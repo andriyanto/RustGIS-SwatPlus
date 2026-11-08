@@ -14,6 +14,7 @@ Changes made in RustGIS-SwatPlus, relative to upstream RustGIS:
 - SWAT+ model commands for the assistant: swat.open, swat.check, swat.get,
   swat.set, swat.save and others (crates/engine/src/cmd/swat.rs), with the
   swat-model and swat-edit skills (crates/assistant/skills).
+- No Dependabot: dependency updates come from upstream when it is merged in.
 - Workflows that deploy, release or publish for upstream run only in
   opengeos/RustGIS.
 
