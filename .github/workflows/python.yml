@@ -155,7 +155,8 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    if: github.event_name == 'release'
+    # The PyPI name belongs to upstream RustGIS.
+    if: github.event_name == 'release' && github.repository == 'opengeos/RustGIS'
     needs: [test, wheels, sdist]
     runs-on: ubuntu-latest
     environment: pypi
