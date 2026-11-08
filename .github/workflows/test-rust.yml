@@ -39,6 +39,14 @@ jobs:
       matrix:
         os: ${{ fromJSON(inputs.os) }}
     steps:
+      # The workspace's test build fills the disk of the smaller Linux runners private
+      # repositories get: drop the SDKs the image carries and the build doesn't use.
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/powershell
+          df -h /
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
