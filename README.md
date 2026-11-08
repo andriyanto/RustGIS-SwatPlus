@@ -2,7 +2,13 @@
   <img src="https://assets.rustgis.app/images/logo.svg" alt="RustGIS logo: a rust-coloured cog framing a segmented globe with an orbit" width="160">
 </p>
 
-<h1 align="center">RustGIS</h1>
+<h1 align="center">RustGIS-SwatPlus</h1>
+
+> **RustGIS-SwatPlus** is a derivative of [RustGIS](https://github.com/opengeos/RustGIS) by
+> opengeos, under the same Apache License 2.0. It adds work on watershed and flood modelling:
+> SWAT+ models through the assistant (`swat.*`), satellite rain grids from JAXA GSMaP (`rain.*`),
+> and heights and measures (Z/M) on vector data. It is not the official RustGIS: the links,
+> downloads and badges below are upstream's. See [NOTICE](NOTICE) for what changed.
 
 <p align="center">
   <b>A fast, free and open-source GIS in pure Rust for mapping, analyzing and sharing geospatial data.</b><br>
@@ -238,5 +244,7 @@ wrong.
 
 ## License and credits
 
-Licensed under the [Apache License 2.0](LICENSE). Sample data from
+Licensed under the [Apache License 2.0](LICENSE). Based on
+[RustGIS](https://github.com/opengeos/RustGIS), copyright its authors; the changes made here are
+listed in [NOTICE](NOTICE). Sample data from
 [Natural Earth](https://www.naturalearthdata.com/) (public domain).

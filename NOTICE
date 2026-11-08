@@ -1,0 +1,22 @@
+RustGIS-SwatPlus
+Copyright the RustGIS authors and the RustGIS-SwatPlus contributors.
+
+This product is a derivative of RustGIS (https://github.com/opengeos/RustGIS),
+licensed under the Apache License, Version 2.0 (see LICENSE). The full history of
+the original project is kept in this repository's git history.
+
+Changes made in RustGIS-SwatPlus, relative to upstream RustGIS:
+
+- Heights and measures (Z/M) on vector data: read and written for Shapefiles,
+  GeoJSON and WKB (crates/data).
+- A reader for JAXA GSMaP rain grids (crates/data/src/raster/gsmap.rs).
+- Rain commands: rain.style, rain.accumulate, rain.zonal (crates/engine/src/cmd/rain.rs).
+- SWAT+ model commands for the assistant: swat.open, swat.check, swat.get,
+  swat.set, swat.save and others (crates/engine/src/cmd/swat.rs), with the
+  swat-model and swat-edit skills (crates/assistant/skills).
+- No Dependabot: dependency updates come from upstream when it is merged in.
+- Workflows that deploy, release or publish for upstream run only in
+  opengeos/RustGIS.
+
+GSMaP data are provided by JAXA under its own terms and are not part of this
+repository.
