@@ -577,6 +577,17 @@ style.importQgis layer? path? text? data?
 style.new layer? name?
 style.remove name
 style.save path
+swat.check
+swat.close
+swat.confidential on
+swat.diff file?
+swat.find query file?
+swat.get file column match? where?
+swat.open path confidential?
+swat.revert file? column?
+swat.save path?
+swat.set file column value mode? match? where? force?
+swat.summary
 table.close
 table.open layer?
 table.remove table
