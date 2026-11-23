@@ -138,7 +138,6 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use rustgis_geom::Coord;

@@ -440,7 +440,6 @@ fn zonal(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use rustgis_data::Coord;

@@ -619,7 +619,7 @@ fn confidential(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-#[allow(clippy::unwrap_used)]
+#[expect(clippy::unwrap_used, reason = "a test module gated on more than `test`, which clippy's allow-unwrap-in-tests does not see")]
 mod tests {
     use super::*;
 
