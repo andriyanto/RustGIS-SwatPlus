@@ -220,7 +220,14 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
 
     let mut out = vec![
         // GeoJSON.
-        case("GeoJSON: a height", "a.geojson", geojson(&[point]), geojson(&[r#"{"type":"Point","coordinates":[1,2,3]}"#]), Said("Z or M")),
+        // A height is kept (`Dataset::zm`) in RustGIS-SwatPlus; a measure is lost.
+        case(
+            "GeoJSON: a measure",
+            "a.geojson",
+            geojson(&[point]),
+            geojson(&[r#"{"type":"Point","coordinates":[1,2,null,4]}"#]),
+            Said("Z or M"),
+        ),
         case(
             "GeoJSON: an unreadable geometry",
             "a.geojson",
@@ -654,48 +661,9 @@ fn cases(fixture_dir: &std::path::Path) -> Vec<Case> {
             Imported("Z or M"),
         ),
     ]);
-    // Independently encoded shapes: scalar Z, scalar M, and arrays with/without optional M.
-    for (name, clean, lossy, clean_index, lossy_index) in [
-        (
-            "Shapefile: a point height",
-            include_bytes!("../../testdata/reading-losses/shp-point-xy.shp").as_slice(),
-            include_bytes!("../../testdata/reading-losses/shp-point-z.shp").as_slice(),
-            include_bytes!("../../testdata/reading-losses/shp-point-xy.shx"),
-            include_bytes!("../../testdata/reading-losses/shp-point-z.shx"),
-        ),
-        (
-            "Shapefile: a point measure",
-            include_bytes!("../../testdata/reading-losses/shp-point-xy.shp").as_slice(),
-            include_bytes!("../../testdata/reading-losses/shp-point-m.shp").as_slice(),
-            include_bytes!("../../testdata/reading-losses/shp-point-xy.shx"),
-            include_bytes!("../../testdata/reading-losses/shp-point-m.shx"),
-        ),
-        (
-            "Shapefile: line heights without measures",
-            include_bytes!("../../testdata/reading-losses/shp-line-xy.shp").as_slice(),
-            include_bytes!("../../testdata/reading-losses/shp-line-z.shp").as_slice(),
-            include_bytes!("../../testdata/reading-losses/shp-line-xy.shx"),
-            include_bytes!("../../testdata/reading-losses/shp-line-z.shx"),
-        ),
-        (
-            "Shapefile: line heights and measures",
-            include_bytes!("../../testdata/reading-losses/shp-line-xy.shp").as_slice(),
-            include_bytes!("../../testdata/reading-losses/shp-line-zm.shp").as_slice(),
-            include_bytes!("../../testdata/reading-losses/shp-line-xy.shx"),
-            include_bytes!("../../testdata/reading-losses/shp-line-zm.shx"),
-        ),
-    ] {
-        let mut c = case(name, "a.shp", clean, lossy, Imported("Z or M"));
-        for (beside, index) in c.beside.iter_mut().zip([clean_index, lossy_index]) {
-            beside.extend([
-                ("a.shx", index.to_vec()),
-                ("a.dbf", include_bytes!("../../testdata/reading-losses/shp-row.dbf").to_vec()),
-                ("a.cpg", b"UTF-8\n".to_vec()),
-                ("a.prj", br#"GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]"#.to_vec()),
-            ]);
-        }
-        out.push(c);
-    }
+    // A Shapefile's heights and measures (scalar Z, scalar M, arrays with and without M) aren't
+    // lost in RustGIS-SwatPlus: they are kept beside the geometry (`Dataset::zm`) and written back,
+    // which `crates/data/tests/zm.rs` checks.
     out
 }
 
