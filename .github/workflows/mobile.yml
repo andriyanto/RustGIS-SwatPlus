@@ -166,7 +166,8 @@ jobs:
 
   android-sign:
     name: Sign the APKs and the App Bundle
-    if: github.event_name != 'pull_request'
+    # Signing and store uploads are upstream's (its keys and accounts).
+    if: github.repository == 'opengeos/RustGIS' && (github.event_name != 'pull_request')
     needs: android-build
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -277,7 +278,8 @@ jobs:
   # Its own job, so only it holds a token that can write to the repository.
   android-release:
     name: Attach the APKs and the App Bundle to the release
-    if: github.event_name == 'release'
+    # Signing and store uploads are upstream's (its keys and accounts).
+    if: github.repository == 'opengeos/RustGIS' && (github.event_name == 'release')
     needs: android-sign
     runs-on: ubuntu-latest
     permissions:
@@ -305,7 +307,8 @@ jobs:
   # commit) is released by its version code. Only this job holds the Play service account's key.
   android-play:
     name: Upload the App Bundle to Google Play
-    if: github.event_name == 'release' || inputs.play
+    # Signing and store uploads are upstream's (its keys and accounts).
+    if: github.repository == 'opengeos/RustGIS' && (github.event_name == 'release' || inputs.play)
     needs: [android-build, android-sign]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -414,7 +417,8 @@ jobs:
 
   ios-sign:
     name: Sign the iOS app
-    if: github.event_name != 'pull_request'
+    # Signing and store uploads are upstream's (its keys and accounts).
+    if: github.repository == 'opengeos/RustGIS' && (github.event_name != 'pull_request')
     needs: ios-build
     runs-on: xcode-27
     timeout-minutes: 30
@@ -512,7 +516,8 @@ jobs:
   # the App Store: it installs through TestFlight and the App Store, not on its own.
   ios-release:
     name: Attach the IPA to the release
-    if: github.event_name == 'release'
+    # Signing and store uploads are upstream's (its keys and accounts).
+    if: github.repository == 'opengeos/RustGIS' && (github.event_name == 'release')
     needs: ios-sign
     runs-on: ubuntu-latest
     permissions:
