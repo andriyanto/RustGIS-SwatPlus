@@ -379,9 +379,9 @@ fn zonal(s: &mut Session, p: &Value) -> CmdResult {
     let zones: Vec<(String, Vec<Vec<Vec<rustgis_data::Coord>>>)> = zl
         .dataset
         .features
-        .iter()
+        .rows()
         .enumerate()
-        .filter_map(|(row, ft)| match &ft.geometry {
+        .filter_map(|(row, ft)| match ft.geometry() {
             Some(Geometry::Polygon(p)) => {
                 let id = field.map(|fi| zl.dataset.value(row, fi).to_string()).unwrap_or_else(|| (row + 1).to_string());
                 Some((id, p.clone()))
