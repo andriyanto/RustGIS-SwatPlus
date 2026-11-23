@@ -94,6 +94,9 @@ pub struct Portal {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Use {
     File,
+    /// A web service's features by their address (an OGC API Features collection's items), read
+    /// page by page, following each page's `next` link.
+    Features,
     /// A Zarr store, whose variable and steps are picked.
     Zarr,
     /// `wms`, `wfs` or `arcgis`, and the layer an address names (an ArcGIS layer's number).
@@ -176,7 +179,10 @@ impl Portal {
                     Some(u) => {
                         let host = host_of(u).to_ascii_lowercase();
                         if !host_ok(&host) {
-                            return Err(format!("'{u}': a Socrata site is its domain, such as data.cityofnewyork.us"));
+                            return Err(rustgis_data::diagnostics::message_with_address(
+                                u,
+                                "a Socrata site is its domain, such as data.cityofnewyork.us",
+                            ));
                         }
                         web(&host)?;
                         // A discovery API itself searches every site; a site keeps the search to it.
@@ -194,7 +200,10 @@ impl Portal {
                     Some(u) => {
                         let host = host_of(u).to_ascii_lowercase();
                         if !host_ok(&host) {
-                            return Err(format!("'{u}': an ArcGIS Hub site is its address, such as hub.arcgis.com"));
+                            return Err(rustgis_data::diagnostics::message_with_address(
+                                u,
+                                "an ArcGIS Hub site is its address, such as hub.arcgis.com",
+                            ));
                         }
                         web(&host)?
                     }
@@ -907,16 +916,7 @@ fn day_of_ms(ms: f64) -> String {
     if !ms.is_finite() || !(0.0..=1e15).contains(&ms) {
         return String::new();
     }
-    // Days to a civil date (Howard Hinnant's algorithm).
-    let z = (ms / 86_400_000.0).floor() as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
+    let (y, m, d) = rustgis_data::date::civil_from_days((ms / 86_400_000.0).floor() as i64);
     format!("{y:04}-{m:02}-{d:02}")
 }
 
@@ -1073,8 +1073,8 @@ fn ign_dataset(f: &Value) -> Option<Dataset> {
     })
 }
 
-/// A GeoLens dataset: its features (OGC API Features, as GeoJSON). Rasters, drawn from tiles
-/// signed for a while, are left out.
+/// A GeoLens dataset: its features (OGC API Features, as GeoJSON), every page of them. Rasters,
+/// drawn from tiles signed for a while, are left out.
 fn geolens_dataset(base: &str, f: &Value) -> Option<Dataset> {
     let p = f.get("properties")?;
     let id = text(f, "id", 100);
@@ -1096,7 +1096,7 @@ fn geolens_dataset(base: &str, f: &Value) -> Option<Dataset> {
         resources: vec![Resource {
             format: "GeoJSON".into(),
             url: format!("{base}/api/collections/{id}/items?limit={GEOLENS_FEATURES}"),
-            using: Use::File,
+            using: Use::Features,
         }],
         listing: None,
         kind,
@@ -1106,7 +1106,7 @@ fn geolens_dataset(base: &str, f: &Value) -> Option<Dataset> {
     })
 }
 
-/// How many features a GeoLens dataset is read with: a page of its server's, the most it gives.
+/// How many features a page of a GeoLens dataset is asked for.
 pub const GEOLENS_FEATURES: usize = 1000;
 
 /// A Hugging Face dataset (public, not gated): its files are listed after.
@@ -1473,6 +1473,7 @@ mod tests {
         let ds = gl.parse("https://datasets.geolibre.app/api/search/datasets/?q=", g, None, "").unwrap();
         assert_eq!(ds.len(), 1);
         assert_eq!(ds[0].resources[0].url, "https://datasets.geolibre.app/api/collections/8c26-1/items?limit=1000");
+        assert_eq!(ds[0].resources[0].using, Use::Features, "read page by page");
 
         let hf = Portal::new(Some("huggingface"), None).unwrap();
         let h = br#"[{"id":"giswqs/geospatial","downloads":10,"gated":false,"private":false,"tags":["license:mit","region:us"]},{"id":"a/gated","gated":"manual"},{"id":"noslash"}]"#;

@@ -8,24 +8,25 @@ use super::{f, ps};
 use crate::render::rustgis_tiles::arcgis_auth::{self, Info};
 use crate::{CmdResult, CommandSpec as C, Session};
 
+/// Declares sign-in changes as reserved account operations, independently of their network reach.
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("arcgis.signIn", "Sign In to ArcGIS", "Home › Add › Service", sign_in).view().params(
+        C::new("arcgis.signIn", "Sign In to ArcGIS", "Home › Add › Service", sign_in).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Reserved)).view().params(
             r#"{"portal"?: "the portal's address: an ArcGIS Online organization's (https://myorg.maps.arcgis.com) or an ArcGIS Enterprise portal's (https://gis.example.org/portal); ArcGIS Online when blank", "clientId"?: "the client id of an OAuth app registered on the portal (Developer credentials) whose redirect URLs list http://127.0.0.1:7290/arcgis/callback; RustGIS's own app when absent on ArcGIS Online (required for ArcGIS Enterprise)", "port"?: "the callback server's port (7290; the redirect URL registered must name it)"} → the sign-in page to open in the browser; the session is kept when the browser comes back (arcgis.status tells). Desktop and command line only"#,
         ),
-        C::new("arcgis.token", "Use ArcGIS Token", "Home › Add › Service", token).view().params(
+        C::new("arcgis.token", "Use ArcGIS Token", "Home › Add › Service", token).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Reserved)).view().params(
             r#"{"url": "an ArcGIS REST address on https:// (a service's, …/rest/services, or a portal's …/sharing/rest)", "token": "an ArcGIS token for it"} — kept for the session only, never in the project; sent to that ArcGIS Server's (or portal's) requests only. A service address given to service.layers or service.add with ?token=… does the same"#,
         ),
-        C::new("arcgis.signOut", "Sign Out of ArcGIS", "Home › Add › Service", sign_out)
+        C::new("arcgis.signOut", "Sign Out of ArcGIS", "Home › Add › Service", sign_out).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Reserved))
             .view()
             .params(r#"{"portal"?: "a signed-in portal's address, or a server a token was given for (arcgis.status lists them); every one when absent"}"#),
         C::new("arcgis.cancelSignIn", "Cancel ArcGIS Sign-In", "Home › Add › Service", |_s, _p| {
             #[cfg(not(target_arch = "wasm32"))]
             arcgis_auth::cancel_sign_in();
             Ok(status())
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved))
         .view(),
-        C::new("arcgis.status", "ArcGIS Sign-In Status", "Home › Add › Service", |_s, _p| Ok(status())).view(),
+        C::new("arcgis.status", "ArcGIS Sign-In Status", "Home › Add › Service", |_s, _p| Ok(status())).roles(&[]).effects(crate::policy::Effects::NONE).view(),
     ]
 }
 
@@ -96,7 +97,22 @@ fn token(_s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"server": root, "sessions": status()["sessions"]}))
 }
 
-fn sign_out(_s: &mut Session, p: &Value) -> CmdResult {
+/// Says how many sign-out revocations went unsent, the system having refused a thread to send
+/// them on: the portal accepts those tokens until they expire.
+#[cfg(not(target_arch = "wasm32"))]
+fn say_unrevoked(s: &mut Session, sent: Result<(), Vec<arcgis_auth::Revocation>>) {
+    if let Err(unsent) = sent {
+        s.notify(
+            format!(
+                "{} sign-in token(s) weren't revoked at the portal: the system refused a thread to send them on. The portal accepts them until they expire.",
+                unsent.len()
+            ),
+            true,
+        );
+    }
+}
+
+fn sign_out(s: &mut Session, p: &Value) -> CmdResult {
     // Only an absent (or blank) portal means every session: junk is refused, not taken for it.
     if p.get("portal").is_some_and(|v| !v.is_null() && !v.is_string()) {
         return Err("portal is a signed-in portal's address (arcgis.status lists them)".into());
@@ -114,11 +130,33 @@ fn sign_out(_s: &mut Session, p: &Value) -> CmdResult {
     let (revocations, gone) = arcgis_auth::sign_out(portal.as_deref());
     // Tiles and documents read with the token are cached by address: they go with it.
     if gone > 0 {
-        crate::render::rustgis_tiles::cache::clear();
+        crate::render::rustgis_tiles::cache::sign_out();
     }
     #[cfg(not(target_arch = "wasm32"))]
-    arcgis_auth::revoke_all(revocations);
+    say_unrevoked(s, arcgis_auth::revoke_all(revocations));
     #[cfg(target_arch = "wasm32")]
-    drop(revocations);
+    let _ = (s, revocations);
     Ok(json!({"signedOut": gone, "sessions": status()["sessions"]}))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    /// Revocations a refused thread left unsent are said once, with their count; sent ones aren't.
+    #[test]
+    fn unsent_revocations_are_said_and_sent_ones_are_not() {
+        let mut s = Session::new(crate::Project::default());
+        let r = || arcgis_auth::Revocation {
+            endpoint: "https://portal.example/sharing/rest/oauth2/revokeToken".into(),
+            body: "token=t".into(),
+        };
+        let mark = s.notice_mark();
+        say_unrevoked(&mut s, Err(vec![r(), r()]));
+        let said = s.notices_since(mark);
+        assert!(said.len() == 1 && said.iter().all(|n| n.error && n.text.starts_with("2 sign-in token(s) weren't revoked")), "{said:?}");
+        let mark = s.notice_mark();
+        say_unrevoked(&mut s, Ok(()));
+        assert!(s.notices_since(mark).is_empty());
+    }
 }

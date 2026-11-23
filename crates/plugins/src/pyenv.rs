@@ -114,11 +114,19 @@ pub fn status(id: &str) -> Option<bool> {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(600))).build().into()
+    ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(600)))
+        .tls_config(rustgis_data::http::tls_config())
+        .build()
+        .into()
 }
 
 fn get(agent: &ureq::Agent, url: &str) -> Result<ureq::http::Response<ureq::Body>, String> {
-    agent.get(url).header("User-Agent", concat!("RustGIS/", env!("CARGO_PKG_VERSION"))).call().map_err(|e| format!("{url}: {e}"))
+    agent
+        .get(url)
+        .header("User-Agent", concat!("RustGIS/", env!("CARGO_PKG_VERSION")))
+        .call()
+        .map_err(|e| rustgis_data::diagnostics::message_with_address(url, &e.to_string()))
 }
 
 /// uv: the one [`UV_ENV`] names, else the one downloaded before, else a fresh download.
@@ -152,9 +160,14 @@ pub fn uv(progress: &mut dyn FnMut(&str)) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("PyPI has no uv {UV_VERSION} for {tag}"))?
         .to_string();
     let mut bytes = Vec::new();
-    get(&agent, &url)?.body_mut().as_reader().take(MAX_WHEEL + 1).read_to_end(&mut bytes).map_err(|e| format!("{url}: {e}"))?;
+    get(&agent, &url)?
+        .body_mut()
+        .as_reader()
+        .take(MAX_WHEEL + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| rustgis_data::diagnostics::message_with_address(&url, &e.to_string()))?;
     if bytes.len() as u64 > MAX_WHEEL {
-        return Err(format!("{url} is unexpectedly large"));
+        return Err(rustgis_data::diagnostics::message_with_address(&url, "is unexpectedly large"));
     }
     let actual: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
     if actual != *sha256 {
@@ -169,7 +182,7 @@ pub fn uv(progress: &mut dyn FnMut(&str)) -> Result<PathBuf, String> {
         .read_to_end(&mut program)
         .map_err(|e| format!("{name}: {e}"))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    rustgis_data::io::write_atomic(&exe, &program).map_err(|e| format!("{}: {e}", exe.display()))?;
+    rustgis_data::io::replace_atomic(&exe, &program).map_err(|e| format!("{}: {e}", exe.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -201,10 +214,19 @@ fn run_uv(uv: &Path, args: &[&std::ffi::OsStr], progress: &mut dyn FnMut(&str)) 
     let mut child = c.spawn().map_err(|e| format!("couldn't start uv ({e})"))?;
     // Standard output is drained on a thread, so a full pipe can't stall uv.
     let out = child.stdout.take().map(|o| {
-        std::thread::spawn(move || {
+        std::thread::Builder::new().name("rustgis-uv-output".into()).spawn(move || {
             let _ = std::io::copy(&mut BufReader::new(o), &mut std::io::sink());
         })
     });
+    // No thread to drain it with: uv is stopped rather than left to stall on a full pipe.
+    let out = match out.transpose() {
+        Ok(out) => out,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("couldn't run uv: the system refused a thread to read its output on ({e})"));
+        }
+    };
     let mut last = std::collections::VecDeque::new();
     if let Some(err) = child.stderr.take() {
         for line in BufReader::new(err).lines().map_while(Result::ok) {
@@ -276,7 +298,7 @@ pub fn prepare(id: &str, progress: &mut dyn FnMut(&str)) -> Result<PathBuf, Stri
                 progress,
             )?;
         }
-        rustgis_data::io::write_atomic(&tmp.join(MADE_FOR), want.as_bytes()).map_err(|e| e.to_string())?;
+        rustgis_data::io::replace_atomic(&tmp.join(MADE_FOR), want.as_bytes()).map_err(|e| e.to_string())?;
         let old = parent.join(format!(".{id}-{nanos}-old"));
         let had_old = check.env.exists();
         if had_old {

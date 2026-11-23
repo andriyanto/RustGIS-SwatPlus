@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::RustGisApp;
 
-const MAX_PREF_BYTES: usize = 100_000;
+pub(crate) const MAX_PREF_BYTES: usize = 100_000;
 const MAX_PREF_CHANGES: usize = 1_000;
 const MAX_COMMAND_LEN: usize = 200;
 
@@ -41,6 +41,9 @@ const DEFAULTS: &[(&str, &str, &str)] = &[
     ("Alt+Shift+ArrowLeft", "layer.outdent", ""),
     ("Alt+Shift+ArrowUp", "layer.moveUp", ""),
     ("Alt+Shift+ArrowDown", "layer.moveDown", ""),
+    // Renames the active layer, as F2 renames a file: without a name, the key opens the Rename
+    // dialog (see `chrome`).
+    ("F2", "layer.rename", ""),
 ];
 
 /// The clipboard keys: (keys, command). They arrive as copy, cut and paste events rather than key
@@ -61,11 +64,16 @@ pub const MAP_TOOLS: &[(&str, &str)] = &[
     ("createLine", "Create Line"),
     ("createPolygon", "Create Polygon"),
     ("editVertices", "Edit Vertices"),
+    ("rotatedBox", "Rotated Box"),
+    ("circle", "Circle"),
+    ("cutPolygon", "Cut Polygon"),
+    ("reshape", "Reshape"),
 ];
 
 /// Labels of the `ui.*` commands that have a shortcut but no entry in Command Search.
 const UI_LABELS: &[(&str, &str)] = &[
     ("ui.commandSearch", "Command Search"),
+    ("ui.convertShape", "Convert Polygon to Shape…"),
     ("ui.open", "Open Project…"),
     ("ui.save", "Save Project"),
     ("ui.saveAs", "Save Project As…"),
@@ -197,13 +205,13 @@ impl Binding {
 
 /// One user change to the defaults, stored in preferences.
 #[derive(Serialize, Deserialize)]
-struct Change {
-    keys: String,
-    command: String,
+pub(crate) struct Change {
+    pub(crate) keys: String,
+    pub(crate) command: String,
     #[serde(default)]
-    params: Value,
+    pub(crate) params: Value,
     #[serde(default)]
-    remove: bool,
+    pub(crate) remove: bool,
 }
 
 /// Every shortcut.
@@ -522,6 +530,20 @@ mod tests {
         b.chord = Chord { command: true, alt: false, shift: false, key: Key::J };
         assert_ne!(before, app.shortcuts_fingerprint());
         assert!(crate::RustGisApp::takes_browser_key(&app.command_keys(), "j", "KeyJ", true, false, false));
+        // The same key given another command, or other parameters, changes it too.
+        let moved = app.shortcuts_fingerprint();
+        let j = Chord { command: true, alt: false, shift: false, key: Key::J };
+        app.ui.keymap.assign(j, "select.clear", Value::Null);
+        let other_command = app.shortcuts_fingerprint();
+        assert_ne!(moved, other_command);
+        // Assigning moves the binding to the end, so a second command for the same key, in the
+        // same place, isolates the command.
+        app.ui.keymap.assign(j, "select.all", Value::Null);
+        assert_ne!(other_command, app.shortcuts_fingerprint());
+        app.ui.keymap.assign(j, "tool.set", serde_json::json!({"tool": "select"}));
+        let with_params = app.shortcuts_fingerprint();
+        app.ui.keymap.assign(j, "tool.set", serde_json::json!({"tool": "measure"}));
+        assert_ne!(with_params, app.shortcuts_fingerprint());
     }
 
     #[test]

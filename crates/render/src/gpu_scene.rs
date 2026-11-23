@@ -57,6 +57,12 @@ pub struct GpuScene {
     pub data_pending: bool,
     /// Tile layers that couldn't be drawn, and why.
     pub tile_errors: Vec<String>,
+    /// Raster layers read in place drawn from less than the view needs (a coarser level, tiles
+    /// they couldn't read), by id, their errors among `tile_errors`: an export refuses them.
+    pub partial: Vec<u32>,
+    /// Raster layers read in place whose tiles are still on their way, by id: drawn again as
+    /// they land; an export that can't wait refuses them.
+    pub pending_in_place: Vec<u32>,
     /// A turned or tilted scene: the camera it was drawn for, which the vertex shader's full
     /// perspective takes, and a tilted one's sky and fog. `None` for a flat, north-up scene.
     pub tilt: Option<SceneTilt>,
@@ -95,13 +101,21 @@ impl CmdClip {
 /// that need tiny-skia: masks, blend modes, transparency, aggregation, extrusion) at its
 /// exact z-position; `Mesh`/`Points` are lyon-tessellated vector layers.
 pub enum DrawCmd {
-    /// Screen-sized premultiplied RGBA, drawn covering the whole map view. The pixmap is
-    /// moved in, not copied — flushing the CPU accumulator doesn't pay a full-screen `to_vec`.
-    Image { pixmap: tiny_skia::Pixmap },
-    /// Tessellated polygon fills and line/ring strokes of one layer run.
-    Mesh { origin: [f64; 2], vertices: Vec<MeshVertex>, indices: Vec<u32> },
-    /// Point markers: instances of a small set of unit-space shape templates.
-    Points { origin: [f64; 2], instances: Vec<PointInstance> },
+    /// Screen-sized premultiplied RGBA, drawn covering the whole map view at `opacity` (the
+    /// picture's every channel times it, placed over what is under it). The pixmap is moved in,
+    /// not copied — flushing the CPU accumulator doesn't pay a full-screen `to_vec`. Shared: a
+    /// picture of layers that look as they did is kept from one scene to the next
+    /// (`frame_cache`), and the GPU keeps the texture of a picture it has uploaded while the
+    /// picture lives. A see-through layer drawn alone is one at the layer's opacity, so a change
+    /// of transparency alone draws nothing again.
+    Image { pixmap: Arc<tiny_skia::Pixmap>, opacity: f32 },
+    /// Tessellated polygon fills and line/ring strokes of one layer run. Shared: a layer that looks
+    /// as it did keeps its mesh from one scene to the next (`layer_meshes`), and the GPU keeps the
+    /// buffers of a mesh it has uploaded while the mesh lives.
+    Mesh { origin: [f64; 2], vertices: Arc<Vec<MeshVertex>>, indices: Arc<Vec<u32>> },
+    /// Point markers: instances of a small set of unit-space shape templates, shared as
+    /// [`DrawCmd::Mesh`] is.
+    Points { origin: [f64; 2], instances: Arc<Vec<PointInstance>> },
     /// Extruded features standing up in a tilted view: roofs and walls, lit and drawn with a
     /// depth buffer (as MapLibre's fill extrusions), or, with `shadows`, the shadows they cast
     /// on the ground, drawn under every feature.
@@ -113,11 +127,32 @@ pub enum DrawCmd {
     /// One raster tile layer the GPU map places again for every frame it shows, from the tile
     /// cache, for the camera of that frame (see [`crate::tiles::live`]): the scene holds only
     /// which layer, so panning and zooming never draw the scene again for its tiles (#635).
-    LiveTiles { spec: rustgis_tiles::Spec, opacity: f32 },
+    /// The archive revision binds later live tile acquisition to this scene's credits.
+    LiveTiles { name: String, spec: rustgis_tiles::Spec, opacity: f32, archive_revision: u64 },
     /// One vector tile layer's tiles as meshes (see `tile_mesh`): the GPU keeps each mesh's
     /// buffers across frames, shows the layers of its runs that show at the camera's zoom and
     /// clips each tile to its square, as MapLibre draws its tiles.
     TileMeshes { tiles: Vec<MeshTile> },
+}
+
+impl DrawCmd {
+    /// A command sharing this one's data, for a scene to draw again; `None` for an extrusion,
+    /// whose data isn't shared (only a tilted view's scenes have them, and those keep nothing).
+    pub fn share(&self) -> Option<DrawCmd> {
+        Some(match self {
+            DrawCmd::Image { pixmap, opacity } => DrawCmd::Image { pixmap: Arc::clone(pixmap), opacity: *opacity },
+            DrawCmd::Mesh { origin, vertices, indices } => {
+                DrawCmd::Mesh { origin: *origin, vertices: Arc::clone(vertices), indices: Arc::clone(indices) }
+            }
+            DrawCmd::Points { origin, instances } => DrawCmd::Points { origin: *origin, instances: Arc::clone(instances) },
+            DrawCmd::Extrusion { .. } => return None,
+            DrawCmd::Tiles { origin, tiles } => DrawCmd::Tiles { origin: *origin, tiles: tiles.clone() },
+            DrawCmd::LiveTiles { name, spec, opacity, archive_revision } => {
+                DrawCmd::LiveTiles { name: name.clone(), spec: spec.clone(), opacity: *opacity, archive_revision: *archive_revision }
+            }
+            DrawCmd::TileMeshes { tiles } => DrawCmd::TileMeshes { tiles: tiles.clone() },
+        })
+    }
 }
 
 /// One tile of a [`DrawCmd::TileMeshes`].

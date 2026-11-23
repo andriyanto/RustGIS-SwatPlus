@@ -13,6 +13,10 @@ rustgis-geom = { workspace = true }
 rustgis-data = { workspace = true }
 rustgis-map = { workspace = true }
 tiny-skia = { workspace = true }
+resvg = { workspace = true }
+svgtypes = { workspace = true }
+simplecss = { workspace = true }
+kurbo = { workspace = true }
 bytemuck = { workspace = true }
 lyon = { workspace = true }
 ab_glyph = { workspace = true }
@@ -24,6 +28,8 @@ base64 = { workspace = true }
 web-time = { workspace = true }
 serde_json = { workspace = true }
 miniz_oxide = { workspace = true }
+subsetter = { workspace = true }
+ttf-parser = { workspace = true }
 rustgis-tiles = { workspace = true }
 
 [dev-dependencies]

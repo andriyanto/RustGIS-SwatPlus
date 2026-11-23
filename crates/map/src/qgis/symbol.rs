@@ -5,12 +5,13 @@
 
 use roxmltree::Node;
 
-use super::{Report, color, data_defined_on, has_effect, points, prop, props, signed_points};
+use super::{NoteKind, ReadImage, Report, color, data_defined_on, has_effect, points, prop, props, signed_points};
 use crate::Rgba;
 use crate::fills::{FillLayer, FillPattern, GradientPoint, GradientShape, Spread, Stop, Stops};
+use crate::symbol_by::SymbolBy;
 use crate::symbology::{
-    Dash, Glyph, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, MAX_DASH_STEPS, MAX_STROKES, Marker, MarkerRotation, Placements,
-    Symbol,
+    Dash, Glyph, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, MAX_DASH_STEPS, MAX_PICTURES, MAX_PICTURES_BYTES, MAX_STROKES,
+    Marker, MarkerRotation, Picture, Placements, Symbol,
 };
 
 /// A symbol layer's settings by name.
@@ -28,6 +29,8 @@ pub(super) struct Converted {
     pub strokes: Vec<LineStroke>,
     /// A marker symbol turned by a field (its data-defined angle).
     pub rotation: Option<MarkerRotation>,
+    /// Its data-defined size, colours, outline width and angle, as expressions.
+    pub by: SymbolBy,
     /// A fill symbol's stacked fills, bottom first: empty when its one fill is a colour (the
     /// symbol's own), as before patterns were read.
     pub fills: Vec<FillLayer>,
@@ -59,6 +62,9 @@ pub(super) fn turns_by_field(sym: Node) -> bool {
 /// they are in map units. `turned`: the layer's markers turn by a field, so a marker symbol that
 /// doesn't is drawn as a mark that keeps still.
 pub(super) fn read(sym: Node, reference: Option<f64>, turned: bool, layer: &str, report: &mut Report) -> Converted {
+    // Noted once for the symbol, whichever of its opacities (its own, an image layer's, a marker
+    // line's) is see-through.
+    let seen = report.noted(layer, NoteKind::Approximated, SEE_THROUGH_IMAGES);
     let alpha = sym.attribute("alpha").and_then(|a| a.trim().parse::<f32>().ok()).filter(|a| a.is_finite()).unwrap_or(1.0).clamp(0.0, 1.0);
     let fade = |c: Rgba| c.with_alpha((f32::from(c.a()) * alpha).round() as u8);
     let unit = sym.attribute("outputUnit");
@@ -68,11 +74,19 @@ pub(super) fn read(sym: Node, reference: Option<f64>, turned: bool, layer: &str,
         .take(64)
         .map(|l| (l, settings(l, unit)))
         .collect();
-    // A marker symbol's angle from a field turns the layer's markers; other data-defined settings
-    // are noted.
+    // A marker symbol's angle from a field turns the layer's markers; its size, colours, outline
+    // width and other angles become expressions; other data-defined settings are noted.
     let is_marker = !matches!(sym.attribute("type"), Some("fill") | Some("line"));
     let mut rotation = None;
-    for node in std::iter::once(sym).chain(layers.iter().map(|(l, _)| *l)) {
+    let mut by = SymbolBy::default();
+    // The size (in points) of the layer whose size expression was taken.
+    let mut sized_layer: Option<f32> = None;
+    // How many of its layers are sized by expression.
+    let mut sized_layers = 0;
+    // A marker of several layers draws as marks scaled with its size: the top layer's is read first.
+    let marks = is_marker && layers.len() > 1;
+    let order: Vec<&(Node, Props)> = if marks { layers.iter().rev().collect() } else { layers.iter().collect() };
+    for (node, p) in std::iter::once((sym, None)).chain(order.into_iter().map(|(l, p)| (*l, Some(p.as_slice())))) {
         let active = active_properties(node);
         // A layout `active_properties` doesn't read (QGIS 2's `dd_properties`) is still noted.
         if active.is_empty() && data_defined_on(node) {
@@ -82,9 +96,26 @@ pub(super) fn read(sym: Node, reference: Option<f64>, turned: bool, layer: &str,
             match field_angle(property).filter(|_| is_marker && name == "angle") {
                 Some(r) if rotation.as_ref().is_none_or(|had| *had == r) => rotation = Some(r),
                 Some(_) => report.approximated(layer, "marker layers turned by different fields, all turned by the first"),
+                // A lower layer's size: the marks scale with the top one's.
+                None if marks && name == "size" && by.size.is_some() => sized_layers += usize::from(p.is_some()),
+                None if by_expression(sym.attribute("type"), name, property, p, reference, &mut by, layer, report) => {
+                    // (A size on the symbol itself scales the whole symbol: nothing to turn.)
+                    if name == "size" && p.is_some() {
+                        sized_layers += 1;
+                        sized_layer = p.and_then(|p| size(p, "size", reference, layer, report)).or(Some(2.0 * 96.0 / 25.4));
+                    }
+                    if !(marks && name == "size") && layers.len() > 1 {
+                        report.approximated(layer, "data-defined settings of one symbol layer, applied to the whole symbol");
+                    }
+                }
                 None => report.skipped(layer, "data-defined symbol settings (from fields or expressions)"),
             }
         }
+    }
+    // Each layer sized by expression scales as QGIS scales them together; a layer of a fixed size
+    // scales with the rest.
+    if marks && by.size.is_some() && sized_layers < layers.len() {
+        report.approximated(layer, "the layers of a marker sized by expression, all scaled with its size");
     }
     for (l, _) in &layers {
         if has_effect(*l) {
@@ -97,6 +128,51 @@ pub(super) fn read(sym: Node, reference: Option<f64>, turned: bool, layer: &str,
         _ => marker(&layers, reference, turned && rotation.is_none(), layer, report),
     };
     out.rotation = rotation;
+    let drawn_as_marks = is_marker && !out.strokes.is_empty();
+    // Marks keep their own colours and outlines.
+    if drawn_as_marks && (by.fill.is_some() || by.stroke.is_some() || by.stroke_width.is_some()) {
+        report.skipped(layer, "data-defined colours and outline widths of a marker drawn as marks");
+        (by.fill, by.stroke, by.stroke_width) = (None, None, None);
+    }
+    // A line of stacked strokes draws each with its own colour and width.
+    if sym.attribute("type") == Some("line") && out.stacked() && (by.stroke.is_some() || by.stroke_width.is_some()) {
+        report.skipped(layer, "data-defined colours and widths of a line of several strokes");
+        (by.stroke, by.stroke_width) = (None, None);
+    }
+    // Marks scale with the symbol's size, its largest layer's: the expression, taken from one
+    // layer, is turned into the size it gives that one, so every mark scales as that layer does.
+    if let (true, Some(text), Some(own)) = (drawn_as_marks, by.size.as_ref(), sized_layer.map(|s| s.clamp(0.0, 200.0)))
+        && own > 0.0
+        && out.symbol.size > 0.0
+        && (out.symbol.size / own - 1.0).abs() > 1e-6
+    {
+        let k = (f64::from(out.symbol.size / own)).clamp(1e-3, 1e3);
+        let scaled = format!("({text}) * {}", (k * 1e6).round() / 1e6);
+        if scaled.len() <= rustgis_data::query::MAX_LEN {
+            by.size = Some(scaled);
+        } else {
+            report.skipped(layer, "a data-defined marker size too long to read");
+            by.size = None;
+        }
+    }
+    // (An expression's colour is drawn as it is: the symbol's opacity doesn't fade it.)
+    if alpha < 1.0 && (by.fill.is_some() || by.stroke.is_some()) {
+        report.approximated(layer, "data-defined colours of a see-through symbol, drawn opaque");
+    }
+    // An image marker is drawn at the layer's opacity alone.
+    let picture = |m: Marker| matches!(m, Marker::Picture(_));
+    let faded = alpha < 1.0
+        && (picture(out.symbol.marker)
+            || out.strokes.iter().any(|s| s.markers.is_some_and(|m| matches!(m.mark, LineMark::Marker(k) if picture(k)))));
+    let now = report.noted(layer, NoteKind::Approximated, SEE_THROUGH_IMAGES);
+    if now > seen + 1 {
+        for _ in seen + 1..now {
+            report.forget(layer, NoteKind::Approximated, SEE_THROUGH_IMAGES);
+        }
+    } else if now == seen && faded {
+        report.approximated(layer, SEE_THROUGH_IMAGES);
+    }
+    out.by = by;
     out.symbol.fill = fade(out.symbol.fill);
     out.symbol.stroke = fade(out.symbol.stroke);
     for s in &mut out.strokes {
@@ -371,7 +447,7 @@ fn fill(layers: &[(Node, Props)], reference: Option<f64>, layer: &str, report: &
     }
     let symbol =
         Symbol { fill: fill.unwrap_or(none), stroke: stroke.unwrap_or(none), stroke_width: width, size: 0.0, marker: Marker::Circle };
-    Converted { symbol, strokes: Vec::new(), rotation: None, fills: stack }
+    Converted { symbol, strokes: Vec::new(), rotation: None, by: SymbolBy::default(), fills: stack }
 }
 
 /// A gradient fill's (or a shapeburst fill's, `burst`) first colour and the rest of it: its two
@@ -537,7 +613,7 @@ fn line(layers: &[(Node, Props)], reference: Option<f64>, layer: &str, report: &
         }
         None => hidden(),
     };
-    Converted { symbol, strokes, rotation: None, fills: Vec::new() }
+    Converted { symbol, strokes, rotation: None, by: SymbolBy::default(), fills: Vec::new() }
 }
 
 /// A marker line (`hash` false) or hashed line as strokes of markers or hash marks along the line:
@@ -590,6 +666,10 @@ fn along(l: Node, p: &[(String, String)], hash: bool, reference: Option<f64>, la
             marker_mark(class, &sp, base, reference, layer, report)
         };
         if let Some(mut st) = stroke {
+            // An image mark is drawn at the layer's opacity alone.
+            if alpha < 1.0 && st.markers.is_some_and(|m| matches!(m.mark, LineMark::Marker(Marker::Picture(_)))) {
+                report.approximated(layer, SEE_THROUGH_IMAGES);
+            }
             st.offset += across;
             st.level = pass;
             st.color = st.color.map(fade);
@@ -648,7 +728,8 @@ fn marker_mark(
             })
         }
         "FontMarker" => font_char(p, layer, report)?,
-        "SvgMarker" | "RasterMarker" | "EllipseMarker" | "FilledMarker" => {
+        "RasterMarker" => raster_image(p, layer, report).map_or(Marker::Circle, |(picture, _)| Marker::Picture(picture)),
+        "SvgMarker" | "EllipseMarker" | "FilledMarker" => {
             report.approximated(layer, format!("{} markers, drawn as circles in their colour", marker_name(class)));
             Marker::Circle
         }
@@ -659,6 +740,9 @@ fn marker_mark(
     };
     if class == "FontMarker" && anchored(p) {
         report.approximated(layer, "font markers anchored off their centre, drawn centred");
+    }
+    if matches!(shape, Marker::Picture(_)) && anchored(p) {
+        report.approximated(layer, "raster image markers along lines anchored off their centre, drawn centred");
     }
     let fill = prop(p, "color").and_then(color).unwrap_or(Rgba::new(0, 0, 0, 0));
     let outline = if prop(p, "outline_style") == Some("no") { None } else { prop(p, "outline_color").and_then(color) };
@@ -735,6 +819,8 @@ fn marker(layers: &[(Node, Props)], reference: Option<f64>, still: bool, layer: 
         let fill = prop(p, "color").and_then(color);
         let outline = prop(p, "outline_color").and_then(color);
         let sz = size(p, "size", reference, layer, report).unwrap_or(2.0 * 96.0 / 25.4);
+        // Its height over its width: an image's own, else a shape's square.
+        let mut aspect = 1.0;
         let shape = match class {
             "SimpleMarker" => {
                 let name = prop(p, "name").unwrap_or("circle");
@@ -747,7 +833,14 @@ fn marker(layers: &[(Node, Props)], reference: Option<f64>, still: bool, layer: 
                 Some(m) => m,
                 None => continue,
             },
-            "SvgMarker" | "RasterMarker" | "EllipseMarker" | "FilledMarker" => {
+            "RasterMarker" => match raster_image(p, layer, report) {
+                Some((picture, a)) => {
+                    aspect = a;
+                    Marker::Picture(picture)
+                }
+                None => Marker::Circle,
+            },
+            "SvgMarker" | "EllipseMarker" | "FilledMarker" => {
                 report.approximated(layer, format!("{} markers, drawn as circles in their colour", marker_name(class)));
                 Marker::Circle
             }
@@ -759,7 +852,7 @@ fn marker(layers: &[(Node, Props)], reference: Option<f64>, still: bool, layer: 
         let fill = fill.unwrap_or(Rgba::new(0, 0, 0, 0));
         let width = size(p, "outline_width", reference, layer, report).unwrap_or(0.0);
         let angle = prop(p, "angle").and_then(|a| a.trim().parse::<f32>().ok()).filter(|a| a.is_finite()).unwrap_or(0.0);
-        let (x, y) = point_offset(p, sz, reference, layer, report);
+        let (x, y) = point_offset(p, (sz, sz * aspect), reference, layer, report);
         let drawn_outline = outline.filter(|_| prop(p, "outline_style") != Some("no") && width > 0.0);
         marks.push(LineStroke {
             color: Some(fill),
@@ -793,14 +886,119 @@ fn marker(layers: &[(Node, Props)], reference: Option<f64>, still: bool, layer: 
         && marks.len() <= 1
         && marks.iter().all(|m| m.offset == 0.0 && m.markers.is_some_and(|k| k.offset_along == 0.0 && k.angle == 0.0));
     let strokes = if alone { Vec::new() } else { marks.into_iter().map(LineStroke::clamped).collect() };
-    Converted { symbol, strokes, rotation: None, fills: Vec::new() }
+    Converted { symbol, strokes, rotation: None, by: SymbolBy::default(), fills: Vec::new() }
+}
+
+/// Reads the images of the raster image markers under `root` (a project or a style), each
+/// `imageFile` once (a file once for each spelling of its path from the folder: a leading `./` is
+/// dropped, so `./a.png` and `a.png` are one), into the report for [`raster_image`]: a `base64:`
+/// one as it is, a file's through `read` (relative to `dir`). One at a web address isn't fetched,
+/// nor one on a network share (`\\host\share`, `//host/share`), nor one kept inside a `.qgz`
+/// (`attachment:`); one relative to no folder (or to a drive's working folder) isn't looked
+/// for, and those past the pictures a run keeps ([`MAX_PICTURES`],
+/// [`MAX_PICTURES_BYTES`]) aren't read. An image is kept when read, before its symbol is: one
+/// in a part of the project the import then leaves out stays kept for the run, within those
+/// bounds.
+pub(super) fn read_images(root: Node, dir: &str, read: &mut ReadImage, report: &mut Report) {
+    let (mut bytes, mut reads) = (0, 0);
+    // A file's image by its path from the folder (`./a.png` and `a.png` are one).
+    let mut files = std::collections::HashMap::<String, Result<(Picture, f32), String>>::new();
+    let rasters = root.descendants().filter(|n| n.has_tag_name("layer") && n.attribute("class") == Some("RasterMarker"));
+    for l in rasters.filter(|l| l.attribute("enabled") != Some("0")) {
+        let p = props(l);
+        let Some(file) = prop(&p, "imageFile").map(str::trim).filter(|f| !f.is_empty()) else { continue };
+        if report.images.contains_key(file) {
+            continue;
+        }
+        let source = if file.starts_with("base64:") {
+            Ok(None)
+        } else if file.starts_with("attachment:") {
+            Err("whose image is kept inside the .qgz project, which RustGIS doesn't read it from")
+        } else if file.contains("://") {
+            Err("whose image is at a web address, which RustGIS doesn't fetch")
+        } else if file.len() > 1 && file.chars().take(2).all(|c| c == '\\' || c == '/') {
+            // Looking a share up can sign in to the host the file names, which a style or
+            // project chose (as an archive on one isn't opened either).
+            Err("whose image is on a network share, which RustGIS doesn't open")
+        } else if super::is_drive_relative(file) {
+            Err("whose image file is relative to a drive's working folder, which no project folder tells")
+        } else if super::is_relative(file) && dir.is_empty() {
+            Err("whose image file is relative to a folder the import wasn't given")
+        } else {
+            Ok(Some(super::source::absolute(file, dir)))
+        };
+        if let Ok(Some(path)) = &source
+            && let Some(got) = files.get(path)
+        {
+            report.images.insert(file.to_string(), got.clone());
+            continue;
+        }
+        if source.is_ok() && (reads >= MAX_PICTURES || bytes >= MAX_PICTURES_BYTES) {
+            continue;
+        }
+        let got = match &source {
+            Ok(Some(path)) => read(path),
+            Ok(None) => read(file),
+            Err(why) => Err(*why),
+        };
+        reads += usize::from(source.is_ok());
+        let kept = got.map_err(str::to_string).and_then(|(b64, aspect)| {
+            // Past what a run keeps, it isn't (`Picture::new` gives the default then).
+            let picture = Picture::new(&b64);
+            if picture.is_default() || !(aspect.is_finite() && aspect > 0.0) {
+                return Err("past the images RustGIS keeps".to_string());
+            }
+            bytes += b64.len();
+            Ok((picture, aspect))
+        });
+        if let Ok(Some(path)) = source {
+            files.insert(path, kept.clone());
+        }
+        report.images.insert(file.to_string(), kept);
+    }
+}
+
+/// The note for image markers drawn opaque where QGIS draws them see-through: once per symbol
+/// ([`read`]).
+const SEE_THROUGH_IMAGES: &str = "see-through raster image markers, drawn opaque";
+
+/// A raster image marker's image (read before the symbols: [`read_images`]) and its height over
+/// its width, or `None` (noted, with why) for it to be drawn as a circle. What QGIS draws
+/// otherwise than RustGIS is noted: a ratio of its own, see-through.
+fn raster_image(p: &[(String, String)], layer: &str, report: &mut Report) -> Option<(Picture, f32)> {
+    let file = prop(p, "imageFile").map(str::trim).unwrap_or_default();
+    let why = match report.images.get(file) {
+        _ if file.is_empty() => "with no image".to_string(),
+        Some(Ok(got)) => {
+            let got = *got;
+            // QGIS's `fixedAspectRatio`: 0 keeps the image's own.
+            let ratio = prop(p, "fixedAspectRatio").and_then(|r| r.trim().parse::<f32>().ok()).filter(|r| r.is_finite() && *r > 0.0);
+            if ratio.is_some_and(|r| (r - got.1).abs() > 1e-3 * got.1) {
+                report.approximated(layer, "raster image markers of a fixed aspect ratio, drawn in their image's own");
+            }
+            if prop(p, "alpha").and_then(|a| a.trim().parse::<f32>().ok()).is_some_and(|a| a < 1.0) {
+                report.approximated(layer, SEE_THROUGH_IMAGES);
+            }
+            return Some(got);
+        }
+        Some(Err(why)) => why.clone(),
+        None => "past the images an import reads".to_string(),
+    };
+    report.approximated(layer, format!("raster image markers {why}, drawn as circles"));
+    None
 }
 
 /// A point marker layer's offset (`offset`, "x,y" in its unit: right and down) in points, its
-/// anchor point added: anchored at its left or top edge, a marker of size `size` sits half its
-/// size right of or below the point, as QGIS draws it. A font marker's baseline anchor is drawn
-/// centred (noted).
-fn point_offset(p: &[(String, String)], size: f32, reference: Option<f64>, layer: &str, report: &mut Report) -> (f32, f32) {
+/// anchor point added: anchored at its left or top edge, a marker `width` wide and `height` tall
+/// sits half its width right of or half its height below the point, as QGIS draws it. A font
+/// marker's baseline anchor is drawn centred (noted).
+fn point_offset(
+    p: &[(String, String)],
+    (width, height): (f32, f32),
+    reference: Option<f64>,
+    layer: &str,
+    report: &mut Report,
+) -> (f32, f32) {
     let parse = |v: &str| v.trim().parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(0.0);
     let (x, y) = prop(p, "offset").and_then(|o| o.split_once(',')).map_or((0.0, 0.0), |(x, y)| (parse(x), parse(y)));
     let unit = prop(p, "offset_unit").or(prop(p, SYMBOL_UNIT));
@@ -809,15 +1007,14 @@ fn point_offset(p: &[(String, String)], size: f32, reference: Option<f64>, layer
     } else {
         (signed_points(x, unit, reference, layer, report), signed_points(y, unit, reference, layer, report))
     };
-    let half = size / 2.0;
     match prop(p, "horizontal_anchor_point").map(str::trim) {
-        Some("0") => x += half,
-        Some("2") => x -= half,
+        Some("0") => x += width / 2.0,
+        Some("2") => x -= width / 2.0,
         _ => {}
     }
     match prop(p, "vertical_anchor_point").map(str::trim) {
-        Some("0") => y += half,
-        Some("2") => y -= half,
+        Some("0") => y += height / 2.0,
+        Some("2") => y -= height / 2.0,
         Some("3") => report.approximated(layer, "markers anchored at their baseline, drawn centred"),
         _ => {}
     }
@@ -826,7 +1023,13 @@ fn point_offset(p: &[(String, String)], size: f32, reference: Option<f64>, layer
 
 /// The data-defined properties switched on in `node`'s own `data_defined_properties`, by name.
 fn active_properties<'a, 'i>(node: Node<'a, 'i>) -> Vec<(&'a str, Node<'a, 'i>)> {
-    let Some(dd) = node.children().find(|c| c.has_tag_name("data_defined_properties")) else { return Vec::new() };
+    active_properties_in(node, "data_defined_properties")
+}
+
+/// The data-defined properties switched on in `node`'s own `tag` (`data_defined_properties` of a
+/// symbol, `dd_properties` of label settings), by name.
+pub(super) fn active_properties_in<'a, 'i>(node: Node<'a, 'i>, tag: &str) -> Vec<(&'a str, Node<'a, 'i>)> {
+    let Some(dd) = node.children().find(|c| c.has_tag_name(tag)) else { return Vec::new() };
     let mut out = Vec::new();
     for props in dd.descendants().filter(|o| o.has_tag_name("Option") && o.attribute("name") == Some("properties")) {
         for p in props.children().filter(|c| c.has_tag_name("Option")).take(64) {
@@ -837,6 +1040,60 @@ fn active_properties<'a, 'i>(node: Node<'a, 'i>) -> Vec<(&'a str, Node<'a, 'i>)>
         }
     }
     out
+}
+
+/// A data-defined property's expression: a field's (`type` 2) quoted, or the expression's own
+/// (`type` 3); `None` for a fixed value or text too long to read.
+pub(super) fn property_text(property: Node) -> Option<String> {
+    let named = |name: &str| {
+        property.children().find(|c| c.has_tag_name("Option") && c.attribute("name") == Some(name)).and_then(|o| o.attribute("value"))
+    };
+    let text = match named("type").map(str::trim) {
+        Some("2") => format!("\"{}\"", named("field")?.trim().replace('"', "\"\"")),
+        Some("3") => super::expr::rustgis_scales(named("expression")?.trim()),
+        _ => return None,
+    };
+    Some(text).filter(|t| !t.is_empty() && t != "\"\"" && t.chars().count() <= rustgis_data::query::MAX_LEN - 32)
+}
+
+/// Takes the data-defined property `name` of a symbol layer (its settings `p`) of a `kind`
+/// symbol into `by` when RustGIS draws it by expression: a marker's size and angle, the fill and
+/// outline colours and the outline's (a line's) width, sizes turned from the layer's unit into
+/// points. False for one it doesn't. A second symbol layer's for the same keeps the first's (noted).
+fn by_expression(
+    kind: Option<&str>,
+    name: &str,
+    property: Node,
+    p: Option<&[(String, String)]>,
+    reference: Option<f64>,
+    by: &mut SymbolBy,
+    layer: &str,
+    report: &mut Report,
+) -> bool {
+    let (marker, fill, line) = (!matches!(kind, Some("fill" | "line")), kind == Some("fill"), kind == Some("line"));
+    let sized = |key: &str, text: String, report: &mut Report| {
+        let unit = p.and_then(|p| prop(p, &format!("{key}_unit")).or(prop(p, SYMBOL_UNIT)));
+        let k = super::in_points(1.0, unit, reference, layer, report);
+        if (k - 1.0).abs() < 1e-9 || !k.is_finite() { text } else { format!("({text}) * {}", (k * 1e6).round() / 1e6) }
+    };
+    let Some(text) = property_text(property) else { return false };
+    let (slot, text) = match name {
+        "size" if marker => (&mut by.size, sized("size", text, report)),
+        "fillColor" if marker || fill => (&mut by.fill, text),
+        "outlineColor" => (&mut by.stroke, text),
+        "outlineWidth" if line => (&mut by.stroke_width, sized("line_width", text, report)),
+        "outlineWidth" => (&mut by.stroke_width, sized("outline_width", text, report)),
+        "angle" if marker => (&mut by.angle, text),
+        _ => return false,
+    };
+    match slot {
+        Some(had) if *had != text => {
+            report.approximated(layer, "symbol layers with different data-defined settings, drawn with the first's")
+        }
+        Some(_) => {}
+        None => *slot = Some(text),
+    }
+    true
 }
 
 /// A data-defined angle that is a field's value (a field property, or the expression `"field"`,
@@ -942,7 +1199,6 @@ fn pattern_name(class: &str) -> &'static str {
 fn marker_name(class: &str) -> &'static str {
     match class {
         "SvgMarker" => "SVG",
-        "RasterMarker" => "raster image",
         "EllipseMarker" => "ellipse",
         _ => "filled",
     }

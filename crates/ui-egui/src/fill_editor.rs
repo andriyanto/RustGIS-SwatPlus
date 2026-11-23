@@ -35,6 +35,11 @@ fn fill_json(f: &FillLayer) -> Value {
                 o["char"] = json!(g.ch.to_string());
                 o["font"] = json!(g.font.as_str());
             }
+            // An image, sent again with every change so the fill keeps it.
+            if let Marker::Picture(p) = marker {
+                o["marker"] = json!("image");
+                o["image"] = json!(p.base64());
+            }
             o
         }
         FillPattern::Gradient { shape, color2, stops, discrete, from, to, spread, angle, in_view } => {
@@ -78,7 +83,28 @@ fn spread_name(s: Spread) -> &'static str {
 }
 
 /// Runs `layer.fillLayers` with `fills` for the class picked (`None`: the layer's).
-fn set_fills(app: &mut RustGisApp, class: Option<&ClassRef>, fills: &[FillLayer]) {
+pub(crate) fn set_fills(app: &mut RustGisApp, class: Option<&ClassRef>, fills: &[FillLayer]) {
+    let (p, replaced) = fills_params(class, fills);
+    if app.run("layer.fillLayers", p).is_ok() {
+        crate::panes::notify_image_replaced(app, replaced);
+    }
+}
+
+/// `layer.fillLayers`' parameters for `fills`, the layer's or `class`'s own, with images that
+/// can't be drawn sent as circles, and how many were.
+fn fills_params(class: Option<&ClassRef>, fills: &[FillLayer]) -> (Value, usize) {
+    let mut replaced = 0;
+    let fills: Vec<FillLayer> = fills
+        .iter()
+        .map(|f| match f.pattern {
+            FillPattern::Dots { marker, size, outline, outline_width, spacing, displacement, offset } => {
+                let (marker, lost) = crate::panes::drawn_marker(marker);
+                replaced += usize::from(lost);
+                FillLayer { pattern: FillPattern::Dots { marker, size, outline, outline_width, spacing, displacement, offset }, ..*f }
+            }
+            _ => *f,
+        })
+        .collect();
     let mut p = json!({"fills": fills.iter().map(fill_json).collect::<Vec<_>>()});
     match class {
         Some(ClassRef::Value(v)) => p["value"] = json!(v),
@@ -86,7 +112,19 @@ fn set_fills(app: &mut RustGisApp, class: Option<&ClassRef>, fills: &[FillLayer]
         Some(ClassRef::Other) => p["other"] = json!(true),
         None => {}
     }
-    let _ = app.run("layer.fillLayers", p);
+    (p, replaced)
+}
+
+/// Fill `i`'s markers as an image, waiting for its file: the fills as they are, the layer's
+/// (`layer`) or `class`'s own, for `layer.fillLayers`.
+pub(crate) fn fill_image(layer: u32, class: Option<&ClassRef>, fills: &[FillLayer], i: usize) -> crate::MarkerImage {
+    let mut fills = fills.to_vec();
+    // The marker the image replaces isn't counted as an image replaced by a circle.
+    if let Some(FillLayer { pattern: FillPattern::Dots { marker, .. }, .. }) = fills.get_mut(i) {
+        *marker = Marker::Circle;
+    }
+    let (p, replaced) = fills_params(class, &fills);
+    crate::MarkerImage::in_list("layer.fillLayers", p, layer, "fills", i, replaced)
 }
 
 /// A fill's kind, as the Draw list names it.
@@ -159,7 +197,7 @@ pub(crate) fn fills_editor(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tok
         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
         ui.painter().rect_filled(r, CornerRadius::same(4), t.ribbon);
         let swatch = Rect::from_center_size(r.center(), vec2(r.width().min(120.0) - 8.0, r.height() - 10.0));
-        preview(ui, swatch, &fills, &base);
+        preview(ui.painter(), swatch, &fills, &base);
         if borrowed {
             ui.label(
                 egui::RichText::new(tl!("This class is drawn with the layer's fills. Changing them here gives it its own."))
@@ -272,7 +310,9 @@ pub(crate) fn fills_editor(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tok
                 ui.horizontal(|ui| {
                     let c = f.color.unwrap_or(base.fill);
                     let mut cc = c32(c);
-                    if crate::widgets::color_button(ui, &mut cc).changed() {
+                    let resp = crate::widgets::color_button(ui, &mut cc);
+                    if resp.changed() {
+                        crate::widgets::one_step_per_press(app, &resp);
                         set(app, FillLayer { color: Some(rgba(cc)), ..f });
                     }
                     let mut from_symbol = f.color.is_none();
@@ -281,19 +321,29 @@ pub(crate) fn fills_editor(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tok
                     }
                 });
                 ui.end_row();
-                let number = |ui: &mut Ui, label: &str, v: f32, range: std::ops::RangeInclusive<f32>, suffix: &str| -> Option<f32> {
-                    let input_label = ui.label(tl!(label));
-                    let mut x = v;
-                    let r = ui.add(egui::DragValue::new(&mut x).range(range).speed(0.1).suffix(suffix)).labelled_by(input_label.id);
-                    ui.end_row();
-                    (r.changed() && x != v).then_some(x)
-                };
+                // A number changed, its command run straight after (one step to undo a drag).
+                let number =
+                    |app: &mut RustGisApp, ui: &mut Ui, label: &str, v: f32, range: std::ops::RangeInclusive<f32>, suffix: &str| {
+                        let input_label = ui.label(tl!(label));
+                        let mut x = v;
+                        let resp = ui
+                            .add(egui::DragValue::new(&mut x).update_while_editing(false).range(range).speed(0.1).suffix(suffix))
+                            .labelled_by(input_label.id);
+                        ui.end_row();
+                        let changed = crate::widgets::changed(&resp) && x != v;
+                        if changed {
+                            crate::widgets::one_step_per_press(app, &resp);
+                        }
+                        changed.then_some(x)
+                    };
                 // A gradient's or shapeburst's second colour, and its stops between (set by command).
                 if let FillPattern::Gradient { color2, stops, .. } | FillPattern::Shapeburst { color2, stops, .. } = f.pattern {
                     let input_label = ui.label(tl!("Second color"));
                     ui.horizontal(|ui| {
                         let mut cc = c32(color2);
-                        if crate::widgets::color_button(ui, &mut cc).labelled_by(input_label.id).changed() {
+                        let resp = crate::widgets::color_button(ui, &mut cc).labelled_by(input_label.id);
+                        if resp.changed() {
+                            crate::widgets::one_step_per_press(app, &resp);
                             let mut pattern = f.pattern;
                             if let FillPattern::Gradient { color2, .. } | FillPattern::Shapeburst { color2, .. } = &mut pattern {
                                 *color2 = rgba(cc);
@@ -333,7 +383,7 @@ pub(crate) fn fills_editor(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tok
                             .on_hover_text(tl!("Straight across, in rings from its first point, or round its first point"))
                             .labelled_by(input_label.id);
                         ui.end_row();
-                        if let Some(a) = number(ui, "Angle", angle, 0.0..=360.0, "°") {
+                        if let Some(a) = number(app, ui, "Angle", angle, 0.0..=360.0, "°") {
                             set(app, with(shape, spread, a));
                         }
                         let input_label = ui.label(tl!("Spread"));
@@ -366,11 +416,11 @@ pub(crate) fn fills_editor(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tok
                         }
                         ui.end_row();
                         if let Some(d) = distance
-                            && let Some(d) = number(ui, "Distance", d, 0.0..=MAX_BURST_DISTANCE, " pt")
+                            && let Some(d) = number(app, ui, "Distance", d, 0.0..=MAX_BURST_DISTANCE, " pt")
                         {
                             set(app, with(Some(d), blur, ignore_rings));
                         }
-                        if let Some(b) = number(ui, "Blur", f32::from(blur), 0.0..=f32::from(MAX_BURST_BLUR), " px") {
+                        if let Some(b) = number(app, ui, "Blur", f32::from(blur), 0.0..=f32::from(MAX_BURST_BLUR), " px") {
                             set(app, with(distance, b.round() as u8, ignore_rings));
                         }
                         ui.label("");
@@ -385,16 +435,16 @@ pub(crate) fn fills_editor(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tok
                             pattern: FillPattern::Hatch { angle, spacing, width, offset },
                             ..f
                         };
-                        if let Some(a) = number(ui, "Angle", angle, 0.0..=360.0, "°") {
+                        if let Some(a) = number(app, ui, "Angle", angle, 0.0..=360.0, "°") {
                             set(app, hatch(a, spacing, width, offset));
                         }
-                        if let Some(s) = number(ui, "Spacing", spacing, PATTERN_SPACING, " pt") {
+                        if let Some(s) = number(app, ui, "Spacing", spacing, PATTERN_SPACING, " pt") {
                             set(app, hatch(angle, s, width, offset));
                         }
-                        if let Some(w) = number(ui, "Line width", width, 0.0..=MAX_HATCH_WIDTH, " pt") {
+                        if let Some(w) = number(app, ui, "Line width", width, 0.0..=MAX_HATCH_WIDTH, " pt") {
                             set(app, hatch(angle, spacing, w, offset));
                         }
-                        if let Some(o) = number(ui, "Offset", offset, -MAX_PATTERN_OFFSET..=MAX_PATTERN_OFFSET, " pt") {
+                        if let Some(o) = number(app, ui, "Offset", offset, -MAX_PATTERN_OFFSET..=MAX_PATTERN_OFFSET, " pt") {
                             set(app, hatch(angle, spacing, width, o));
                         }
                     }
@@ -412,20 +462,23 @@ pub(crate) fn fills_editor(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tok
                                         set(app, dots(m, size, spacing, displacement));
                                     }
                                 }
+                                if crate::markerpick::entry(ui, matches!(marker, Marker::Picture(_))) {
+                                    crate::markerpick::pick(app, fill_image(l.id, class, &fills, i));
+                                }
                             })
                             .response
                             .labelled_by(input_label.id);
                         ui.end_row();
-                        if let Some(s) = number(ui, "Size", size, 0.0..=MAX_DOT_SIZE, " pt") {
+                        if let Some(s) = number(app, ui, "Size", size, 0.0..=MAX_DOT_SIZE, " pt") {
                             set(app, dots(marker, s, spacing, displacement));
                         }
-                        if let Some(s) = number(ui, "Spacing across", spacing[0], PATTERN_SPACING, " pt") {
+                        if let Some(s) = number(app, ui, "Spacing across", spacing[0], PATTERN_SPACING, " pt") {
                             set(app, dots(marker, size, [s, spacing[1]], displacement));
                         }
-                        if let Some(s) = number(ui, "Spacing down", spacing[1], PATTERN_SPACING, " pt") {
+                        if let Some(s) = number(app, ui, "Spacing down", spacing[1], PATTERN_SPACING, " pt") {
                             set(app, dots(marker, size, [spacing[0], s], displacement));
                         }
-                        if let Some(d) = number(ui, "Rows shifted", displacement[0], 0.0..=(spacing[0] - 0.01).max(0.0), " pt") {
+                        if let Some(d) = number(app, ui, "Rows shifted", displacement[0], 0.0..=(spacing[0] - 0.01).max(0.0), " pt") {
                             set(app, dots(marker, size, spacing, [d, displacement[1]]));
                         }
                     }
@@ -436,10 +489,10 @@ pub(crate) fn fills_editor(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tok
 }
 
 /// The stacked `fills` on `r`, bottom first: a colour fills it, hatch lines cross it at their
-/// angle and spacing, markers sit on their grid (as circles), a gradient or shapeburst shades it
-/// (in cells), each in its colour or `base`'s.
-fn preview(ui: &Ui, r: Rect, fills: &[FillLayer], base: &Symbol) {
-    let p = ui.painter().with_clip_rect(r);
+/// angle and spacing, markers sit on their grid (as circles, images as themselves), a gradient or
+/// shapeburst shades it (in cells), each in its colour or `base`'s.
+pub(crate) fn preview(p: &egui::Painter, r: Rect, fills: &[FillLayer], base: &Symbol) {
+    let p = p.with_clip_rect(r);
     let one = [FillLayer::default()];
     let shown = if fills.is_empty() { &one[..] } else { fills };
     // (Only what the map draws: a hatch of no width, a marker of no size, no colour to show.)
@@ -462,7 +515,9 @@ fn preview(ui: &Ui, r: Rect, fills: &[FillLayer], base: &Symbol) {
                     k += step;
                 }
             }
-            FillPattern::Dots { size, spacing, displacement, .. } => {
+            FillPattern::Dots { marker, size, spacing, displacement, .. } => {
+                // An image, looked up once for all its dots.
+                let image = crate::markerimages::image(p.ctx(), marker);
                 // (No finer than 4 points in the swatch: it is a picture, not every dot.)
                 let [dx, dy] = spacing.map(|s| s.max(4.0));
                 // (Shifts widened with the spacing, so a half shift stays a half.)
@@ -474,7 +529,12 @@ fn preview(ui: &Ui, r: Rect, fills: &[FillLayer], base: &Symbol) {
                     for col in -1..=cols {
                         let x = r.min.x + (col as f32 + 0.5) * dx + if row.rem_euclid(2) == 1 { shift[0] } else { 0.0 };
                         let y = r.min.y + (row as f32 + 0.5) * dy + if col.rem_euclid(2) == 1 { shift[1] } else { 0.0 };
-                        p.circle_filled(pos2(x, y), (size / 2.0).max(0.5), c);
+                        match &image {
+                            Some(image) => image.paint(&p, pos2(x, y), size.max(1.0)),
+                            None => {
+                                p.circle_filled(pos2(x, y), (size / 2.0).max(0.5), c);
+                            }
+                        }
                     }
                 }
             }
@@ -542,11 +602,44 @@ fn along(pattern: &FillPattern, u: f32, v: f32, r: Rect) -> f32 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use egui_kittest::kittest::Queryable;
 
     use super::*;
+
+    /// A fill of image markers shows its image on the preview's grid, not circles (#2266).
+    #[test]
+    fn a_fill_of_image_markers_shows_its_image() {
+        use base64::Engine;
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(6, 3, image::Rgba([10, 120, 230, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let pic = rustgis_engine::map::Picture::new(&base64::engine::general_purpose::STANDARD.encode(&png));
+        let dots = |marker| FillLayer {
+            color: None,
+            pattern: FillPattern::Dots {
+                marker,
+                size: 6.0,
+                outline: None,
+                outline_width: 0.0,
+                spacing: [10.0, 10.0],
+                displacement: [0.0, 0.0],
+                offset: [0.0, 0.0],
+            },
+        };
+        let base = Symbol { stroke_width: 0.0, ..Symbol::default_for(rustgis_engine::data::GeometryType::Polygon, 0) };
+        let ctx = egui::Context::default();
+        let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(40.0, 20.0));
+        let textured =
+            |c: &egui::epaint::ClippedShape| matches!(&c.shape, egui::Shape::Mesh(m) if m.texture_id != egui::TextureId::default());
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| preview(ui.painter(), r, &[dots(Marker::Picture(pic))], &base));
+        assert!(!out.shapes.is_empty() && out.shapes.iter().all(textured));
+        out.textures_delta.clear();
+        // A shape is still circles.
+        let shapes = ctx.run_ui(egui::RawInput::default(), |ui| preview(ui.painter(), r, &[dots(Marker::Circle)], &base)).shapes;
+        assert!(shapes.iter().all(|c| matches!(c.shape, egui::Shape::Circle(_))));
+    }
 
     /// Fills are added (the first the symbol's colour, the next hatch lines over it), drawn as
     /// markers or removed, each a `layer.fillLayers`.

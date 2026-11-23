@@ -75,7 +75,9 @@ Then ask, for example:
 ## Managing the open desktop app
 
 By default each agent gets its own project in memory. To drive the project that is open in the
-desktop app instead, tick **Let your Agents Control RustGIS** in the AI Assistant's settings. It
+desktop app instead, open **Analyze › AI Assistant**, click the **Assistant settings** (gear)
+icon in the pane's header, and tick **Let your Agents Control RustGIS** below **Skills**.
+These are the AI Assistant's settings, separate from the main **Settings** ribbon tab. Ticking it
 starts the relay and shows what an agent needs to connect: the MCP server configuration, and the
 `claude mcp add` / `codex mcp add` commands. While it's ticked, attached agents may also read and
 write files and use the network, without `--yes`. RustGIS remembers the choice and starts the
@@ -128,8 +130,16 @@ Attached calls run on the open app's session through the same tools and refusal 
 private server. `snapshot` additionally supports a real window capture with `mode: "screen"`.
 If the map is not on screen, it falls back to an offscreen render and explains why in `note`.
 The relay holds a screen request until the app has taken the picture, and runs nothing else
-meanwhile. File and network commands need `--yes`, unless **Let your Agents Control RustGIS**
-is ticked.
+meanwhile. Direct `run_command` calls to `map.reloadTiles` and `map.repairTiles` validate local
+PMTiles/MBTiles archives on the desktop's existing background-read worker after admission and,
+when required, approval. Their replies and audit entries wait for the command to actually land;
+later entries in the same JSON-RPC batch and later relay requests wait too. Cancelling, revoking
+the caller or changing the original archive target prevents installation. The original agent
+still owns the resulting undo step. Arbitrary `run` scripts and file-bridge scripts retain their
+existing synchronous execution contract; this does not move their child commands to the worker.
+Notebook cells, task steps and Script pane scripts validate reload and repair inline on the window
+thread, without reload status or cancellation during validation.
+File and network commands need `--yes`, unless **Let your Agents Control RustGIS** is ticked.
 
 Without **Full access**, an attached agent cannot replace the open project:
 `project.new`, `project.open`, `project.openText`, `project.sample` and `project.fromTemplate`
@@ -156,7 +166,11 @@ Passwords, keys and tokens in the arguments, a `run` script's lines included, ar
 they are written. On Linux and macOS the folder and files are readable by you only; on Windows they're protected by
 your user profile's permissions. A batch's calls share the batch's
 `duration_s` and are marked `"batch": true`. An error whose text mentions a credential (a token, a
-password, a bearer…) is logged as withheld rather than risk keeping the credential. Days older than 30 are removed.
+password, a bearer…) is logged as withheld rather than risk keeping the credential. Log days older
+than 30 days are pruned when a logged call creates a new day's file, not by a timer; older files
+can remain while logging is idle. You can remove unwanted day files from this folder yourself.
+Updating does not rewrite old logs. If an older log exposed a credential, rotate it with its
+service before sharing the log.
 
 ### MCP over HTTP
 
@@ -204,7 +218,7 @@ couldn't start: agents then stay on, and the status bar says only the file bridg
    the same rules as the `run` tool: a refused or failing line stops it, and nothing it did to the
    project is kept. Files written by an earlier line stay written.
 3. The outcome is written to `bridge-result.json` in the same folder: `{success, result, lines,
-   layersAdded, notices, error, duration_s, timestamp}`. The status bar says whether it worked.
+   layersAdded, notices, losses, error, duration_s, timestamp}`. The status bar says whether it worked.
 
 Only one RustGIS at a time runs the bridge: a second copy's is refused while the first's runs
 (it holds `bridge.lock`). The bridge runs a script each time the file changes. Whatever the file held when the bridge started
@@ -324,15 +338,15 @@ These behavioral tests in `crates/assistant/src/relay.rs` check the requirements
 
 | Tool | What it does |
 | --- | --- |
-| `list_layers` | The whole project in one call: path and unsaved changes, the view (centre, longitude/latitude extent, scale, projection), the active layer, layers in table-of-contents order (group, type, source, extent, feature count, selection, definition query, renderer, labels, fields, visibility), web tile layers, basemap, tables and layouts with their map frames. `name_filter` keeps the layers and tables whose name holds it; `include_fields: false` leaves fields out |
-| `view_map` | The map as a PNG image at the current view; `width` and `height` default to 1024 × 640, each clamped to 64–2048 pixels |
+| `list_layers` | The whole project in one call: path and unsaved changes, the view (centre, longitude/latitude extent, scale, projection), the active layer, layers in table-of-contents order (group, type, source, extent (rounded outwards to six decimals, so it still holds every coordinate), feature count, selection, definition query, renderer, labels, fields, visibility, transparency), web tile layers, basemap, tables and layouts with their page size in millimetres and their map frames. `name_filter` keeps the layers and tables whose name holds it; `include_fields: false` leaves fields out |
+| `view_map` | The map as a PNG image at the current view; `width` and `height` default to 1024 × 640, each clamped to 64–2048 pixels. A picture over 3.75 MiB (a satellite basemap near 2048 pixels) is drawn again smaller, and its caption gives the size drawn and the size asked. `layout` (a layout's name) draws its page instead, fitted to `width` (and `height` when given); `region` draws part of either at full detail: `[x, y, w, h]` in mm on a layout (up to 600 dpi), `[west, south, east, north]` in degrees on the map. What drawing it said (texts cut off, layers without their cast shadows) follows the caption |
 | `snapshot` | The map as a PNG with JSON metadata: `mode`, `width`, `height`, `extent` (longitude/latitude), `center`, `scale`, `projection`, `render_settled`, `saved` and `note`. `mode: "screen"` captures the RustGIS window through the relay, once the map has finished drawing or after `wait_s` seconds (default 5, clamped to 0–30); `overlays: false` leaves out the map's controls, scale bar, north arrow and sketches. `mode: "render"` draws offscreen at `max_width` (default 1024, clamped to 64–2048 pixels); height follows the view's shape, with each side capped at 2048. It works while the window is hidden. `mode: "auto"` (default) takes the screen when the map is on it. Unavailable screen captures fall back to render. `save_path` also writes the PNG to a file, which needs file access |
 | `search_commands` | Finds RustGIS commands by words: their ids, ribbon locations and parameters |
-| `run_command` | Runs a command by id with JSON parameters; each run is one undo step. The result names the layers it added (`layersAdded`) and what the command said beside it (`notices`), including any parameters it ignored (`layer.moveDown ignores 'steps' (it reads layer)`) |
-| `run` | Runs several commands in one call, as one undo step: a script in the `script.run` format (one `command-id {json}` per line, `#` comments). A failing line stops it, nothing it did to the project is kept, and the error names the line; files an earlier line wrote (an export) stay written. Answers `{success, result, lines, layersAdded, notices, error, duration_s}`, where `result` is the last command's. Each line follows `run_command`'s rules, checked before any line runs |
+| `run_command` | Runs a command by id with JSON parameters; each run that changes the project is one undo step. The result names the layers it added (`layersAdded`) and what the command said beside it (`notices`), including any parameters it ignored (`layer.moveDown ignores 'steps' (it reads layer)`). A notice that reports lost data with a [loss code](cli.md#loss-codes) is also in `losses`, as `{code, kind, text, action}`, so an agent can match the code: for an `assumed.*` code it can ask instead of guessing. A loss that has no code yet is only in `notices`. When the list doesn't fit the output budget beside the result, it is shortened (each entry's `code` and `kind`, then one entry per code with its `count`, then the codes alone) and `lossesTrimmed` is `true`; with the tightest budgets `losses` is left out and only `lossesTrimmed` says so. A failed command's error ends with a `losses:` line of JSON: one entry per code with its `action` and `count`, then the counts alone, then the codes alone, or `lossesTrimmed: true` |
+| `run` | Runs several commands in one call, as one undo step (none when its lines only read the project, moved the view, exported, left a request, or ran a command that reports it changed nothing, such as a move to where the layers already are; a line that sets a value to the one it has still counts): a script in the `script.run` format (one `command-id {json}` per line, `#` comments). A failing line stops it, nothing it did to the project is kept, and the error names the line; files an earlier line wrote (an export) stay written. Answers `{success, result, lines, layersAdded, notices, losses, error, duration_s}`, where `result` is the last command's. Each line follows `run_command`'s rules, checked before any line runs |
 | `search_tools` | Finds geoprocessing tools by words |
 | `describe_tool` | A geoprocessing tool's parameters |
-| `run_tool` | Runs a geoprocessing tool; its output is added to the map as a new layer (with `layersAdded` and `notices` as for `run_command`), or to the project as a standalone table, which the result names (`table`) |
+| `run_tool` | Runs a geoprocessing tool; its output is added to the map as a new layer (with `layersAdded`, `notices` and `losses` as for `run_command`), or to the project as a standalone table, which the result names (`table`) |
 | `read_features` | A vector layer's or a standalone table's attribute rows: `layer` (name or id) or `table` (a standalone table's name or id; a `layer` name that no layer has reads the table of that name), optional `where`, `fields`, `order_by`, `descending` and `selected` (layers only); `limit` defaults to 20, capped at 200. Returns the matching count and rows with `_row`, and a layer's `_lon` and `_lat` |
 | `search_docs` | Searches this documentation and returns the best matching sections |
 | `read_doc` | Reads a documentation page or section as Markdown; `offset` (1-based line) and `limit` (default 2000 lines) page through long results using `next_offset` |
@@ -370,6 +384,10 @@ protocol.
 
 ### Local-agent approvals
 
+These rules govern requests authenticated with the run's token. Local agent programs run with
+your operating-system account and their own tool permissions; a program allowed to read the main
+relay token can use its native-client access described above.
+
 Local agents launched by the assistant use `Relay::grant_reviewed(auto)`, not an unrestricted
 run grant. With automatic approval off, gated tool calls wait in a RustGIS-side queue scoped to
 that grant and exact message, including all tool calls in a batch. `--yes` and the general relay
@@ -378,6 +396,11 @@ stopping the relay cancels pending work. The approval wait has a separate 15-min
 other clients' reads can still run while it waits. Explicit automatic approval bypasses this
 extra queue for that run, but not the reserved-command refusals. Ordinary MCP clients retain
 the access policy described above.
+
+The displayed batch is frozen with its effective parameters, targets and runtime loads. If
+those change while it waits, RustGIS refuses it and the agent must request it again. Delayed
+downloads, tool results and screenshots retain the original grant, check it before starting
+another stage and before landing, and can be completed only once by their owner.
 
 Stopping the relay through its command or status-bar control also turns off its remembered
 agent-control choice. Copyable setup commands are labelled for POSIX shells or PowerShell and

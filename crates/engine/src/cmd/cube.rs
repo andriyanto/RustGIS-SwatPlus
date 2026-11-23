@@ -25,18 +25,20 @@ use super::ps;
 use crate::{CmdResult, CommandSpec as C, Session};
 
 pub fn commands() -> Vec<C> {
-    vec![C::new("cube.trend", "Trend Analysis", "Analyze › Image Analysis", trend_cmd).params(
-        r#"{"cube"?: an entry of cube.catalog (its STAC API, collection, band, cell size and cloud cap, or its Zarr store and variable) | "layers"?: [raster layers, a date each; one on another grid is resampled (nearest) onto the first's] | "layer"?: a Zarr layer (or "path" | "url", "variable", "index", "crs" as for zarr.reduce) or a raster of several bands, a date each (default: the active layer) | "collection": a STAC collection (desktop; read in place over an area, in pieces when large; with url, asset, bbox, maxCloud, cellSize and resampling below, and "start", "end"), "url"?: the collection's STAC API (as for stac.addCube), "asset"?: the collection's band, such as NDVI, "bbox"?: [w, s, e, n] | "view" (the collection's area), "maxCloud"?: a collection's cloud cover cap, "cellSize"?: a collection's cell size in the files' units (the overview level nearest it is read), "resampling"?: "nearest" (default: that overview's pixels as stored) | "average" (each cell the mean of the full images' pixels in it, which reads them), "band"?: 1-based (a stack's band), "dates"?: [dates] (a stack's or the bands' dates, in their order; default: read from the layers' names or files, or the bands' names), "start"?, "end"?: dates (a whole number from 1000 to 9999 is a year; an end given as a year or a month takes all of it), "months"?: [1–12] (one season across years), "test"?: "hamedRao" (default) | "yueWang" | "seasonal" | "original", "seasons"?: parts of a year for the seasonal test (default 12), "alpha"?: 0.05 (above 0, below 0.5), "minValid"?: dates a cell needs (default: half of them, at least 4; the seasonal test also needs 4 in seasons of two or more), "per"?: "year" (default) | "decade", "name"?: text, "ran"?: (internal: a trend the app has worked out)} → four raster layers: Sen's slope, the test's Z and p-value, and the slope where p < alpha"#,
+    vec![C::new("cube.trend", "Trend Analysis", "Analyze › Workflows", trend_cmd).inputs(cube_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).params(
+        r#"{"cube"?: an entry of cube.catalog (its STAC API, collection, band, cell size and cloud cap, or its Zarr store and variable) | "layers"?: [raster layers, a date each; one on another grid is resampled (nearest) onto the first's] | "layer"?: a Zarr layer (or "path" | "url", "variable", "index", "crs" as for zarr.reduce) or a raster of several bands, a date each (default: the active layer) | "collection": a STAC collection (desktop; read in place over an area, in pieces when large; with url, asset, bbox, maxCloud, cellSize and resampling below, and "start", "end"), "url"?: the collection's STAC API (as for stac.addCube), "asset"?: the collection's band, such as NDVI, "mask"?: a collection's quality band (as for cube.reduce), "bbox"?: [w, s, e, n] | "view" (the collection's area), "maxCloud"?: a collection's cloud cover cap, "cellSize"?: a collection's cell size in the files' units (the overview level nearest it is read), "resampling"?: "nearest" (default: that overview's pixels as stored) | "average" (each cell the mean of the full images' pixels in it, which reads them), "band"?: 1-based (a stack's band), "dates"?: [dates] (a stack's or the bands' dates, in their order; default: read from the layers' names or files, or the bands' names), "start"?, "end"?: dates (a whole number from 1000 to 9999 is a year; an end given as a year or a month takes all of it), "months"?: [1–12] (one season across years), "test"?: "hamedRao" (default) | "yueWang" | "seasonal" | "original", "seasons"?: parts of a year for the seasonal test (default 12), "alpha"?: 0.05 (above 0, below 0.5), "minValid"?: dates a cell needs (default: half of them, at least 4; the seasonal test also needs 4 in seasons of two or more), "per"?: "year" (default) | "decade", "name"?: text, "ran"?: (internal: a trend the app has worked out)} → four raster layers: Sen's slope, the test's Z and p-value, and the slope where p < alpha"#,
     ),
-    C::new("cube.reduce", "Summarise a Data Cube over Time", "Analyze › Image Analysis", reduce_cmd).params(
-        r#"{"cube"?: an entry of cube.catalog (as for cube.trend) | "layers"?: [raster layers, a date each; one on another grid is resampled (nearest) onto the first's] | "layer"?: a Zarr layer or a raster of several bands, a date each (default: the active layer) | "path"?: a Zarr store's folder | "url"?: a Zarr store's address, or a STAC collection's API (as for stac.addCube) | "collection": a STAC collection (desktop; read in place over an area, in pieces when large; with url, asset, bbox, maxCloud, cellSize and resampling below, and "start", "end"), "variable"?, "index"?, "crs"?: a Zarr variable's (as for zarr.reduce), "asset"?: the collection's band, such as NDVI, "bbox"?: [w, s, e, n] | "view" (the collection's area), "maxCloud"?: a collection's cloud cover cap, "cellSize"?: a collection's cell size in the files' units (the overview level nearest it is read), "resampling"?: "nearest" (default) | "average" (as for cube.trend), "band"?: 1-based (a stack's band), "dates"?: [dates] (a stack's or the bands' dates, in their order; default: read from the layers' names or files, or the bands' names), "stat": "mean"|"min"|"max"|"sum"|"std" (the population standard deviation, n)|"count"|"countAbove"|"mode" or "majority" (a categorical cube's most frequent class; the least of those tied)|"modeCount" (how many dates had the mode)|"variety" (how many classes)|"changes" (how many times the class changed from one valued date to the next)|"longestRun" (the class of the longest run of dates in one class; the least of those tied)|"longestRunLength" (how many dates that run lasted)|"frequency" (a layer for each class met: its count of dates)|"countIn" (how many dates in the classes given), "above"?: number (countAbove's threshold), "classes"?: [whole numbers 0–255, at most 256] (countIn's classes), "by"?: "all" (default: one layer) | "year" (a layer for each calendar year) | "month" (a layer for each month of the year, across years), "start"?, "end"?: dates (as for cube.trend), "months"?: [1–12] (a season across years), "minValid"?: 0–1 (a cell with a smaller share of its group's dates is left empty; default 0), "name"?: text} → raster layers of the statistic, one for each group (frequency: one for each class of each group)"#,
+    C::new("cube.reduce", "Summarise a Data Cube over Time", "Analyze › Workflows", reduce_cmd).inputs(cube_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).params(
+        r#"{"cube"?: an entry of cube.catalog (as for cube.trend) | "layers"?: [raster layers, a date each; one on another grid is resampled (nearest) onto the first's] | "layer"?: a Zarr layer or a raster of several bands, a date each (default: the active layer) | "path"?: a Zarr store's folder | "url"?: a Zarr store's address, or a STAC collection's API (as for stac.addCube) | "collection": a STAC collection (desktop; read in place over an area, in pieces when large; with url, asset, bbox, maxCloud, cellSize and resampling below, and "start", "end"), "variable"?, "index"?, "crs"?: a Zarr variable's (as for zarr.reduce), "asset"?: the collection's band, such as NDVI, "mask"?: {"asset": the items' quality band, such as SCL, Fmask, qa_pixel or CMASK, and one of "keep": [classes] | "drop": [classes] | "bits": {"set"?: [bits on], "unset"?: [bits off]} (bits 0–63)} (a collection's: a cell is taken at a date only where the same item's quality band lets it through, read onto the band's grid by nearest neighbour; items without it are left out), "bbox"?: [w, s, e, n] | "view" (the collection's area), "maxCloud"?: a collection's cloud cover cap, "cellSize"?: a collection's cell size in the files' units (the overview level nearest it is read), "resampling"?: "nearest" (default) | "average" (as for cube.trend), "band"?: 1-based (a stack's band), "dates"?: [dates] (a stack's or the bands' dates, in their order; default: read from the layers' names or files, or the bands' names), "stat": "mean"|"median"|"min"|"max"|"sum"|"std" (the population standard deviation, n)|"count"|"countAbove"|"first" (the value at the cell's first date with one, in "order": the best pixel)|"mode" or "majority" (a categorical cube's most frequent class; the least of those tied)|"modeCount" (how many dates had the mode)|"variety" (how many classes)|"changes" (how many times the class changed from one valued date to the next)|"longestRun" (the class of the longest run of dates in one class; the least of those tied)|"longestRunLength" (how many dates that run lasted)|"frequency" (a layer for each class met: its count of dates)|"countIn" (how many dates in the classes given), "order"?: first's order of the dates: "clear" (the default with a mask: by the share of the area the mask lets through, the clearest first) | "date" (the default without one: the earliest first) | "-date" (the latest first), "above"?: number (countAbove's threshold), "classes"?: [whole numbers 0–255, at most 256] (countIn's classes), "by"?: "all" (default: one layer) | "year" (a layer for each calendar year) | "month" (a layer for each month of the year, across years), "start"?, "end"?: dates (as for cube.trend), "months"?: [1–12] (a season across years), "minValid"?: 0–1 (a cell with a smaller share of its group's dates is left empty; default 0), "name"?: text} → raster layers of the statistic, one for each group (frequency: one for each class of each group)"#,
     )]
 }
 
 /// The most cell values a cube is read into at once (cells × dates): 64 million, 256 MB, on the
 /// desktop; 16 million, 64 MB, in the browser's smaller memory. A run also takes, on each of its
-/// threads (up to 16 on the desktop, one in the browser), a cell's Sen slopes at a time (dates² ⁄ 2:
-/// at most 16 MB at [`MAX_DATES`], so up to 256 MB more at the peak), freed cell by cell; and its
+/// threads (the shared count on the desktop, by default up to 16, one in the browser), a cell's Sen
+/// slopes at a time (dates² ⁄ 2: at most 16 MB at [`MAX_DATES`], so up to 256 MB more at the peak
+/// on 16 threads; more threads are taken only as the threads' scratch budget holds them), freed
+/// cell by cell; and its
 /// four outputs, four values a cell, made once the block is dropped.
 pub const MAX_VALUES: u64 = if cfg!(target_arch = "wasm32") { 16_000_000 } else { 64_000_000 };
 /// The most pairs of dates a trend compares in all (cells × dates² ⁄ 2), which bounds the time
@@ -94,6 +96,33 @@ pub trait TimeCube: Send + Sync {
     fn nothing_read(&self) -> Option<String> {
         None
     }
+    /// What reading its slices said (a shift a Zarr store's system doesn't apply, …), once each,
+    /// asked once every slice is read: the outputs are on their grid, so it is said of them too.
+    /// A stack's slices are layers, whose notices were said when they were added.
+    fn lost(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Whether its dates are masked by a quality band (a STAC collection's `"mask"`), so each
+    /// has a clear share ([`TimeCube::clear_share`]).
+    fn masked(&self) -> bool {
+        false
+    }
+    /// Date `i`'s clear share of the area, 0 to 1: the part its quality band lets through.
+    /// `None` for a cube with no mask. `cancel` stops it within its reads.
+    fn clear_share(&self, i: usize, cancel: &AtomicBool) -> Result<Option<f64>, String> {
+        let _ = (i, cancel);
+        Ok(None)
+    }
+}
+
+/// `outputs` with what reading the cube's slices said ([`TimeCube::lost`]) on the first of them:
+/// said once for the run, not once a layer.
+fn with_lost(outputs: Result<Vec<Raster>, String>, cube: &dyn TimeCube) -> Result<Vec<Raster>, String> {
+    let mut outputs = outputs?;
+    if let Some(first) = outputs.first_mut() {
+        first.lost = cube.lost();
+    }
+    Ok(outputs)
 }
 
 /// A stack of rasters (or a raster's bands), a date each.
@@ -141,9 +170,9 @@ impl TimeCube for Stack {
     }
 }
 
-/// A Zarr variable along its time dimension.
+/// A Zarr variable along its time dimension, and what reading its slices said, once each.
 #[cfg(not(target_arch = "wasm32"))]
-struct ZarrCube(super::zarr::ZarrCube);
+struct ZarrCube(super::zarr::ZarrCube, std::sync::Mutex<Vec<String>>);
 
 #[cfg(not(target_arch = "wasm32"))]
 impl TimeCube for ZarrCube {
@@ -162,7 +191,17 @@ impl TimeCube for ZarrCube {
                 None => return Ok(None),
             },
         };
+        // A poisoned lock still holds the notices said so far.
+        let mut lost = self.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for l in &r.lost {
+            if !lost.contains(l) {
+                lost.push(l.clone());
+            }
+        }
         Ok(Some((r, 0)))
+    }
+    fn lost(&self) -> Vec<String> {
+        self.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
     fn label(&self) -> String {
         self.0.zt.variable.clone()
@@ -269,10 +308,15 @@ pub const TREND: Needs = Needs { what: "trend", min_dates: trend::MIN_VALUES, or
 pub const SUMMARY: Needs = Needs { what: "summary", min_dates: 2, ordered: false };
 
 /// The cube a command's parameters name: a stack of layers, a Zarr variable, or a raster's bands.
-pub fn cube_from(s: &Session, p: &Value, needs: Needs) -> Result<Box<dyn TimeCube>, String> {
+pub fn cube_from(s: &mut Session, p: &Value, needs: Needs) -> Result<Box<dyn TimeCube>, String> {
     let dates = date_list(p)?;
     let what = needs.what;
-    if let Some(list) = p.get("layers").filter(|v| !v.is_null()) {
+    let choice = cube_choice(s, p)?;
+    // A mask is the same item's quality asset: only a STAC collection's items have one.
+    if p.get("mask").is_some_and(|m| !m.is_null()) && !matches!(choice, CubeChoice::Collection) {
+        return Err("mask is read from a STAC collection's items (\"collection\"), each date's from its own item".into());
+    }
+    if let CubeChoice::Layers(list) = choice {
         let list = list.as_array().ok_or("layers is a list of raster layers")?;
         if list.len() < needs.min_dates {
             return Err(format!("a {what}'s stack needs {} layers or more, a date each", needs.min_dates));
@@ -334,24 +378,14 @@ pub fn cube_from(s: &Session, p: &Value, needs: Needs) -> Result<Box<dyn TimeCub
         stack.grid = first.filter(|_| grids);
         return Ok(Box::new(stack));
     }
-    let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null());
-    // A STAC collection's band, read from its files over an area (#579): named by its collection.
-    if given("collection") {
+    // Branch choice was captured without opening a collection/store.
+    if matches!(choice, CubeChoice::Collection) {
         #[cfg(target_arch = "wasm32")]
         return Err(format!("in the web app, a STAC collection's {what} can't be worked out yet (the desktop app can)"));
         #[cfg(not(target_arch = "wasm32"))]
         return Ok(Box::new(super::stac::stac_cube(s, p)?));
     }
-    let zarr_layer = !given("path") && !given("url") && {
-        let id = s.layer_id(p)?;
-        // A Zarr layer: one following the slider, or a slice, named by its steps (`t2m[time=3]`);
-        // another file's subdataset (GDAL's) goes the bands' way below.
-        s.map()
-            .layer(id)
-            .and_then(|l| l.raster.as_ref())
-            .is_some_and(|r| r.time_zarr.is_some() || r.subdataset.as_deref().is_some_and(|d| d.contains('[')))
-    };
-    if given("path") || given("url") || zarr_layer {
+    if matches!(choice, CubeChoice::Zarr { .. }) {
         // The web app reads no Zarr store along its time axis yet: said, not taken for bands.
         #[cfg(target_arch = "wasm32")]
         return Err(format!("in the web app, a Zarr variable's {what} can't be worked out yet (the desktop app can)"));
@@ -366,7 +400,7 @@ pub fn cube_from(s: &Session, p: &Value, needs: Needs) -> Result<Box<dyn TimeCub
                     cube.zt.variable
                 ));
             }
-            return Ok(Box::new(ZarrCube(cube)));
+            return Ok(Box::new(ZarrCube(cube, std::sync::Mutex::default())));
         }
     }
     let id = s.layer_id(p)?;
@@ -621,7 +655,7 @@ impl TrendRun {
             // first piece is worked out, so a run cancelled or refused before then hasn't taken it.
             if let (0, Some(total)) = (piece, whole) {
                 for band in &mut bands {
-                    band.reserve_exact(total);
+                    reserve(band, total)?;
                 }
             }
             for (k, band) in bands.iter_mut().enumerate() {
@@ -642,20 +676,20 @@ impl TrendRun {
             format!("{} p-value ({})", self.name, self.test.code()),
             format!("{} significant slope per {unit} (p < {})", self.name, self.alpha),
         ];
-        names
+        let outputs = names
             .into_iter()
             .zip(bands)
             .map(|(name, band)| {
                 Raster::new(name, grid.width, height, vec![band], grid.transform, grid.crs, None, raster::ColorHint::Gray, "Float32")
                     .map_err(|e| e.to_string())
             })
-            .collect()
+            .collect();
+        with_lost(outputs, self.cube.as_ref())
     }
 
     /// One piece's slices read into a block, cell by date: the piece's first slice (its grid), the
     /// block, and its cells. Dates are read [`TimeCube::readers`] at a time; `too_long` checks the
     /// run's length on the first slice when the cube didn't know its size.
-    #[allow(clippy::type_complexity)]
     fn read_piece(
         &self,
         piece: usize,
@@ -684,7 +718,8 @@ impl TrendRun {
                     if let Some(e) = too_long.and_then(|f| f(cells)) {
                         return Err(e);
                     }
-                    block = vec![f32::NAN; cells * n];
+                    // Reserved first: a block the machine can't hold is an error, not a crash (#1291).
+                    block = raster::filled(cells, n, f32::NAN).map_err(|e| e.to_string())?;
                     grid = Some(r.clone());
                 }
                 Some(g) => off_grid(self.cube.as_ref(), i, g, &r)?,
@@ -709,7 +744,6 @@ impl TrendRun {
     /// Each cell's trend in `block` (cells × dates), worked out on as many threads as there are
     /// cores: its four outputs a cell. `first` is the block's first cell among all of the run's,
     /// so progress is counted over the whole grid.
-    #[allow(clippy::too_many_arguments)]
     fn work_out(
         &self,
         block: &[f32],
@@ -723,7 +757,7 @@ impl TrendRun {
         done: &AtomicUsize,
     ) -> Result<Vec<f32>, String> {
         let n = self.steps.len();
-        let mut out = vec![f32::NAN; cells * OUTPUTS];
+        let mut out = raster::filled(cells, OUTPUTS, f32::NAN).map_err(|e| e.to_string())?;
         let stopped = AtomicBool::new(false);
         // Cancel is looked at after about the same work whatever the dates: a cell compares n²⁄2
         // pairs, so every 4096 cells for a short series, every cell for a long one.
@@ -762,17 +796,34 @@ impl TrendRun {
                 }
             }
         };
-        // On the desktop, the cells in as many parts as there are cores; the browser has no
+        // On the desktop, the cells in as many parts as the shared thread count; the browser has no
         // threads, so there they are worked out here.
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let threads = std::thread::available_parallelism().map_or(1, |t| t.get()).clamp(1, 16);
+            // Each thread holds a cell's Sen slopes, `n² ⁄ 2` of them, as 8-byte floats: beyond one
+            // thread's, no more than the threads' scratch budget, so a high thread setting doesn't
+            // multiply the peak (16 threads at the most dates fit the smallest budget).
+            let slopes = n.saturating_mul(n).saturating_mul(4).max(1);
+            let threads = rustgis_data::threads::max().min(1 + rustgis_analysis::scratch_budget() / slopes);
             let part = cells.div_ceil(threads).max(1);
-            std::thread::scope(|scope| {
-                for (k, (block, out)) in block.chunks(part * n).zip(out.chunks_mut(part * OUTPUTS)).enumerate() {
-                    let work = &work;
-                    scope.spawn(move || work(first + k * part, block, out));
+            // No more threads than there are parts (10 cells on 8 threads make 5).
+            let threads = cells.div_ceil(part);
+            // The parts are taken from a list, by the threads started and by this one, so a
+            // thread the OS refuses leaves no part undone (and costs speed, not the run).
+            let parts = std::sync::Mutex::new(block.chunks(part * n).zip(out.chunks_mut(part * OUTPUTS)).enumerate().collect::<Vec<_>>());
+            let take = || {
+                loop {
+                    // The lock is let go before the part is worked out.
+                    let next = parts.lock().unwrap_or_else(|e| e.into_inner()).pop();
+                    let Some((k, (block, out))) = next else { break };
+                    work(first + k * part, block, out);
                 }
+            };
+            std::thread::scope(|scope| {
+                for _ in 1..threads {
+                    let _ = std::thread::Builder::new().spawn_scoped(scope, take);
+                }
+                take();
             });
         }
         #[cfg(target_arch = "wasm32")]
@@ -802,17 +853,34 @@ fn read_slices(
     in_order: bool,
     place: &mut dyn FnMut(usize, Option<(Arc<Raster>, usize)>) -> Result<(), String>,
 ) -> Result<(), String> {
+    read_each(cube, steps, cancel, in_order, &|i| cube.slice_of(i, piece), place)
+}
+
+/// Reads something of each of `steps`' dates with `read` (a slice, a clear share) and hands it
+/// to `place` with its place among the steps, as [`read_slices`] says.
+fn read_each<T: Send>(
+    cube: &dyn TimeCube,
+    steps: &[usize],
+    cancel: &AtomicBool,
+    in_order: bool,
+    read: &(dyn Fn(usize) -> Result<T, String> + Sync),
+    place: &mut dyn FnMut(usize, T) -> Result<(), String>,
+) -> Result<(), String> {
     // One at a time in the browser, which has no threads to read on, and where the slices must come
     // in their order (`in_order`): several readers place them as they are read, and one slow read
     // lets the others run ahead of it.
     let readers = if cfg!(target_arch = "wasm32") || in_order { 1 } else { cube.readers().clamp(1, 16).min(steps.len().max(1)) };
-    if readers == 1 {
+    let in_turn = |place: &mut dyn FnMut(usize, T) -> Result<(), String>| -> Result<(), String> {
         for (k, &i) in steps.iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 return Err("cancelled".into());
             }
-            place(k, cube.slice_of(i, piece)?)?;
+            place(k, read(i)?)?;
         }
+        Ok(())
+    };
+    if readers == 1 {
+        in_turn(place)?;
     } else {
         // Several dates read at once, placed here as they come; a few wait at most, so the
         // slices held stay a handful. An error (or Cancel) drops the receiver, which stops the
@@ -822,22 +890,34 @@ fn read_slices(
         #[cfg(not(target_arch = "wasm32"))]
         {
             let next = AtomicUsize::new(0);
+            let capture = rustgis_data::diagnostics::Capture::current();
+            let still = crate::render::rustgis_tiles::cache::current_still();
             std::thread::scope(|scope| -> Result<(), String> {
-                type Read = Result<Option<(Arc<Raster>, usize)>, String>;
-                let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Read)>(readers);
+                let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Result<T, String>)>(readers);
+                let mut started = 0;
                 for _ in 0..readers {
                     let (tx, next) = (tx.clone(), &next);
-                    scope.spawn(move || {
-                        loop {
-                            let k = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(&i) = steps.get(k) else { break };
-                            if cancel.load(Ordering::Relaxed) || tx.send((k, cube.slice_of(i, piece))).is_err() {
-                                break;
+                    let capture = &capture;
+                    let still = still.clone();
+                    let reader = std::thread::Builder::new().spawn_scoped(scope, move || {
+                        crate::render::rustgis_tiles::cache::with_optional_still(still, || {
+                            let _diagnostic_scope = capture.enter();
+                            loop {
+                                let k = next.fetch_add(1, Ordering::Relaxed);
+                                let Some(&i) = steps.get(k) else { break };
+                                if cancel.load(Ordering::Relaxed) || tx.send((k, read(i))).is_err() {
+                                    break;
+                                }
                             }
-                        }
+                        })
                     });
+                    started += usize::from(reader.is_ok());
                 }
                 drop(tx);
+                // A thread the system refuses costs speed: with none, the dates are read here, in turn.
+                if started == 0 {
+                    return in_turn(&mut *place);
+                }
                 for (k, read) in rx {
                     if cancel.load(Ordering::Relaxed) {
                         return Err("cancelled".into());
@@ -917,7 +997,7 @@ impl Stitch {
 }
 
 /// Prepares `cube.trend`: the cube, the dates, the test and its options checked.
-pub fn trend_start(s: &Session, p: &Value) -> Result<TrendRun, String> {
+pub fn trend_start(s: &mut Session, p: &Value) -> Result<TrendRun, String> {
     let merged = super::cube_catalog::with_entry(p)?;
     let p: &Value = &merged;
     // Read for the seasonal test only: another test leaves it alone, whatever it holds.
@@ -959,7 +1039,10 @@ pub fn trend_start(s: &Session, p: &Value) -> Result<TrendRun, String> {
     let day = |i: usize| rustgis_data::time::format(cube.dates().get(i).copied().unwrap_or(f64::NAN), "YYYY-MM-DD");
     let (a, z) = (steps.first().copied().unwrap_or(0), steps.last().copied().unwrap_or(0));
     let label = format!("{} {}–{}", cube.label(), day(a), day(z));
-    let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map_or(label, |n| n.chars().take(200).collect());
+    let name = match ps(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => super::within("name", "the outputs' name", n, 200)?,
+        None => label,
+    };
     Ok(TrendRun { cube, steps, test, alpha, min_valid, per, name, max_pairs: MAX_PAIRS })
 }
 
@@ -1050,12 +1133,26 @@ fn run_telling<T: Send>(
     use std::sync::mpsc::{RecvTimeoutError, channel};
     let (cancel, done) = (AtomicBool::new(false), AtomicUsize::new(0));
     let total = total.max(1);
+    let capture = rustgis_data::diagnostics::Capture::current();
+    let still = crate::render::rustgis_tiles::cache::current_still();
+    // Taken by the worker, or here when the system refuses it a thread.
+    let held = std::sync::Mutex::new(Some(work));
+    let take = || held.lock().unwrap_or_else(|e| e.into_inner()).take();
     std::thread::scope(|scope| {
         let (sent, ended) = channel();
         let (c, d) = (&cancel, &done);
-        let worker = scope.spawn(move || {
-            let _ = sent.send(work(c, d));
+        let worker = std::thread::Builder::new().spawn_scoped(scope, move || {
+            crate::render::rustgis_tiles::cache::with_optional_still(still, || {
+                let _diagnostic_scope = capture.enter();
+                if let Some(work) = take() {
+                    let _ = sent.send(work(c, d));
+                }
+            })
         });
+        // A thread the system refuses costs the progress told, not the run: it runs here.
+        let Ok(worker) = worker else {
+            return take().map_or_else(|| Err(format!("{what} failed unexpectedly")), |work| work(c, d));
+        };
         let mut told = usize::MAX;
         // Waited for, not polled, so a short run returns as soon as it ends.
         let r = loop {
@@ -1092,7 +1189,7 @@ pub fn add_outputs(s: &mut Session, rasters: Vec<Raster>, dates: usize) -> CmdRe
     let mut layers = Vec::new();
     for r in rasters {
         let name = r.name.clone();
-        let tif = raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
+        let tif = raster::geotiff::write_all(&r).map_err(|e| e.to_string())?;
         let file: String = name.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect();
         let layer = rustgis_map::raster::RasterLayer::from_bytes(r, format!("{file}.tif"), tif);
         let out = super::raster::add_raster(s, &name, layer)?;
@@ -1131,6 +1228,10 @@ pub enum Stat {
     LongestRunLength,
     /// How many dates had each class: an output for each class met.
     Frequency,
+    /// The middle value (the mean of the two middle ones, for an even count).
+    Median,
+    /// The value at the first date with one, in the run's order ([`Order`]): the best pixel.
+    First,
 }
 
 impl Stat {
@@ -1151,6 +1252,8 @@ impl Stat {
             Stat::LongestRun => "longestRun",
             Stat::LongestRunLength => "longestRunLength",
             Stat::Frequency => "frequency",
+            Stat::Median => "median",
+            Stat::First => "first",
         }
     }
 
@@ -1187,7 +1290,7 @@ impl Stat {
     /// The statistic asked for: `stat`, countAbove's threshold (`above`) and countIn's classes
     /// (`classes`).
     pub(crate) fn parse(p: &Value) -> Result<Stat, String> {
-        const STATS: &str = "mean, min, max, sum, std, count, countAbove, mode (or majority), modeCount, variety, changes, longestRun, longestRunLength, frequency or countIn";
+        const STATS: &str = "mean, median, min, max, sum, std, count, countAbove, first, mode (or majority), modeCount, variety, changes, longestRun, longestRunLength, frequency or countIn";
         Ok(match ps(p, "stat").map(str::trim).ok_or_else(|| format!("stat is required ({STATS})"))? {
             x if x.eq_ignore_ascii_case("mean") => Stat::Mean,
             x if x.eq_ignore_ascii_case("min") || x.eq_ignore_ascii_case("minimum") => Stat::Min,
@@ -1206,6 +1309,8 @@ impl Stat {
             x if x.eq_ignore_ascii_case("longestRun") => Stat::LongestRun,
             x if x.eq_ignore_ascii_case("longestRunLength") => Stat::LongestRunLength,
             x if x.eq_ignore_ascii_case("frequency") => Stat::Frequency,
+            x if x.eq_ignore_ascii_case("median") => Stat::Median,
+            x if x.eq_ignore_ascii_case("first") => Stat::First,
             x => return Err(format!("unknown stat '{x}' ({STATS})")),
         })
     }
@@ -1262,22 +1367,66 @@ pub(crate) struct Totals {
     counts: Vec<Vec<u16>>,
     /// Why the values can't be summarised as classes, at the first that can't.
     refused: Option<String>,
+    /// Median: each cell's values, `per` a cell (its group's dates), in the order they came.
+    values: Vec<f32>,
+    per: usize,
+    /// First: each cell's value's rank so far (`acc` the value), and the rank of the date being
+    /// added ([`Totals::at`]).
+    rank: Vec<u32>,
+    at: u32,
 }
 
 impl Totals {
-    pub(crate) fn new(stat: Stat, cells: usize) -> Totals {
+    /// Totals for `cells` cells over up to `dates` dates (the median holds them all), their memory
+    /// reserved first: totals the machine can't hold are an error, not a crash (#1291).
+    pub(crate) fn new(stat: Stat, cells: usize, dates: usize) -> Result<Totals, String> {
+        fn each<T: Clone>(cells: usize, v: T) -> Result<Vec<T>, String> {
+            let mut out = Vec::new();
+            reserve(&mut out, cells)?;
+            out.resize(cells, v);
+            Ok(out)
+        }
         let acc = match stat {
-            Stat::Count | Stat::Mode | Stat::Variety | Stat::ModeCount | Stat::LongestRun | Stat::LongestRunLength | Stat::Frequency => {
-                Vec::new()
-            }
-            Stat::Min => vec![f64::INFINITY; cells],
-            Stat::Max => vec![f64::NEG_INFINITY; cells],
-            _ => vec![0.0; cells],
+            Stat::Count
+            | Stat::Mode
+            | Stat::Variety
+            | Stat::ModeCount
+            | Stat::LongestRun
+            | Stat::LongestRunLength
+            | Stat::Frequency
+            | Stat::Median => Vec::new(),
+            Stat::Min => each(cells, f64::INFINITY)?,
+            Stat::Max => each(cells, f64::NEG_INFINITY)?,
+            _ => each(cells, 0.0)?,
         };
-        let m2 = if matches!(stat, Stat::Std) { vec![0.0; cells] } else { Vec::new() };
-        let last = if stat.in_order() { vec![f32::NAN; cells] } else { Vec::new() };
-        let (run, longest) = if stat.runs() { (vec![0; cells], vec![(f32::NAN, 0); cells]) } else { (Vec::new(), Vec::new()) };
-        Totals { stat, n: vec![0; cells], acc, m2, last, run, longest, classes: Vec::new(), counts: Vec::new(), refused: None }
+        let m2 = if matches!(stat, Stat::Std) { each(cells, 0.0)? } else { Vec::new() };
+        let last = if stat.in_order() { each(cells, f32::NAN)? } else { Vec::new() };
+        let (run, longest) = if stat.runs() { (each(cells, 0)?, each(cells, (f32::NAN, 0))?) } else { (Vec::new(), Vec::new()) };
+        let values = if stat == Stat::Median {
+            each(
+                cells.checked_mul(dates).ok_or_else(|| format!("not enough memory for the values of {cells} cells × {dates} dates"))?,
+                f32::NAN,
+            )?
+        } else {
+            Vec::new()
+        };
+        let rank = if stat == Stat::First { each(cells, u32::MAX)? } else { Vec::new() };
+        Ok(Totals {
+            stat,
+            n: each(cells, 0)?,
+            acc,
+            m2,
+            last,
+            run,
+            longest,
+            classes: Vec::new(),
+            counts: Vec::new(),
+            refused: None,
+            values,
+            per: dates,
+            rank,
+            at: 0,
+        })
     }
 
     /// How many class counts it holds: its cells × the classes it has met.
@@ -1296,6 +1445,11 @@ impl Totals {
         self.n.len()
     }
 
+    /// The rank of the date whose values come next, for first: the lowest rank's value is kept.
+    pub(crate) fn at(&mut self, rank: u32) {
+        self.at = rank;
+    }
+
     /// Cell `c`'s next value, a finite one; a categorical statistic's in date order.
     pub(crate) fn add(&mut self, c: usize, v: f64) {
         if self.refused.is_some() || c >= self.n.len() {
@@ -1310,11 +1464,28 @@ impl Totals {
         }
         let Some(k) = self.n.get_mut(c) else { return };
         *k += 1;
+        let nth = *k;
         if self.stat.runs() {
             self.extend_run(c, v as f32);
             return;
         }
-        let k = f64::from(*k);
+        if self.stat == Stat::Median {
+            if nth as usize <= self.per
+                && let Some(slot) = self.values.get_mut(c * self.per + nth as usize - 1)
+            {
+                *slot = v as f32;
+            }
+            return;
+        }
+        if self.stat == Stat::First {
+            if let (Some(r), Some(a)) = (self.rank.get_mut(c), self.acc.get_mut(c))
+                && self.at < *r
+            {
+                (*r, *a) = (self.at, v);
+            }
+            return;
+        }
+        let k = f64::from(nth);
         let (Some(a), m) = (self.acc.get_mut(c), self.m2.get_mut(c)) else { return };
         match self.stat {
             Stat::Mean | Stat::Std => {
@@ -1345,7 +1516,9 @@ impl Totals {
             | Stat::ModeCount
             | Stat::LongestRun
             | Stat::LongestRunLength
-            | Stat::Frequency => {}
+            | Stat::Frequency
+            | Stat::Median
+            | Stat::First => {}
         }
     }
 
@@ -1395,6 +1568,7 @@ impl Totals {
     pub(crate) fn finish(&self, min_share: f64, dates: usize) -> Vec<f32> {
         let need = (min_share.clamp(0.0, 1.0) * dates as f64 - 1e-9).ceil().max(1.0) as u32;
         let count = self.counts_zero();
+        let mut middle: Vec<f32> = Vec::new();
         self.n
             .iter()
             .enumerate()
@@ -1411,6 +1585,12 @@ impl Totals {
                     Stat::ModeCount => self.mode(c).map_or(0.0, |(n, _)| f64::from(n)),
                     Stat::LongestRun => self.longest.get(c).map_or(f64::NAN, |(class, _)| f64::from(*class)),
                     Stat::LongestRunLength => self.longest.get(c).map_or(0.0, |(_, length)| f64::from(*length)),
+                    Stat::Median => {
+                        let from = c * self.per;
+                        middle.clear();
+                        middle.extend_from_slice(self.values.get(from..from + (*k as usize).min(self.per)).unwrap_or_default());
+                        median(&mut middle)
+                    }
                     _ => a,
                 }) as f32
             })
@@ -1467,6 +1647,22 @@ impl Totals {
     }
 }
 
+/// The middle of `v` (the mean of the two middle values for an even count), reordering it; NaN
+/// when empty.
+fn median(v: &mut [f32]) -> f64 {
+    let n = v.len();
+    if n == 0 {
+        return f64::NAN;
+    }
+    let (_, upper, _) = v.select_nth_unstable_by(n / 2, f32::total_cmp);
+    let upper = f64::from(*upper);
+    if n % 2 == 1 {
+        return upper;
+    }
+    let lower = v[..n / 2].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    (f64::from(lower) + upper) / 2.0
+}
+
 /// Whether class `v` is one of countIn's.
 fn in_classes(set: &[u64; 4], v: f64) -> bool {
     (0.0..=255.0).contains(&v) && set.get(v as usize / 64).is_some_and(|w| w >> (v as usize % 64) & 1 == 1)
@@ -1496,6 +1692,15 @@ pub enum By {
     Month,
 }
 
+/// The order in which first takes a cell's dates: by their clear share of the area (a masked
+/// cube's, the clearest first), by date, or latest first.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Order {
+    Clear,
+    Date,
+    Latest,
+}
+
 /// A summary over time of any cube (#579), prepared on the session and computed anywhere with
 /// [`ReduceRun::run`]: the slices folded into running totals as they are read, so a long period
 /// takes no more memory than a short one.
@@ -1508,12 +1713,49 @@ pub struct ReduceRun {
     group_of: Vec<usize>,
     /// Each group's output name and how many of the steps it has.
     groups: Vec<(String, usize)>,
+    /// First's order of the dates.
+    order: Order,
 }
 
 impl ReduceRun {
-    /// The work, for a progress bar: the slices read, every piece's.
+    /// The work, for a progress bar: the slices read, every piece's, and the dates' clear shares
+    /// when first takes them in that order.
     pub fn total(&self) -> usize {
-        self.steps.len() * self.cube.pieces().max(1)
+        self.steps.len() * self.cube.pieces().max(1) + if self.ranks_clear() { self.steps.len() } else { 0 }
+    }
+
+    /// Whether the dates are ranked by their clear share, read before the slices.
+    fn ranks_clear(&self) -> bool {
+        self.stat == Stat::First && self.order == Order::Clear
+    }
+
+    /// Each step's rank for first, 0 the first taken: in date order, latest first, or by the clear
+    /// share of the area (read here, each date's masks, as many at once as the cube reads slices),
+    /// the clearest first and the earliest of those tied.
+    fn ranks(&self, cancel: &AtomicBool, done: &AtomicUsize) -> Result<Vec<u32>, String> {
+        let date = |k: usize| self.steps.get(k).and_then(|i| self.cube.dates().get(*i)).copied().unwrap_or(f64::NAN);
+        let mut by: Vec<usize> = (0..self.steps.len()).collect();
+        match self.order {
+            Order::Date => by.sort_by(|a, b| date(*a).total_cmp(&date(*b))),
+            Order::Latest => by.sort_by(|a, b| date(*b).total_cmp(&date(*a))),
+            Order::Clear => {
+                let mut share = vec![0.0f64; self.steps.len()];
+                let cube = self.cube.as_ref();
+                read_each(cube, &self.steps, cancel, false, &|i| cube.clear_share(i, cancel), &mut |k, got| {
+                    if let Some(s) = share.get_mut(k) {
+                        *s = got.unwrap_or(0.0);
+                    }
+                    done.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                })?;
+                by.sort_by(|a, b| share[*b].total_cmp(&share[*a]).then(date(*a).total_cmp(&date(*b))));
+            }
+        }
+        let mut rank = vec![0u32; by.len()];
+        for (r, k) in by.into_iter().enumerate() {
+            rank[k] = u32::try_from(r).unwrap_or(u32::MAX - 1);
+        }
+        Ok(rank)
     }
 
     /// How many dates it reads.
@@ -1538,6 +1780,7 @@ impl ReduceRun {
         if let Some(e) = whole.and_then(too_many) {
             return Err(e);
         }
+        let rank = if self.stat == Stat::First { self.ranks(cancel, done)? } else { Vec::new() };
         let mut stitch = Stitch::default();
         // Each group's columns so far, by class for frequency; and for frequency each group's
         // value where a class is missing, for a class met first in a later piece.
@@ -1568,11 +1811,23 @@ impl ReduceRun {
                             if let Some(e) = too_many(vals.len()) {
                                 return Err(e);
                             }
+                            // The median holds every date's value of the piece's cells.
+                            if self.stat == Stat::Median
+                                && let Some(e) = too_many_values(vals.len(), self.steps.len())
+                            {
+                                return Err(e);
+                            }
                             grid = Some(r.clone());
                         }
                         Some(first) => off_grid(self.cube.as_ref(), i, first, &r)?,
                     }
-                    let t = totals.get_mut(g).ok_or("a date in no group")?.get_or_insert_with(|| Totals::new(self.stat, vals.len()));
+                    let slot = totals.get_mut(g).ok_or("a date in no group")?;
+                    if slot.is_none() {
+                        let dates = self.groups.get(g).map_or(0, |(_, d)| *d);
+                        *slot = Some(Totals::new(self.stat, vals.len(), dates)?);
+                    }
+                    let t = slot.as_mut().ok_or("a date in no group")?;
+                    t.at(rank.get(k).copied().unwrap_or(0));
                     let nodata = r.nodata.map(|v| v as f32);
                     for (c, v) in vals.iter().enumerate().take(t.cells()) {
                         if v.is_finite() && Some(*v) != nodata {
@@ -1618,14 +1873,14 @@ impl ReduceRun {
                 let (columns, piece_mask) = match (finished.get_mut(g).and_then(Option::take), totals.get_mut(g).and_then(Option::take)) {
                     (Some(out), _) => out,
                     (None, Some(t)) => finish(&t, self.min_share, dates, frequency),
-                    (None, None) => finish(&Totals::new(self.stat, cells), self.min_share, dates, frequency),
+                    (None, None) => finish(&Totals::new(self.stat, cells, 0)?, self.min_share, dates, frequency),
                 };
                 // Their full length when the cube knows it, so they don't grow by doubling.
-                stack_columns(band, mask, columns, &piece_mask, whole);
+                stack_columns(band, mask, columns, &piece_mask, whole)?;
                 if let (0, Some(total)) = (piece, whole)
                     && frequency
                 {
-                    mask.reserve_exact(total);
+                    reserve(mask, total)?;
                 }
                 mask.extend(piece_mask);
             }
@@ -1648,7 +1903,8 @@ impl ReduceRun {
         }
         done.store(self.total(), Ordering::Relaxed);
         let grid = &grid;
-        self.groups
+        let outputs = self
+            .groups
             .iter()
             .zip(bands)
             .flat_map(|((name, _), columns)| {
@@ -1661,7 +1917,8 @@ impl ReduceRun {
                         .map_err(|e| e.to_string())
                 })
             })
-            .collect()
+            .collect();
+        with_lost(outputs, self.cube.as_ref())
     }
 }
 
@@ -1701,7 +1958,7 @@ fn classes_over(totals: &[Option<Totals>], finished: &[Option<(Columns, Vec<f32>
 /// Puts a piece's columns under a group's so far, by key: a class the piece didn't meet gets the
 /// piece's `piece_mask`, and one met first in this piece the pieces' before it (`mask`). A column
 /// made here takes its full length, `whole` cells, when the cube knows it.
-fn stack_columns(outs: &mut Columns, mask: &[f32], columns: Columns, piece_mask: &[f32], whole: Option<usize>) {
+fn stack_columns(outs: &mut Columns, mask: &[f32], columns: Columns, piece_mask: &[f32], whole: Option<usize>) -> Result<(), String> {
     let order = |a: &Option<f32>, b: &Option<f32>| match (a, b) {
         (Some(a), Some(b)) => a.total_cmp(b),
         _ => a.is_some().cmp(&b.is_some()),
@@ -1715,7 +1972,8 @@ fn stack_columns(outs: &mut Columns, mask: &[f32], columns: Columns, piece_mask:
                 }
             }
             Err(at) => {
-                let mut b = Vec::with_capacity(whole.unwrap_or(0).max(mask.len() + column.len()));
+                let mut b = Vec::new();
+                reserve(&mut b, whole.unwrap_or(0).max(mask.len() + column.len()))?;
                 b.extend_from_slice(mask);
                 b.extend(column);
                 outs.insert(at, (key, b));
@@ -1727,11 +1985,18 @@ fn stack_columns(outs: &mut Columns, mask: &[f32], columns: Columns, piece_mask:
             b.extend_from_slice(piece_mask);
         }
     }
+    Ok(())
+}
+
+/// Room for `cells` more values in `v`, reserved first: outputs the machine can't hold are an
+/// error, not a crash (#1291).
+fn reserve<T>(v: &mut Vec<T>, cells: usize) -> Result<(), String> {
+    v.try_reserve_exact(cells).map_err(|_| format!("not enough memory for the values of {cells} cells"))
 }
 
 /// Prepares `cube.reduce`: the cube, the statistic, and the dates of the period (and months)
 /// asked for, in their groups.
-pub fn reduce_start(s: &Session, p: &Value) -> Result<ReduceRun, String> {
+pub fn reduce_start(s: &mut Session, p: &Value) -> Result<ReduceRun, String> {
     let merged = super::cube_catalog::with_entry(p)?;
     let p: &Value = &merged;
     let stat = Stat::parse(p)?;
@@ -1743,7 +2008,26 @@ pub fn reduce_start(s: &Session, p: &Value) -> Result<ReduceRun, String> {
         Some(x) if x.eq_ignore_ascii_case("month") => By::Month,
         Some(x) => return Err(format!("by is all, year or month, not {x}")),
     };
+    // First's order, checked before the cube is read; a masked cube's dates by clear share by default.
+    let order = match p.get("order").filter(|v| !v.is_null()) {
+        None => None,
+        Some(_) if stat != Stat::First => return Err(format!("order is first's (which date a cell takes first), not {}'s", stat.code())),
+        Some(v) => Some(match v.as_str().map(str::trim) {
+            Some(x) if x.eq_ignore_ascii_case("clear") => Order::Clear,
+            Some(x) if x.eq_ignore_ascii_case("date") => Order::Date,
+            Some(x) if x.eq_ignore_ascii_case("-date") => Order::Latest,
+            _ => return Err(format!("order is clear, date or -date, not {v}")),
+        }),
+    };
     let cube = cube_from(s, p, SUMMARY)?;
+    let order = match order {
+        Some(Order::Clear) if !cube.masked() => {
+            return Err("order clear ranks the dates by the share of the area their mask lets through: give \"mask\"".into());
+        }
+        Some(o) => o,
+        None if cube.masked() => Order::Clear,
+        None => Order::Date,
+    };
     let mut steps = steps(cube.dates(), cube.period(), p)?;
     let date = |i: usize| cube.dates().get(i).copied().unwrap_or(f64::NAN);
     // Changes and runs are counted from each date to the next: the dates in order, which a Zarr
@@ -1781,7 +2065,8 @@ pub fn reduce_start(s: &Session, p: &Value) -> Result<ReduceRun, String> {
     } else {
         format!(" (months {})", months.iter().map(u32::to_string).collect::<Vec<_>>().join(","))
     };
-    let given = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(|n| n.chars().take(200).collect::<String>());
+    let given =
+        ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(|n| super::within("name", "the outputs' name", n, 200)).transpose()?;
     let base = format!("{} {}", cube.label(), stat.code());
     let groups = found
         .iter()
@@ -1797,7 +2082,7 @@ pub fn reduce_start(s: &Session, p: &Value) -> Result<ReduceRun, String> {
             (name, keys.iter().filter(|k| **k == key).count())
         })
         .collect();
-    Ok(ReduceRun { cube, steps, stat, min_share, group_of, groups })
+    Ok(ReduceRun { cube, steps, stat, min_share, group_of, groups, order })
 }
 
 /// `cube.reduce`: the summary computed here (blocking), its progress told where only a shell waits
@@ -1811,6 +2096,54 @@ fn reduce_cmd(s: &mut Session, p: &Value) -> CmdResult {
 
 #[cfg(test)]
 mod tests {
+    /// Both I/O thread hops retain the initiating request context; numeric workers don't need it.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn permission_transport_cube_readers_inherit_run_telling_context() {
+        use crate::render::rustgis_tiles::cache;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
+        };
+        struct Cube(AtomicUsize);
+        impl super::TimeCube for Cube {
+            fn dates(&self) -> &[f64] {
+                &[0.0, 1.0]
+            }
+            fn label(&self) -> String {
+                "synthetic".into()
+            }
+            fn readers(&self) -> usize {
+                2
+            }
+            fn slice(&self, _: usize) -> Result<Option<(Arc<super::Raster>, usize)>, String> {
+                self.0.fetch_add(1, SeqCst);
+                let still = cache::current_still();
+                assert!(still.is_some(), "both run and slice threads must inherit context");
+                cache::check_still(&still)?;
+                Ok(None)
+            }
+        }
+        let live = Arc::new(AtomicBool::new(true));
+        let flag = live.clone();
+        let still: cache::Still = Arc::new(move || flag.load(SeqCst));
+        let cube = Cube(AtomicUsize::new(0));
+        let run = || {
+            super::run_telling(
+                "synthetic",
+                2,
+                |_, _| {},
+                |cancel, _| {
+                    assert!(cache::current_still().is_some(), "run_telling must carry the predicate");
+                    super::read_slices(&cube, &[0, 1], 0, cancel, false, &mut |_, _| Ok(()))
+                },
+            )
+        };
+        assert!(cache::with_still(still.clone(), run).is_ok());
+        live.store(false, SeqCst);
+        assert!(cache::with_still(still, run).unwrap_err().contains("cancelled"));
+        assert!(cube.0.load(SeqCst) >= 3);
+    }
     /// The outputs' names: the date taken out, a MODIS date's A with it, and no other final A.
     #[test]
     fn labels_lose_their_date() {
@@ -1842,7 +2175,6 @@ mod tests {
     /// end is never told.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    #[allow(clippy::panic)]
     fn a_long_run_that_panics_says_why() {
         fn tell(_: &str, share: f64) {
             assert!(share < 1.0, "a run that panicked is told as done");
@@ -1897,7 +2229,7 @@ mod tests {
             }
             fn slice(&self, i: usize) -> Result<Option<(Arc<Raster>, usize)>, String> {
                 // The early dates the slowest, so readers that place as they read finish them last.
-                std::thread::sleep(std::time::Duration::from_millis(((12 - i.min(12)) * 3) as u64));
+                std::thread::sleep(std::time::Duration::from_millis(((12 - i.min(12)) * 3) as u64)); // test-wait: finish early cube dates last to exercise result ordering
                 let gt = GeoTransform { origin_x: 0.0, origin_y: 0.0, pixel_width: 1.0, pixel_height: -1.0 };
                 let r = Raster::new("s", 1, 1, vec![vec![i as f32]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32")
                     .map_err(|e| e.to_string())?;
@@ -1929,17 +2261,32 @@ mod tests {
         let nan = f32::NAN;
         let mut outs = Vec::new();
         let mut mask = Vec::new();
-        super::stack_columns(&mut outs, &mask, vec![(Some(3.0), vec![1.0, nan])], &[0.0, nan], None);
+        super::stack_columns(&mut outs, &mask, vec![(Some(3.0), vec![1.0, nan])], &[0.0, nan], None).unwrap();
         mask.extend([0.0, nan]);
-        super::stack_columns(&mut outs, &mask, vec![(Some(5.0), vec![4.0])], &[0.0], Some(3));
+        super::stack_columns(&mut outs, &mask, vec![(Some(5.0), vec![4.0])], &[0.0], Some(3)).unwrap();
         let got: Vec<(Option<f32>, String)> = outs.iter().map(|(k, b)| (*k, format!("{b:?}"))).collect();
         assert_eq!(got, vec![(Some(3.0), "[1.0, NaN, 0.0]".to_string()), (Some(5.0), "[0.0, NaN, 4.0]".to_string())]);
         // One output, keyed None, is extended piece after piece.
         let mut one = Vec::new();
-        super::stack_columns(&mut one, &[], vec![(None, vec![1.0])], &[], Some(3));
+        super::stack_columns(&mut one, &[], vec![(None, vec![1.0])], &[], Some(3)).unwrap();
         assert!(one.first().is_some_and(|(_, b)| b.capacity() >= 3), "made at its full length");
-        super::stack_columns(&mut one, &[], vec![(None, vec![2.0, 3.0])], &[], Some(3));
+        super::stack_columns(&mut one, &[], vec![(None, vec![2.0, 3.0])], &[], Some(3)).unwrap();
         assert_eq!(one, vec![(None, vec![1.0, 2.0, 3.0])]);
+    }
+
+    /// Totals and columns the machine can't hold are errors, not crashes (#1291); small ones are
+    /// made as before.
+    #[test]
+    fn totals_and_columns_too_large_to_hold_are_errors() {
+        for stat in [super::Stat::Min, super::Stat::Std, super::Stat::Count] {
+            let e = super::Totals::new(stat, usize::MAX / 2, 1).err().unwrap_or_default();
+            assert!(e.contains("not enough memory"), "{e}");
+            assert!(super::Totals::new(stat, 4, 1).is_ok());
+        }
+        let mut outs = Vec::new();
+        let e = super::stack_columns(&mut outs, &[], vec![(Some(1.0), vec![2.0])], &[], Some(usize::MAX / 2)).unwrap_err();
+        assert!(e.contains("not enough memory"), "{e}");
+        assert!(super::stack_columns(&mut outs, &[], vec![(Some(1.0), vec![2.0])], &[], Some(3)).is_ok());
     }
 
     /// The class counts of the groups being read share one cap: two groups each within it can be
@@ -1947,7 +2294,7 @@ mod tests {
     #[test]
     fn groups_being_read_share_the_class_cap() {
         let group = |classes: &[f64]| {
-            let mut t = super::Totals::new(super::Stat::Mode, 10);
+            let mut t = super::Totals::new(super::Stat::Mode, 10, 1).unwrap();
             for (c, v) in classes.iter().enumerate() {
                 t.add(c, *v);
             }
@@ -1962,4 +2309,50 @@ mod tests {
         let e = super::classes_over(&totals, &[], 49).unwrap_or_default();
         assert!(e.contains("50 cells × classes across the groups being read, more than 49"), "{e}");
     }
+}
+
+/// The executor's pure precedence, shared before either planning or I/O-capable cube assembly.
+#[derive(Clone, Copy)]
+enum CubeChoice<'a> {
+    Layers(&'a Value),
+    Collection,
+    Zarr { layer: Option<u32> },
+    Bands(u32),
+}
+/// Purely chooses layer-array, STAC, Zarr or primary-band precedence; it never opens a source.
+fn cube_choice<'a>(input: &impl super::InputSource, p: &'a Value) -> Result<CubeChoice<'a>, String> {
+    let context = input.input_context();
+    let s = &context;
+    let given = |k| p.get(k).is_some_and(|v| !v.is_null());
+    if let Some(layers) = p.get("layers").filter(|v| !v.is_null()) {
+        return Ok(CubeChoice::Layers(layers));
+    }
+    if given("collection") {
+        return Ok(CubeChoice::Collection);
+    }
+    if given("path") || given("url") {
+        return Ok(CubeChoice::Zarr { layer: None });
+    }
+    let id = s.layer_id(p)?;
+    let zarr = s
+        .map()
+        .layer(id)
+        .and_then(|l| l.raster.as_ref())
+        .is_some_and(|r| r.time_zarr.is_some() || r.subdataset.as_deref().is_some_and(|d| d.contains('[')));
+    Ok(if zarr { CubeChoice::Zarr { layer: Some(id) } } else { CubeChoice::Bands(id) })
+}
+/// Binds the chosen in-project cube inputs and leaves explicit external locations in frozen parameters.
+fn cube_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    let s = input;
+    let ids = match cube_choice(input, p)? {
+        CubeChoice::Layers(list) => list
+            .as_array()
+            .ok_or("layers is a list of raster layers")?
+            .iter()
+            .map(|v| s.layer_id(&json!({"layer":v})))
+            .collect::<Result<Vec<_>, _>>()?,
+        CubeChoice::Zarr { layer: Some(id) } | CubeChoice::Bands(id) => vec![id],
+        CubeChoice::Collection | CubeChoice::Zarr { layer: None } => Vec::new(),
+    };
+    Ok(super::Inputs::layers(ids.iter().filter_map(|id| s.map().layer(*id)).map(|l| (s.map(), l))))
 }

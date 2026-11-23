@@ -20,6 +20,8 @@ something on the roadmap (or not on it) interests you, propose it and open a pul
    - what you plan to build: the commands it adds, where it sits in the ribbon (following the
      [ribbon guidelines](docs/contributing.md#ribbon-guidelines)), which formats or tools are involved;
    - which crates it touches and whether it adds a dependency;
+   - for work that grows with the data, how it runs off the UI thread with progress and Cancel
+     (see [Never hold the window](AGENTS.md#never-hold-the-window));
    - how you will test it.
 
    Put it in an issue with the
@@ -28,8 +30,10 @@ something on the roadmap (or not on it) interests you, propose it and open a pul
    below) use an issue and wait for a maintainer's reply; otherwise either works.
 3. **Open a pull request.** Draft pull requests are welcome early, to get feedback on the
    approach before the work is finished. Link the issue (`Closes #123`) and fill in the
-   [pull request template](.github/pull_request_template.md). Before it is ready for review, it
-   must meet the rules and quality gates in [AGENTS.md](AGENTS.md).
+   [pull request template](.github/pull_request_template.md). If the change shows on screen, add
+   screenshots to the description (before and after for a change to existing UI, after only for
+   new UI); see [attachments](docs/contributing.md#documentation). Before it is ready for review,
+   it must meet the rules and quality gates in [AGENTS.md](AGENTS.md).
 
 ## Pick freely or coordinate first
 
@@ -40,10 +44,46 @@ something on the roadmap (or not on it) interests you, propose it and open a pul
   - changes the data model (`Feature`, `Coord`, `Renderer`);
   - adds a dependency or a crate;
   - changes the `.rgis` project format, or an existing command's id or parameters (the CLI,
-    Python, MCP and saved scripts call commands by id);
+    Python, MCP and saved scripts call commands by id; `crates/engine/command-surface.txt` lists
+    them, and a test fails until a pull request that changes one commits the new file);
   - changes the plugin interface;
   - falls under _Exploratory_ in the roadmap.
 
-Roadmap themes are not releases or an order; an item moves to Done when it lands. A
-pull request that lands a roadmap item, or an item of [GEOLIBRE_PARITY.md](GEOLIBRE_PARITY.md),
-updates that file in the same change.
+[Maintaining RustGIS](docs/maintaining.md) says who approves each of these and what happens when a
+proposal gets no reply.
+
+Roadmap themes are not releases or an order. A pull request that lands a roadmap item removes it
+from the roadmap, or narrows it to what is left; one that lands an item of the
+[GeoLibre parity checklist](docs/geolibre-parity.md) updates that file. Either change goes in the same pull
+request.
+
+## AI-assisted contributions
+
+Code written with AI tools is welcome, from anyone, whatever their programming experience
+([#203](https://github.com/opengeos/RustGIS/discussions/203)). A contribution is judged by its
+quality, not by who or what wrote it.
+
+Whoever opens a pull request is responsible for it, however it was written:
+
+- you have read the change and can explain what it does and why;
+- you ran the checks in [AGENTS.md](AGENTS.md) and looked at what the change does (the
+  screenshot, the output file, the numbers) rather than trusting a tool's summary of it;
+- the pull request description and replies to review comments say what is true of the change,
+  whether or not a tool drafted them.
+
+## Where code comes from
+
+RustGIS is licensed under Apache-2.0, so everything in it must be your own work or come from a
+source whose licence allows that.
+
+- Don't copy code from GPL, LGPL, AGPL or other copyleft projects (such as GRASS, QGIS or GEOS),
+  and don't ask an AI tool to translate it into Rust: a translation is still a copy.
+- Implementing an algorithm from a paper, a standard or a specification is fine. Cite it in a
+  code comment or the pull request.
+- If you followed another project's code while writing yours, name it in the pull request so a
+  reviewer can check.
+- Running another program only to produce expected test results is fine, as the
+  [analysis reference corpus](ATTRIBUTION.md) does with GEOS and PROJ.
+
+Report security problems privately, as [SECURITY.md](SECURITY.md) describes, not in an issue or
+pull request.

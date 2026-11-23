@@ -66,7 +66,9 @@ differences in the short answer, in platform, technology and focus, are the ones
   clustering, diagrams, blend modes, layer groups, a data-defined label engine, and style
   interchange with SLD, QGIS QML and Mapbox GL JSON. RustGIS covers the common renderers and
   SQL-filtered label classes, stacked line symbols, symbol levels, blend modes and layer groups,
-  but not rule-based renderers or general data-defined styling.
+  symbol size, colours, outline width and angle by expression, and label text, size, colour and
+  angle by expression, and Unique Values by expression (QGIS's rule-based renderers import as
+  it), but no rule-based renderer edited as rules.
 - **3D.** GeoLibre has a Cesium globe with terrain, 3D Tiles, I3S, Gaussian splats, CZML and
   Google Photorealistic 3D Tiles. RustGIS has a globe, terrain-draped tilted views, 2.5D
   extrusion and LiDAR point layers.
@@ -142,7 +144,7 @@ differences in the short answer, in platform, technology and focus, are the ones
 | **Platforms** | Windows, macOS, Linux, and the browser (WebAssembly) | Windows, macOS, Linux, the browser and PWA, Android, iOS, Docker |
 | **Interface** | Ribbon with Command Search | Menus and panels with a command palette and interface levels |
 | **Map engines** | One native renderer (2D map and globe) | MapLibre, Mapbox GL JS, CesiumJS or the ArcGIS Maps SDK |
-| **Formats** | A focused set read natively; more through GDAL when installed | A wide set in the app, some desktop only (File Geodatabase, MBTiles) |
+| **Formats** | A focused set read natively; more through GDAL when installed | A wide set in the app, some desktop only (File Geodatabase) |
 | **Databases** | PostgreSQL/PostGIS, MySQL/MariaDB and SQL Server/Azure SQL read live (read only); DuckDB through DuckDB; desktop only | DuckDB, PostGIS, SQL Server, Iceberg; PGlite and Sedona in the browser |
 | **Geoprocessing** | Built-in tools plus optional 1,000+ GeoLibre/Whitebox suite; list depends on the runner | 1,000+ (GeoLibre and Whitebox) plus the GeoLibre Toolbox |
 | **Editing** | Create, move, rotate, scale, split, merge, vertex move/insert/delete, snapping; export edits | Vertex editing and write-back to sources |

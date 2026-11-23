@@ -1,11 +1,14 @@
 //! A view is decoded and projected on the source worker. The UI installs Arc-backed caches.
+use rustgis_data::query::Expr;
+use rustgis_data::raster::Crs;
 use rustgis_data::source::{Batch, FeatureSource, Request, memory};
-use rustgis_data::{DataError, Geometry, Result};
+use rustgis_data::{DataError, Dataset, Field, Geometry, Result};
 use rustgis_geom::Extent;
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) struct Cache {
+    pub areas: super::AmbiguousAreas,
     pub projected: Arc<Vec<Option<Geometry>>>,
     pub extents: Arc<Vec<Extent>>,
     pub vertices: usize,
@@ -13,6 +16,10 @@ pub(crate) struct Cache {
     pub mean_bytes: usize,
     pub feature_bytes: usize,
     pub projected_bytes: usize,
+    /// The read kept the definition query's matches (its `matched` counts them).
+    pub filtered: bool,
+    /// The system its rows are given in, the source's own ([`FeatureSource::coord_crs`]).
+    pub crs: Crs,
 }
 
 fn base_bytes(batch: &Batch, projected: &Vec<Option<Geometry>>) -> usize {
@@ -36,6 +43,19 @@ fn retain_evenly<T>(items: &mut Vec<T>, kept: usize) {
     items.shrink_to_fit();
 }
 
+/// A layer's definition query, with the fields it names columns from (the layer's).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Query {
+    pub text: String,
+    pub fields: Vec<Field>,
+    pub env: rustgis_data::query::Env,
+}
+
+/// The bytes of features held at once while a filtered read walks the source.
+const FILTER_CHUNK_BYTES: usize = 8 << 20;
+
+/// Reads a view for the worker: within `bytes` (an interactive view) or whole up to `req.limit`
+/// (`full`, a render or export), with the layer's definition query applied before the limit.
 pub(super) fn read_mode(
     source: &dyn FeatureSource,
     req: &Request,
@@ -44,14 +64,169 @@ pub(super) fn read_mode(
     estimate: usize,
     full: bool,
     fields: Option<usize>,
+    query: Option<&Query>,
 ) -> Result<(Batch, Cache)> {
-    if !full {
-        return read_with_fields(source, req, bytes, projection, estimate, fields);
+    let read = |source: &dyn FeatureSource| -> Result<(Batch, Cache)> {
+        if full {
+            Ok(whole(source.read(req)?, projection, source.coord_crs()))
+        } else {
+            read_with_fields(source, req, bytes, projection, estimate, fields)
+        }
+    };
+    // A query that doesn't parse draws every feature, so the view is read as without one.
+    let Some(query) = query else { return read(source) };
+    let Some((scratch, expr)) = parsed_query(source, query) else { return read(source) };
+    // A view read whole is filtered exactly by the layer. A sampled one would leave matches out
+    // (#1456): the source is walked instead, keeping up to the view's limit of the matches.
+    // Half the budget holds them; their projection and display levels take the rest.
+    let first = read(source)?;
+    if full {
+        check_areas(&expr, &scratch, &first.0.features, &source.info().name, first.0.complete)?;
     }
-    let batch = source.read(req)?;
+    if first.0.complete || !source.visits_chunks() || numbers_rows(&expr) {
+        return Ok(first);
+    }
+    drop(first);
+    let (batch, areas) = read_filtered(source, req, if full { usize::MAX } else { bytes / 2 }, scratch, &expr, full, &query.env)?;
+    let crs = source.coord_crs();
+    let (batch, mut cache) = if full { whole(batch, projection, crs) } else { fit(batch, bytes, projection, fields, crs)? };
+    cache.filtered = true;
+    if rustgis_data::query::uses_area(&expr) {
+        cache.areas = areas;
+    }
+    Ok((batch, cache))
+}
+
+/// What a sampled view of `source` is walked with, keeping the matches: the parsed `query` and a
+/// dataset of its fields to hold each chunk. `None` when the source can't be read a chunk at a
+/// time, the query doesn't parse, or it uses a row number (a row's place in the view, which a walk
+/// of the source can't number the same way).
+pub(super) fn walked(source: &dyn FeatureSource, query: &Query) -> Option<(Dataset, Expr)> {
+    if !source.visits_chunks() {
+        return None;
+    }
+    parsed_query(source, query).filter(|(_, expr)| !numbers_rows(expr))
+}
+
+/// Parse against metadata even when a source cannot be walked: its decoded view still needs
+/// validation before a geometry measurement expression is evaluated by the layer.
+fn parsed_query(source: &dyn FeatureSource, query: &Query) -> Option<(Dataset, Expr)> {
+    let info = source.info();
+    let mut scratch = Dataset::new(info.name.clone(), info.geometry_type, query.fields.clone());
+    // Its chunks come in the source's own system, which `$area` and `$length` measure from.
+    scratch.held_in = source.coord_crs();
+    let expr = rustgis_data::query::parse(&query.text, &scratch).ok()?;
+    Some((scratch, expr))
+}
+
+/// Whether an expression reads `@row_number` anywhere.
+fn numbers_rows(e: &Expr) -> bool {
+    use rustgis_data::query::Var;
+    let any = |es: &[Expr]| es.iter().any(numbers_rows);
+    match e {
+        Expr::Var(v) => *v == Var::RowNumber,
+        Expr::And(es) | Expr::Or(es) | Expr::Concat(es) | Expr::Call(_, es) => any(es),
+        Expr::Not(e) | Expr::IsNullExpr { e, .. } => numbers_rows(e),
+        Expr::Compare(_, a, b) | Expr::LikeExpr { e: a, pattern: b, .. } => numbers_rows(a) || numbers_rows(b),
+        Expr::InExpr { e, list, .. } => numbers_rows(e) || any(list),
+        Expr::Between { e, lo, hi, .. } => numbers_rows(e) || numbers_rows(lo) || numbers_rows(hi),
+        Expr::Chain(first, rest) => numbers_rows(first) || rest.iter().any(|(_, e)| numbers_rows(e)),
+        Expr::Case { subject, arms, otherwise } => {
+            subject.as_deref().is_some_and(numbers_rows)
+                || arms.iter().any(|(w, t)| numbers_rows(w) || numbers_rows(t))
+                || otherwise.as_deref().is_some_and(numbers_rows)
+        }
+        Expr::Cmp { .. } | Expr::Like { .. } | Expr::IsNull { .. } | Expr::In { .. } | Expr::Lit(_) | Expr::Field(_) => false,
+    }
+}
+
+/// The features of `req` that `expr` keeps, walking every feature of its extent: an evenly
+/// spread sample of the matches when more than `req.limit` of them, or more than `bytes`, match.
+/// `scratch` holds each chunk, with the fields `expr` was parsed against.
+fn read_filtered(
+    source: &dyn FeatureSource,
+    req: &Request,
+    bytes: usize,
+    mut scratch: Dataset,
+    expr: &Expr,
+    strict: bool,
+    env: &rustgis_data::query::Env,
+) -> Result<(Batch, super::AmbiguousAreas)> {
+    let limit = req.limit.max(1);
+    let (mut kept, mut kept_bytes, mut step, mut seen) = (Vec::new(), 0usize, 1u64, 0u64);
+    let mut areas = super::AmbiguousAreas::default();
+    let measures_area = rustgis_data::query::uses_area(expr);
+    let summary = source.visit_chunks(req.extent, FILTER_CHUNK_BYTES, &mut |chunk| {
+        scratch.features = chunk.into();
+        if strict
+            && measures_area
+            && let Some(message) = scratch.ambiguous_area_message(scratch.features.iter().filter_map(|f| f.geometry.as_ref()))
+        {
+            return Err(DataError::Format(format!(
+                "Definition query: {}: {message}; count covers this decoded chunk of {} feature(s)",
+                scratch.name,
+                scratch.features.len()
+            )));
+        }
+        if measures_area && !strict {
+            areas.include(super::AmbiguousAreas::from_features_in(&scratch.features, scratch.held_in));
+        }
+        let keep: Vec<bool> = (0..scratch.features.len()).map(|r| rustgis_data::query::matches(expr, &scratch, r, env)).collect();
+        for (feature, _) in std::mem::take(&mut scratch.features).into_iter().zip(keep).filter(|(_, k)| *k) {
+            seen += 1;
+            if !(seen - 1).is_multiple_of(step) {
+                continue;
+            }
+            kept_bytes = kept_bytes.saturating_add(memory::feature_bytes(&feature));
+            kept.push(feature);
+            // Every other match kept, at twice the step, as a source's own sample does.
+            while kept.len() > 1 && (kept.len() > limit || kept_bytes > bytes) {
+                let mut i = 0;
+                kept.retain(|_| {
+                    i += 1;
+                    i % 2 == 1
+                });
+                kept_bytes = memory::features_bytes(&kept);
+                step = step.saturating_mul(2);
+            }
+        }
+        Ok(())
+    })?;
+    Ok((
+        Batch {
+            features: kept,
+            matched: seen,
+            complete: step == 1,
+            skipped: summary.skipped,
+            unread_dates: summary.unread_dates,
+            rounded_dates: summary.rounded_dates,
+            null_text: summary.null_text,
+            notes: summary.notes,
+            not_utf8: summary.not_utf8,
+        },
+        areas,
+    ))
+}
+
+/// An expression parsed against source metadata still needs validation against decoded geometry.
+/// `held`, the query's scratch dataset, holds its coordinates as the source gives them, so the
+/// features' places are read in longitude/latitude from that system.
+fn check_areas(expr: &Expr, held: &Dataset, features: &[rustgis_data::Feature], name: &str, complete: bool) -> Result<()> {
+    if rustgis_data::query::uses_area(expr)
+        && let Some(message) = held.ambiguous_area_message(features.iter().filter_map(|f| f.geometry.as_ref()))
+    {
+        let scope = if complete { String::new() } else { format!("; count covers the {} feature(s) read for this view", features.len()) };
+        return Err(DataError::Format(format!("Definition query: {name}: {message}{scope}")));
+    }
+    Ok(())
+}
+
+/// A whole read's cache: every feature projected, without a byte budget.
+fn whole(batch: Batch, projection: &crate::Projection, crs: Crs) -> (Batch, Cache) {
     let flat = crate::projection::Flat::of(projection);
-    let projected: Vec<_> = batch.features.iter().map(|f| f.geometry.as_ref().map(|g| flat.project(g))).collect();
+    let projected = projected_rows(&flat, crs, &batch.features);
     let cache = Cache {
+        areas: super::AmbiguousAreas::from_features_in(&batch.features, crs),
         extents: Arc::new(projected.iter().map(|g| g.as_ref().map_or(Extent::EMPTY, Geometry::extent)).collect()),
         vertices: projected.iter().flatten().map(crate::lod::thinnable).sum(),
         mean_bytes: 0,
@@ -59,8 +234,23 @@ pub(super) fn read_mode(
         projected_bytes: crate::lod::cache_bytes(&projected),
         projected: Arc::new(projected),
         key: projection.code(),
+        filtered: false,
+        crs,
     };
-    Ok((batch, cache))
+    (batch, cache)
+}
+
+/// Each feature's geometry, given in `crs` (the source's own system), in the map's coordinates on
+/// `flat`, as the map draws a layer held there ([`crate::projection::Flat::held`]): none when the
+/// system can't be converted, as the map draws none of such a layer.
+fn projected_rows(flat: &crate::projection::Flat, crs: Crs, features: &[rustgis_data::Feature]) -> Vec<Option<Geometry>> {
+    if crs == Crs::LonLat {
+        return features.iter().map(|f| f.geometry.as_ref().map(|g| flat.project(g))).collect();
+    }
+    match flat.held(crs) {
+        Ok(held) => features.iter().map(|f| f.geometry.as_ref().map(|g| held.geometry(g).0)).collect(),
+        Err(_) => features.iter().map(|_| None).collect(),
+    }
 }
 
 #[cfg(test)]
@@ -74,6 +264,8 @@ fn read(
     read_with_fields(source, req, bytes, projection, estimate, None)
 }
 
+/// Reads a view within `bytes`: a small probe sizes the rows (unless `estimate` already has),
+/// then as many as fit, padded to the layer's `fields`.
 fn read_with_fields(
     source: &dyn FeatureSource,
     req: &Request,
@@ -83,37 +275,15 @@ fn read_with_fields(
     fields: Option<usize>,
 ) -> Result<(Batch, Cache)> {
     let flat = crate::projection::Flat::of(projection);
+    let crs = source.coord_crs();
     let base_budget = bytes.saturating_mul(3) / 4;
     let count_for = |cost: usize| req.limit.min(base_budget.saturating_mul(9) / 10 / cost.max(1)).max(usize::from(req.limit > 0));
     let mut request = Request { limit: if estimate == 0 { req.limit.min(64) } else { count_for(estimate) }, ..*req };
-    let pad = |batch: &mut Batch| -> Result<()> {
-        if let Some(fields) = fields {
-            let row = fields
-                .saturating_mul(std::mem::size_of::<rustgis_data::Value>())
-                .saturating_add(std::mem::size_of::<rustgis_data::Feature>());
-            let kept = bytes / row;
-            if !batch.features.is_empty() && kept == 0 {
-                return Err(DataError::Format(
-                    "one attribute row exceeds the view memory budget; load it explicitly for full processing".into(),
-                ));
-            }
-            if batch.features.len() > kept {
-                retain_evenly(&mut batch.features, kept);
-                batch.complete = false;
-            }
-            for feature in &mut batch.features {
-                feature.attrs.resize(fields, rustgis_data::Value::Null);
-            }
-        }
-        Ok(())
-    };
     let mut batch = if estimate == 0 || req.limit == 0 { source.read_budgeted(&request, bytes)? } else { source.read(&request)? };
     // Trusted row sizes avoid a second probe, but never exempt a newly oversized row.
-    if batch.features.iter().any(|f| std::mem::size_of::<rustgis_data::Feature>().saturating_add(memory::feature_bytes(f)) > bytes) {
-        return Err(DataError::Format("one feature exceeds the view memory budget; load it explicitly for full processing".into()));
-    }
-    pad(&mut batch)?;
-    let project = |batch: &Batch| batch.features.iter().map(|f| f.geometry.as_ref().map(|g| flat.project(g))).collect::<Vec<_>>();
+    refuse_oversized(&batch, bytes)?;
+    pad(&mut batch, bytes, fields)?;
+    let project = |batch: &Batch| projected_rows(&flat, crs, &batch.features);
     let mut projected = project(&batch);
     // The first small uniform sample measures real geometry and trimmed attributes rather
     // than padded DBF widths. Later windows reuse the measured bytes per row, avoiding a
@@ -132,10 +302,63 @@ fn read_with_fields(
             drop(batch);
             request.limit = target;
             batch = source.read_budgeted(&request, bytes)?;
-            pad(&mut batch)?;
+            pad(&mut batch, bytes, fields)?;
             projected = project(&batch);
         }
     }
+    trim(batch, projected, bytes, projection, crs)
+}
+
+/// A view read some other way (a filtered walk) fitted to the view's `bytes` as a read is.
+fn fit(mut batch: Batch, bytes: usize, projection: &crate::Projection, fields: Option<usize>, crs: Crs) -> Result<(Batch, Cache)> {
+    refuse_oversized(&batch, bytes)?;
+    pad(&mut batch, bytes, fields)?;
+    let flat = crate::projection::Flat::of(projection);
+    let projected = projected_rows(&flat, crs, &batch.features);
+    trim(batch, projected, bytes, projection, crs)
+}
+
+/// Refuses a read holding a feature larger than the whole view budget.
+fn refuse_oversized(batch: &Batch, bytes: usize) -> Result<()> {
+    if batch.features.iter().any(|f| std::mem::size_of::<rustgis_data::Feature>().saturating_add(memory::feature_bytes(f)) > bytes) {
+        return Err(DataError::Format("one feature exceeds the view memory budget; load it explicitly for full processing".into()));
+    }
+    Ok(())
+}
+
+/// Gives every feature the layer's `fields` attributes, first keeping as many rows as their
+/// padded attributes fit in `bytes`.
+fn pad(batch: &mut Batch, bytes: usize, fields: Option<usize>) -> Result<()> {
+    if let Some(fields) = fields {
+        let row =
+            fields.saturating_mul(std::mem::size_of::<rustgis_data::Value>()).saturating_add(std::mem::size_of::<rustgis_data::Feature>());
+        let kept = bytes / row;
+        if !batch.features.is_empty() && kept == 0 {
+            return Err(DataError::Format(
+                "one attribute row exceeds the view memory budget; load it explicitly for full processing".into(),
+            ));
+        }
+        if batch.features.len() > kept {
+            retain_evenly(&mut batch.features, kept);
+            batch.complete = false;
+        }
+        for feature in &mut batch.features {
+            feature.attrs.resize(fields, rustgis_data::Value::Null);
+        }
+    }
+    Ok(())
+}
+
+/// Thins the rows and their projection evenly until they fit three quarters of `bytes`, and
+/// builds the window's cache.
+fn trim(
+    mut batch: Batch,
+    mut projected: Vec<Option<Geometry>>,
+    bytes: usize,
+    projection: &crate::Projection,
+    crs: Crs,
+) -> Result<(Batch, Cache)> {
+    let base_budget = bytes.saturating_mul(3) / 4;
     // Keep room for display levels. Actual allocation accounting also handles projections
     // that split at a world seam and create more parts than the original geometry.
     loop {
@@ -161,9 +384,21 @@ fn read_with_fields(
     let mean_bytes = base_bytes(&batch, &projected).div_ceil(batch.features.len().max(1));
     let feature_bytes = memory::features_bytes(&batch.features);
     let projected_bytes = crate::lod::cache_bytes(&projected);
+    let areas = super::AmbiguousAreas::from_features_in(&batch.features, crs);
     Ok((
         batch,
-        Cache { projected: Arc::new(projected), extents, vertices, key: projection.code(), mean_bytes, feature_bytes, projected_bytes },
+        Cache {
+            areas,
+            projected: Arc::new(projected),
+            extents,
+            vertices,
+            key: projection.code(),
+            mean_bytes,
+            feature_bytes,
+            projected_bytes,
+            filtered: false,
+            crs,
+        },
     ))
 }
 
@@ -172,6 +407,45 @@ mod tests {
     use super::*;
     use rustgis_data::{Dataset, Field, FieldType, GeometryType, Value};
     use rustgis_geom::Coord;
+
+    #[test]
+    fn ambiguous_polar_area_queries_fail_for_complete_and_chunked_sources() {
+        let c = Coord::new;
+        let bad = vec![c(-180.0, 90.0), c(180.0, 90.0), c(-90.0, -90.0), c(90.0, -80.0)];
+        let mut ds = Dataset::new("Polar", GeometryType::Polygon, vec![]);
+        ds.push(Some(Geometry::Polygon(vec![vec![bad.clone()]])), vec![]);
+        ds.push(Some(Geometry::Polygon(vec![vec![bad]])), vec![]);
+        let (bytes, _) = rustgis_data::io::write_bytes(&ds, "fgb").unwrap();
+        let source = rustgis_data::source::open_bytes("polar.fgb", bytes, None).unwrap();
+        let query = Query { text: "$area > 0".into(), fields: vec![], env: Default::default() };
+        let req = Request::all();
+        let error =
+            read_mode(source.as_ref(), &req, usize::MAX, &crate::Projection::WebMercator, 0, true, None, Some(&query)).err().unwrap();
+        assert!(error.to_string().contains("2 ring(s) in 2 feature(s)"), "{error}");
+        let scratch = Dataset::new("Polar", GeometryType::Polygon, vec![]);
+        let expr = rustgis_data::query::parse(&query.text, &scratch).unwrap();
+        let error =
+            read_filtered(source.as_ref(), &Request { extent: None, limit: 1, own: None }, usize::MAX, scratch, &expr, true, &query.env)
+                .unwrap_err();
+        assert!(error.to_string().contains("Polar") && error.to_string().contains("2 ring(s) in 2 feature(s)"), "{error}");
+        // Text mentioning $area is ordinary text, not a request to measure the geometry.
+        let text = Query { text: "'$area' = '$area'".into(), fields: vec![], env: Default::default() };
+        let (batch, _) = read_mode(source.as_ref(), &req, usize::MAX, &crate::Projection::WebMercator, 0, true, None, Some(&text)).unwrap();
+        assert_eq!(batch.features.len(), 2);
+        struct Opaque(Box<dyn FeatureSource>);
+        impl FeatureSource for Opaque {
+            fn info(&self) -> &rustgis_data::source::SourceInfo {
+                self.0.info()
+            }
+            fn read(&self, req: &Request) -> Result<Batch> {
+                self.0.read(req)
+            }
+        }
+        let opaque = Opaque(source);
+        assert!(!opaque.visits_chunks());
+        let error = read_mode(&opaque, &req, usize::MAX, &crate::Projection::WebMercator, 0, true, None, Some(&query)).err().unwrap();
+        assert!(error.to_string().contains("2 ring(s) in 2 feature(s)"), "{error}");
+    }
 
     fn source() -> Box<dyn FeatureSource> {
         let mut ds = Dataset::new("complex", GeometryType::Polyline, vec![Field::new("text", FieldType::Text)]);
@@ -249,14 +523,14 @@ mod tests {
         let source = source();
         let projection = crate::Projection::WebMercator;
         for estimate in [0, 100] {
-            let request = Request { extent: None, limit: 0 };
+            let request = Request { extent: None, limit: 0, own: None };
             let (batch, cache) = read(source.as_ref(), &request, 4096, &projection, estimate).unwrap();
             assert!(batch.features.is_empty());
             assert!(cache.projected.is_empty());
             assert_eq!(batch.matched, 600);
         }
         assert!(read(source.as_ref(), &Request::all(), 1, &projection, 0).is_err());
-        let (full, _) = read_mode(source.as_ref(), &Request::all(), 1, &projection, 0, true, None).unwrap();
+        let (full, _) = read_mode(source.as_ref(), &Request::all(), 1, &projection, 0, true, None, None).unwrap();
         assert!(full.complete);
         assert_eq!(full.features.len(), 600);
     }
@@ -401,9 +675,9 @@ mod tests {
     #[test]
     fn one_feature_can_use_the_optional_display_reservation() {
         let source = source();
-        let req = Request { extent: None, limit: 1 };
+        let req = Request { extent: None, limit: 1, own: None };
         let projection = crate::Projection::WebMercator;
-        let (mut full, cache) = read_mode(source.as_ref(), &req, 1, &projection, 0, true, None).unwrap();
+        let (mut full, cache) = read_mode(source.as_ref(), &req, 1, &projection, 0, true, None, None).unwrap();
         full.features.shrink_to_fit();
         let budget = base_bytes(&full, &cache.projected);
         let (batch, cache) = read(source.as_ref(), &req, budget, &projection, 0).unwrap();

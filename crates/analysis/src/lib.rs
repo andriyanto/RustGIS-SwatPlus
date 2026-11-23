@@ -1,16 +1,23 @@
 //! L2: geoprocessing tools.
 //!
 //! Each tool is a [`ToolSpec`]: an id, a toolbox, parameters for the Tools pane, and a
-//! pure `run` function over datasets. Inputs refer to layers by name through [`Inputs`]. Work is
-//! done in Web Mercator metres, except buffers, which are geodesic: drawn in a projection centred
-//! on each feature (see [`geodesic`]) so a 100 km buffer is 100 km on the ground.
+//! pure `run` function over datasets. Inputs refer to layers by name through [`Inputs`].
+//! The geometry tools and topology checks work in the analysis plane
+//! ([`rustgis_geom::lonlat_to_plane`]: Web Mercator meters within ±85.05°, continued beyond to
+//! the poles), radius searches in Web Mercator meters (on the ground when the center or the
+//! feature's box reaches beyond 85.05°, see [`network::within`]), and buffers are geodesic: drawn
+//! in a projection centered on each feature (see [`geodesic`]) so a 100 km buffer is 100 km on the
+//! ground.
 //!
 //! Tools from external suites (the GeoLibre/Whitebox tools in `rustgis-geolibre`, and plugins
 //! in `rustgis-plugins`) join the built-in ones through [`register_external`]: they're listed by [`tools`], found by
 //! [`tool`] and run by [`run`] like the rest.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod attribute_join;
+pub mod control;
 pub mod convert;
+pub mod density;
 pub mod dggs;
 pub mod geodesic;
 pub mod georef;
@@ -19,19 +26,50 @@ pub mod kriging;
 mod merge;
 pub mod network;
 pub mod neural;
+mod parallel;
+mod parameters;
 pub mod rasterops;
+mod repair;
 pub mod selection;
+pub mod sketch_edit;
 mod stats;
 pub mod tissot;
 mod tools;
 pub mod topology;
 pub mod trend;
+mod validity;
 pub mod warp;
 
-pub use tools::{TOOLS, find_field_case_insensitive, holds_coordinates, param_applies, simplify_geometry, zonal_bands};
+pub use attribute_join::{DuplicateStrategy, JoinFieldOptions, JoinFieldReport, join_field};
+pub use density::{
+    DENSITY_CELLS_FLOOR, KernelType, MAX_DENSITY_WORK, auto_cell_size, kernel_density, max_density_cells, points_extent,
+    resolve_grid_extent, silverman_bandwidth,
+};
+pub use parallel::scratch_budget;
+pub use parameters::StatisticList;
+pub use tools::{
+    SimplifyNotes, TOOLS, find_field_case_insensitive, holds_coordinates, in_its_units, layer_raster_crs, max_buffer_bytes, min_pad,
+    param_applies, past_pole, points_from, points_in, projected_crs, raster_crs, raster_crs_in, simplify_geometry, zonal_bands,
+};
 
 use rustgis_data::Dataset;
 use serde_json::Value;
+
+/// Whether a tool that works in its first input's own system ([`ToolSpec::works_in_own_system`]),
+/// and the Geostatistical Wizard, works in `crs`: a projected system, whose coordinates are a
+/// plane's. Longitude/latitude, Web Mercator and the other world projections (whose plane has the
+/// antimeridian as a seam and the poles as lines,
+/// [`rustgis_data::raster::Crs::is_world_projection`]), and other geographic or geocentric
+/// systems, keep the longitude/latitude path, whose plane and geodesics their coordinates need. So
+/// does a system whose conversion can't be made or gives no parameters, whose unit and axes
+/// ([`rustgis_data::raster::Crs::unit_and_axes`]) aren't known.
+pub fn works_in(crs: rustgis_data::raster::Crs) -> bool {
+    crs != rustgis_data::raster::Crs::LonLat
+        && !crs.is_world_projection()
+        && !crs.is_geographic()
+        && !crs.is_geocentric()
+        && crs.transformer().is_ok_and(|t| t.params().is_some())
+}
 
 /// Parameter kinds, which the Tools pane turns into widgets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,15 +80,31 @@ pub enum ParamKind {
     PolygonLayer,
     /// A point layer.
     PointLayer,
-    /// A field of the layer given by the first `Layer` parameter.
+    /// A field of the associated input (the longest `<input>_` name prefix, else the first layer).
     Field,
-    /// A numeric field of the first layer.
+    /// Several field names entered as text, with suggestions from the associated input (tools
+    /// whose runner takes the list as one string). The runner defines the list syntax;
+    /// suggestions append comma-separated names.
+    FieldNames,
+    /// A numeric field of the associated input.
     NumericField,
-    /// A field of the first layer that can hold coordinates: a numeric field, or a text field
+    /// A field of the associated input that can hold coordinates: a numeric field, or a text field
     /// with numbers written in it (see [`holds_coordinates`]).
     CoordinateField,
+    /// Ordered field names from the named input; accepts the existing string or array values.
+    Fields {
+        input: &'static str,
+    },
+    /// Ordered field/statistic objects from the named input, using the existing JSON keys.
+    FieldStatistics {
+        input: &'static str,
+        statistics: StatisticList,
+    },
     Number,
     Text,
+    /// An expression in the language of queries (`pop_est > 1000000`), read against the
+    /// associated input: text, marked apart from plain text for whoever completes it.
+    Expression,
     /// One of a fixed list of choices.
     Choice(&'static [&'static str]),
     /// A raster layer.
@@ -126,17 +180,37 @@ pub struct RasterInput<'a> {
 #[derive(Clone, Debug)]
 pub struct ToolResult {
     pub output: Output,
+    /// Ordinary messages. Classified losses appear in `losses` only.
     pub messages: Vec<String>,
+    /// Losses identified by the producer. Consumers that display plain text read both
+    /// `messages` and the text of these losses.
+    pub losses: Vec<rustgis_data::loss::LossMessage>,
 }
 
 /// Access to the map's layers by name.
 pub trait Inputs {
+    /// A vector layer or table by name, in the system the tool works in: longitude/latitude, or
+    /// for a tool that works in its first input's own system ([`ToolSpec::works_in_own_system`]),
+    /// that system when it is a projected one. Its outputs are made in the same system.
     fn dataset(&self, layer: &str) -> Option<&Dataset>;
+    /// The system the run works in: the one [`Inputs::dataset`] gives layers in, and its outputs
+    /// are made in. Longitude/latitude unless the tool works in its first input's own projected
+    /// system ([`ToolSpec::works_in_own_system`]); the run's plane follows it ([`convert::Plane`]).
+    fn work_crs(&self) -> rustgis_data::raster::Crs {
+        rustgis_data::raster::Crs::LonLat
+    }
+    /// The project's coordinate system (#2032 C3a), when it has one: the system a grid made from a
+    /// layer in degrees, or with no system, is made in when the run names none
+    /// ([`tools::raster_crs_in`]).
+    fn project_crs(&self) -> Option<rustgis_data::raster::Crs> {
+        None
+    }
     /// A standalone table by its id: an input given as a number, which no name is taken for.
     fn table(&self, _id: u32) -> Option<&Dataset> {
         None
     }
-    /// Selected rows of a layer; tools honour a selection like desktop GIS does.
+    /// The rows of a layer a tool reads: its selection, and the features its definition query
+    /// keeps. Empty means every row.
     fn selection(&self, layer: &str) -> &[usize];
     /// A raster layer by name.
     fn raster(&self, _layer: &str) -> Option<RasterInput<'_>> {
@@ -150,6 +224,18 @@ pub trait Inputs {
     /// A longitude/latitude point on the active map's projection plane, in metres. `None` where
     /// the projection doesn't reach, or with no flat map ([`Inputs::projection_name`]).
     fn project(&self, _c: rustgis_geom::Coord) -> Option<rustgis_geom::Coord> {
+        None
+    }
+    /// A point of the active map's projection plane, in metres, back to longitude/latitude: the
+    /// inverse of [`Inputs::project`], for a tool that lays something out on that plane (the
+    /// anchored hexagon grid). `None` where the projection doesn't reach, or with no flat map.
+    fn unproject(&self, _m: rustgis_geom::Coord) -> Option<rustgis_geom::Coord> {
+        None
+    }
+    /// The meridian where the active map's flat projection wraps from one side to the other, not
+    /// normalised (330 for one centred on 150°E): 180 for Web Mercator, `None` for a projection
+    /// limited to an area of use, or with no flat map.
+    fn map_edge(&self) -> Option<f64> {
         None
     }
     /// The longitude/latitude extent the map's view shows, when there is a view.
@@ -168,6 +254,11 @@ pub trait Inputs {
     ) -> Result<(Vec<u8>, Vec<String>), String> {
         Err("vector-to-PMTiles export is unavailable in this input provider".into())
     }
+
+    /// Builds a raster tile archive with the layer's existing display style.
+    fn raster_to_pmtiles(&self, _layer: &str, _min_zoom: u8, _max_zoom: u8) -> Result<Vec<u8>, String> {
+        Err("raster-to-PMTiles export is unavailable in this input provider".into())
+    }
 }
 
 pub struct ToolSpec {
@@ -177,6 +268,102 @@ pub struct ToolSpec {
     pub summary: &'static str,
     pub params: &'static [ParamSpec],
     pub run: fn(&dyn Inputs, &Value) -> Result<ToolResult, String>,
+}
+
+/// The built-in tools that work in their first input's own coordinate system when it is a
+/// projected one, rather than in longitude/latitude ([`ToolSpec::works_in_own_system`]): those
+/// whose results don't depend on the system's units or shape beyond what the input's own
+/// coordinates give (attributes, vertices, envelopes, validity), the overlays and spatial
+/// relations, worked on in its plane rather than the analysis plane, and the tools that measure
+/// distances in metres, measured flat there in its unit ([`convert::own_length`]). Areas they
+/// report are still measured on the ground.
+const OWN_SYSTEM_TOOLS: &[&str] = &[
+    "summaryStatistics",
+    "pivotTable",
+    "joinField",
+    "selectByAttributes",
+    "exportFeatures",
+    "polygonToLine",
+    "splitLineAtVertices",
+    "featureEnvelopeToPolygon",
+    "unsplitLine",
+    "featureVerticesToPoints",
+    "merge",
+    "checkGeometry",
+    "repairGeometry",
+    // Overlays and spatial relations, worked on in the system's plane (#2032 C2e-2).
+    "clip",
+    "erase",
+    "intersect",
+    "identity",
+    "union",
+    "symmetricalDifference",
+    "update",
+    "split",
+    "dissolve",
+    "convexHull",
+    "featureToPoint",
+    "countPoints",
+    "selectByLocation",
+    "spatialJoin",
+    // Distances in metres, measured flat in the system's unit (#2032 C2e-3).
+    "buffer",
+    "simplify",
+    "pointsAlongLines",
+    "near",
+    // Grids and zones on rasters, from the system's own coordinates (#2032 C2e-4).
+    "idwInterpolation",
+    "kriging",
+    "kernelDensity",
+    "zonalStats",
+    "tabulateArea",
+    // A point's x and y in the system's own unit, areas and lengths still on the ground; networks
+    // searched on the ground, kept under the layer as it is held (#2032 C2e-5).
+    "calculateGeometry",
+    "serviceArea",
+    "odCostMatrix",
+];
+
+impl ToolSpec {
+    /// Whether the tool works in its first input's own coordinate system when that is a projected
+    /// one: its inputs are given to it in that system ([`Inputs::dataset`]), the others converted
+    /// into it, and its outputs are held there. Every other tool, and every external one, works in
+    /// longitude/latitude.
+    ///
+    /// Distances in metres are measured flat there, in the system's unit (#2032 C2e-3).
+    pub fn works_in_own_system(&self) -> bool {
+        OWN_SYSTEM_TOOLS.contains(&self.id) && TOOLS.iter().any(|t| std::ptr::eq(t, self))
+    }
+
+    /// Whether the tool crosses its inputs' edges with each other's (overlays and spatial
+    /// relations) or measures to them (Near), where how an edge runs between its vertices decides
+    /// the result, not only where they are: a run in its first input's own system then says when
+    /// another input's edges, converted into it, run far from where a run in longitude/latitude
+    /// takes them.
+    pub fn reads_edges(&self) -> bool {
+        matches!(
+            self.id,
+            "clip"
+                | "erase"
+                | "intersect"
+                | "identity"
+                | "union"
+                | "symmetricalDifference"
+                | "update"
+                | "split"
+                | "countPoints"
+                | "selectByLocation"
+                | "spatialJoin"
+                | "near"
+        )
+    }
+
+    /// Whether the tool reads the geometry of the layer its parameter `param` names, rather than
+    /// only its attributes (Join Field's join table): one whose geometry it doesn't read needn't
+    /// be converted into the system it works in.
+    pub fn reads_geometry_of(&self, param: &str) -> bool {
+        !(self.id == "joinField" && param == "joinTable")
+    }
 }
 
 /// Runs an external tool (the spec says which).
@@ -194,6 +381,7 @@ struct Source {
     provider: ExternalProvider,
     runner: ExternalRunner,
     tools: Option<&'static [ToolSpec]>,
+    generation: u64,
 }
 
 static SOURCES: std::sync::RwLock<Vec<Source>> = std::sync::RwLock::new(Vec::new());
@@ -205,43 +393,42 @@ pub fn register_external(key: &'static str, provider: ExternalProvider, runner: 
     if let Ok(mut v) = SOURCES.write()
         && !v.iter().any(|s| s.key == key)
     {
-        v.push(Source { key, provider, runner, tools: None });
+        v.push(Source { key, provider, runner, tools: None, generation: 0 });
     }
 }
 
 /// The tools of the suite registered as `key` (empty when there is none).
 pub fn external_tools_of(key: &str) -> &'static [ToolSpec] {
-    let provider = match SOURCES.read() {
+    if let Ok(v) = SOURCES.read()
+        && let Some(tools) = v.iter().find(|s| s.key == key).and_then(|s| s.tools)
+    {
+        return tools;
+    }
+    // Discovery is an explicit loading API. A reload while the provider runs must not
+    // publish the superseded result as the current schema.
+    static LOADING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let Ok(_loading) = LOADING.lock() else { return &[] };
+    let (provider, generation) = match SOURCES.read() {
         Ok(v) => match v.iter().find(|s| s.key == key) {
             Some(Source { tools: Some(t), .. }) => return t,
-            Some(s) => s.provider,
+            Some(s) => (s.provider, s.generation),
             None => return &[],
         },
         Err(_) => return &[],
     };
-    // One load at a time: a second caller waits for the first instead of loading again. The
-    // provider runs without the sources' lock held, so a slow one never blocks the others.
-    static LOADING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _loading = LOADING.lock();
-    if let Ok(v) = SOURCES.read()
-        && let Some(Source { tools: Some(t), .. }) = v.iter().find(|s| s.key == key)
-    {
-        return t;
-    }
-    let tools: &'static [ToolSpec] = Box::leak(
-        std::panic::catch_unwind(provider)
-            .unwrap_or_else(|_| {
-                log::error!("the external tools '{key}' failed to load");
-                Vec::new()
-            })
-            .into_boxed_slice(),
-    );
+    let tools = std::panic::catch_unwind(provider).unwrap_or_else(|_| {
+        log::error!("the external tools '{key}' failed to load");
+        Vec::new()
+    });
     match SOURCES.write() {
-        Ok(mut v) => match v.iter_mut().find(|s| s.key == key) {
-            Some(s) => s.tools.get_or_insert(tools),
-            None => tools,
+        Ok(mut v) => match v.iter_mut().find(|s| s.key == key && s.generation == generation) {
+            Some(s) => s.tools.get_or_insert_with(|| Box::leak(tools.into_boxed_slice())),
+            None => {
+                log::info!("{} external tool schema(s) from '{key}' discarded after its registration changed during loading", tools.len());
+                &[]
+            }
         },
-        Err(_) => tools,
+        Err(_) => &[],
     }
 }
 
@@ -256,6 +443,7 @@ pub fn reload_external() {
     if let Ok(mut v) = SOURCES.write() {
         for s in v.iter_mut() {
             s.tools = None;
+            s.generation = s.generation.saturating_add(1);
         }
     }
 }
@@ -267,6 +455,7 @@ pub fn reload_external_of(key: &str) {
         && let Some(s) = v.iter_mut().find(|s| s.key == key)
     {
         s.tools = None;
+        s.generation = s.generation.saturating_add(1);
     }
 }
 
@@ -304,6 +493,105 @@ pub fn tool(id: &str) -> Option<&'static ToolSpec> {
     tools().find(by_id).or_else(|| TOOLS.iter().find(by_name)).or_else(|| external_tools().into_iter().find(by_name))
 }
 
+/// A tool specification and its runner resolved together, before a later stage starts.
+/// Reloading a suite does not replace either part of this value. Plugin callers must also
+/// pin the plugin load: the plugins suite's runner alone does not identify that load.
+#[derive(Clone, Copy)]
+pub struct ResolvedTool {
+    spec: &'static ToolSpec,
+    source: Option<&'static str>,
+    runner: Option<ExternalRunner>,
+    generation: u64,
+}
+
+impl ResolvedTool {
+    /// An external spec belongs to the exact currently published load, without name lookup.
+    pub fn is_current(&self) -> bool {
+        self.source.is_none_or(|source| {
+            SOURCES.read().is_ok_and(|v| {
+                v.iter().any(|s| {
+                    s.key == source
+                        && s.generation == self.generation
+                        && s.tools.is_some_and(|tools| tools.iter().any(|spec| std::ptr::eq(spec, self.spec)))
+                })
+            })
+        })
+    }
+    /// The immutable schema captured when this tool was resolved.
+    pub fn spec(&self) -> &'static ToolSpec {
+        self.spec
+    }
+
+    /// The captured external suite, or `None` for a built-in tool.
+    pub fn source(&self) -> Option<&'static str> {
+        self.source
+    }
+
+    /// Resolves defaults using this tool's original schema and suite classification.
+    pub fn resolve_params(&self, params: &Value) -> Result<Value, String> {
+        params_for(self.spec, params, self.runner.is_none())
+    }
+}
+
+/// Resolves ids before names, with built-in names winning over external names, as [`tool`]
+/// does. The owning suite and runner come from the same lookup as its specification.
+pub fn resolve(name: &str) -> Option<ResolvedTool> {
+    if TOOLS.iter().any(|t| t.id.eq_ignore_ascii_case(name)) {
+        return resolve_published(name);
+    }
+    let _ = external_tools();
+    resolve_published(name)
+}
+
+/// Published schemas only: this accessor never invokes a provider or performs discovery.
+pub fn published_external_tools_of(key: &str) -> &'static [ToolSpec] {
+    SOURCES.read().ok().and_then(|v| v.iter().find(|s| s.key == key).and_then(|s| s.tools)).unwrap_or(&[])
+}
+
+/// Lists builtins and currently published external schemas without initializing any source.
+pub fn published_tools() -> impl Iterator<Item = &'static ToolSpec> {
+    let external: Vec<_> = SOURCES.read().map(|v| v.iter().flat_map(|s| s.tools.unwrap_or(&[]).iter()).collect()).unwrap_or_default();
+    TOOLS.iter().chain(external)
+}
+
+/// Resolves only published schemas and captures the same publication's runner and generation.
+/// IDs precede names; builtin display names, then a built-in tool's former name
+/// ([`FORMER_NAMES`]), precede external display names. Missing publication
+/// remains missing until trusted native startup or an explicitly authorized loading action.
+pub fn resolve_published(name: &str) -> Option<ResolvedTool> {
+    let builtin = |spec| ResolvedTool { spec, source: None, runner: None, generation: 0 };
+    if let Some(spec) = TOOLS.iter().find(|t| t.id.eq_ignore_ascii_case(name)) {
+        return Some(builtin(spec));
+    }
+    let v = SOURCES.read().ok()?;
+    let external: Vec<_> = v
+        .iter()
+        .flat_map(|s| {
+            s.tools.unwrap_or(&[]).iter().map(move |spec| ResolvedTool {
+                spec,
+                source: Some(s.key),
+                runner: Some(s.runner),
+                generation: s.generation,
+            })
+        })
+        .collect();
+    external
+        .iter()
+        .find(|r| r.spec.id.eq_ignore_ascii_case(name))
+        .copied()
+        .or_else(|| TOOLS.iter().find(|t| t.name.eq_ignore_ascii_case(name)).map(builtin))
+        .or_else(|| {
+            let id = FORMER_NAMES.iter().find(|(old, _)| old.eq_ignore_ascii_case(name))?.1;
+            TOOLS.iter().find(|t| t.id == id).map(builtin)
+        })
+        .or_else(|| external.into_iter().find(|r| r.spec.name.eq_ignore_ascii_case(name)))
+}
+
+/// Built-in tools' display names before a rename, and the ids they name: a script or notebook
+/// saved with the old name still runs the tool, after the built-in names have had their turn and
+/// before an external tool's name, as when the old name was the built-in's own.
+const FORMER_NAMES: &[(&str, &str)] = &[("A5 Grid", "a5Grid"), ("Aggregate Points to A5", "a5Aggregate")];
+
 /// The runner for external tools; never called (external specs carry the runner's id).
 pub fn external_placeholder(_: &dyn Inputs, _: &Value) -> Result<ToolResult, String> {
     Err("this tool runs through the external suite".into())
@@ -313,9 +601,46 @@ pub fn external_placeholder(_: &dyn Inputs, _: &Value) -> Result<ToolResult, Str
 /// [`run`] does this first; a host that runs an external tool another way (the browser's
 /// asynchronous runner) does it too, so both check parameters the same way.
 pub fn resolve_params(spec: &ToolSpec, params: &Value) -> Result<Value, String> {
+    params_for(spec, params, source_of(spec).is_none())
+}
+
+/// The keys of `params` that `spec` doesn't read, for an error that a required parameter is
+/// missing (#2307): a misspelled key is the likely reason, and a failed run's warnings are taken
+/// back, so the error says it: " (given 'clips', which Clip doesn't read)". Empty when there are
+/// none. Bounded as [`quoted_keys`] bounds them. A caller adding it to an error the tool gave
+/// checks for this exact text, so it isn't said twice.
+pub fn unread(spec: &ToolSpec, params: &Value) -> String {
+    let Some(given) = params.as_object() else { return String::new() };
+    let unknown: Vec<&str> = given.keys().map(String::as_str).filter(|k| !is_expected_key(spec, params, k)).collect();
+    if unknown.is_empty() {
+        return String::new();
+    }
+    format!(" (given {}, which {} doesn't read)", quoted_keys(unknown), spec.name)
+}
+
+/// Parameter keys a command or tool was given but doesn't read, quoted for a notice or an error
+/// (#194, #2307): `'a', 'b', 'c', 'd', 'e', 2 more`. Bounded, since the keys come from the caller:
+/// the first five, sorted, each cut to 40 characters, then how many more.
+pub fn quoted_keys(mut unknown: Vec<&str>) -> String {
+    unknown.sort_unstable();
+    // A control character (a newline, an escape) would reach a terminal as it is: shown as `?`.
+    let clip = |k: &str| {
+        let safe = k.chars().map(|c| if c.is_control() { '?' } else { c });
+        if k.chars().count() > 40 { safe.take(40).chain(['…']).collect() } else { safe.collect::<String>() }
+    };
+    let mut said: Vec<String> = unknown.iter().take(5).map(|k| format!("'{}'", clip(k))).collect();
+    if unknown.len() > 5 {
+        said.push(format!("{} more", unknown.len() - 5));
+    }
+    said.join(", ")
+}
+
+/// Applies the captured schema without looking its suite up again after a reload.
+fn params_for(spec: &ToolSpec, params: &Value, built_in: bool) -> Result<Value, String> {
     let mut p = params.as_object().cloned().unwrap_or_default();
-    // Not an external suite's tool (a copy of a built-in spec counts as built-in).
-    let built_in = source_of(spec).is_none();
+    if built_in {
+        tools::normalize_params(spec, &mut p);
+    }
     for ps in spec.params {
         if !p.contains_key(ps.name)
             && !ps.default.is_empty()
@@ -324,36 +649,121 @@ pub fn resolve_params(spec: &ToolSpec, params: &Value) -> Result<Value, String> 
             p.insert(ps.name.to_string(), v);
         }
         if ps.required && p.get(ps.name).is_none_or(|v| v.is_null() || v.as_str() == Some("")) {
-            return Err(format!("{}: '{}' is required", spec.name, ps.label));
+            return Err(format!("{}: '{}' is required{}", spec.name, ps.label, unread(spec, params)));
         }
         // The built-in tools' choices are the whole list. An external tool's (GeoLibre's, a
         // plugin's) can be looser, such as GeoLibre's comma-separated lists of options: its own
         // runner checks them.
+        // A refused value's error names the keys it doesn't read too, as a missing one's does.
         if let ParamKind::Choice(choices) = ps.kind
             && built_in
             && let Some(v) = p.get_mut(ps.name)
         {
-            *v = choice(spec, ps, choices, v)?;
+            *v = choice(spec, ps, choices, v).map_err(|e| format!("{e}{}", unread(spec, params)))?;
+        }
+        if ps.kind == ParamKind::Bool
+            && built_in
+            && let Some(v) = p.get_mut(ps.name)
+        {
+            *v = boolean(spec, ps, v).map_err(|e| format!("{e}{}", unread(spec, params)))?;
         }
     }
     Ok(Value::Object(p))
+}
+
+pub use tools::JOIN_FIELD_ALIASES;
+
+/// Whether a parameter key is declared by `spec` or accepted as a valid parameter alias.
+pub fn is_accepted_param(spec: &ToolSpec, key: &str) -> bool {
+    spec.params.iter().any(|p| p.name == key) || (spec.id == "joinField" && JOIN_FIELD_ALIASES.contains(&key))
+}
+
+/// Whether a key given with a run isn't one to warn of (#2307): one [`is_accepted_param`] accepts,
+/// or the name the app's tool dialog puts beside a table's id for the run's history: `<name>_name`
+/// beside a layer parameter `<name>` that holds a table id (a number, or its digits as text for a
+/// tool that isn't built in, read as a table id is read). No tool reads it, so it isn't a
+/// parameter to run over either; given without the id, it's taken for a stray.
+pub fn is_expected_key(spec: &ToolSpec, params: &Value, key: &str) -> bool {
+    // A built-in tool reads digit text as a name, not a table id.
+    let table_id = |id: &Value| {
+        id.as_u64().is_some_and(|n| u32::try_from(n).is_ok())
+            || (source_of(spec).is_some() && id.as_str().is_some_and(|t| t.trim().parse::<u32>().is_ok()))
+    };
+    is_accepted_param(spec, key)
+        || key.strip_suffix("_name").is_some_and(|base| {
+            spec.params.iter().any(|p| p.name == base && matches!(p.kind, ParamKind::Layer)) && params.get(base).is_some_and(table_id)
+        })
+}
+
+/// The names a tool reads one of its parameters under, `key` among them, or none when it has no
+/// other names (Join Field takes its target as `target`, `input` or `target_layer`).
+pub fn param_aliases(spec: &ToolSpec, key: &str) -> &'static [&'static str] {
+    const JOIN_FIELD: &[&[&str]] = &[
+        &["target", "input", "target_layer"],
+        &["joinTable", "join", "source", "join_table"],
+        &["targetField", "target_field", "key", "target_key"],
+        &["joinField", "join_field", "join_key"],
+        &["duplicates", "duplicateStrategy", "duplicate_strategy"],
+    ];
+    if spec.id != "joinField" {
+        return &[];
+    }
+    JOIN_FIELD.iter().find(|group| group.contains(&key)).copied().unwrap_or(&[])
+}
+
+/// A built-in tool's on-off parameter as `true` or `false` (text saying so counts). Anything else is
+/// an error, never a guess at what `"yes"` or `1` meant (#406). A blank value, or null, is the
+/// default.
+fn boolean(spec: &ToolSpec, ps: &ParamSpec, v: &Value) -> Result<Value, String> {
+    let default = || serde_json::from_str(ps.default).unwrap_or(Value::Null);
+    match v {
+        Value::Bool(_) => Ok(v.clone()),
+        Value::Null => Ok(default()),
+        Value::String(s) if s.trim().is_empty() => Ok(default()),
+        Value::String(s) if s.trim().eq_ignore_ascii_case("true") => Ok(Value::Bool(true)),
+        Value::String(s) if s.trim().eq_ignore_ascii_case("false") => Ok(Value::Bool(false)),
+        _ => Err(format!("{}: '{}' must be true or false (not {})", spec.name, ps.label, shown(v))),
+    }
+}
+
+/// A refused value as JSON for its message: up to 80 characters, then "…". A value can be huge,
+/// and is written out only that far (serde_json stops when its writer does).
+fn shown(v: &Value) -> String {
+    struct Upto(String, usize);
+    impl std::fmt::Write for Upto {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            for c in s.chars() {
+                if self.1 == 0 {
+                    return Err(std::fmt::Error);
+                }
+                self.0.push(c);
+                self.1 -= 1;
+            }
+            Ok(())
+        }
+    }
+    let mut out = Upto(String::new(), 80);
+    if std::fmt::write(&mut out, format_args!("{v}")).is_err() {
+        out.0.push('…');
+    }
+    out.0
 }
 
 /// A built-in tool's choice parameter as one of its choices, spelled as declared (`"meters"` is
 /// `"Meters"`). Any other value is an error naming the choices: a tool never guesses what an
 /// unknown one meant (#406). A blank value is the declared default.
 fn choice(spec: &ToolSpec, ps: &ParamSpec, choices: &[&str], v: &Value) -> Result<Value, String> {
-    let given = match v {
+    let given: std::borrow::Cow<'_, str> = match v {
         Value::Null => return Ok(Value::Null),
         // Blank: the declared default, as when it's left out.
         Value::String(s) if s.trim().is_empty() => return Ok(serde_json::from_str(ps.default).unwrap_or_else(|_| v.clone())),
-        Value::String(s) => s.trim().to_string(),
-        Value::Number(_) | Value::Bool(_) => v.to_string(),
-        _ => String::new(),
+        Value::String(s) => s.trim().into(),
+        Value::Number(_) | Value::Bool(_) => v.to_string().into(),
+        _ => "".into(),
     };
     match choices.iter().find(|c| c.eq_ignore_ascii_case(&given)) {
         Some(c) => Ok(Value::String((*c).to_string())),
-        None => Err(format!("{}: '{}' must be one of {} (not {v})", spec.name, ps.label, choices.join(", "))),
+        None => Err(format!("{}: '{}' must be one of {} (not {})", spec.name, ps.label, choices.join(", "), shown(v))),
     }
 }
 
@@ -378,9 +788,265 @@ pub fn run(id: &str, inputs: &dyn Inputs, params: &Value) -> Result<ToolResult, 
     let spec = tool(id).ok_or_else(|| format!("no tool '{id}'"))?;
     let p = resolve_params(spec, params)?;
     // A bug in a tool must not take the app down.
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match source_of(spec) {
-        Some((_, runner)) => runner(spec, inputs, &p),
-        None => (spec.run)(inputs, &p),
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        in_plane(inputs, || {
+            validate_pole_inputs(spec, inputs, &p)?;
+            let result = match source_of(spec) {
+                Some((_, runner)) => runner(spec, inputs, &p),
+                None => (spec.run)(inputs, &p),
+            };
+            with_pole_loop_notes(result, spec, inputs, &p)
+        })
     }))
     .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", spec.name)))
+}
+
+/// `work` in the plane of the system `inputs` are given in ([`Inputs::work_crs`]): the analysis
+/// plane for longitude/latitude, a projected system's own coordinates otherwise
+/// ([`convert::Plane::Own`]).
+fn in_plane<T>(inputs: &dyn Inputs, work: impl FnOnce() -> T) -> T {
+    let _plane = convert::install(convert::run_plane_for(inputs.work_crs()));
+    work()
+}
+
+/// A tool's result with [`pole_loop_note`] added: to its messages, or to a refusal of polygons
+/// with no area (Clip's `none of the 1 feature(s) of 'loop' covers anything: a polygon with no
+/// area`) that names a layer with such rings, which they may be the reason for; then only those
+/// layers are read. Another error (`no layer named 'study_area'`, `no field named 'area'`) is left
+/// as it is.
+fn with_pole_loop_notes(result: Result<ToolResult, String>, spec: &ToolSpec, inputs: &dyn Inputs, p: &Value) -> Result<ToolResult, String> {
+    match result {
+        // No pole in a projected system's own plane for a ring to loop around.
+        Ok(r) if convert::plane() == convert::Plane::Own => Ok(r),
+        Err(e) if convert::plane() == convert::Plane::Own => Err(e),
+        Ok(mut r) => {
+            r.messages.extend(pole_loop_note(spec, inputs, p, |_| true));
+            Ok(r)
+        }
+        // The tools' refusal of an input with no area says "with no area" (`tools::NO_AREA`).
+        Err(e) if !e.contains("with no area") => Err(e),
+        Err(e) => {
+            // Tools name a layer as it is stored, which may differ in case from how it was given.
+            let lower = e.to_lowercase();
+            match pole_loop_note(spec, inputs, p, |stored| lower.contains(&format!("'{}'", stored.to_lowercase()))) {
+                Some(note) => Err(format!("{}. {note}", e.trim_end_matches(['.', ' ']))),
+                None => Err(e),
+            }
+        }
+    }
+}
+
+/// Tools that read polygons as areas in the analysis plane, where longitude and latitude are x
+/// and y: overlays, joins, containment, zones, buffers and distances from inside. Others copy a
+/// geometry, read only its attributes, or measure it on the ground (Calculate Geometry), so a loop
+/// around a pole is nothing to them.
+const READ_AREAS_IN_THE_PLANE: &[&str] = &[
+    "buffer",
+    "near",
+    "zonalStats",
+    "tabulateArea",
+    "clip",
+    "erase",
+    "intersect",
+    "identity",
+    "union",
+    "symmetricalDifference",
+    "update",
+    "split",
+    "countPoints",
+    "spatialJoin",
+    "selectByLocation",
+    "featureToPoint",
+    "dissolve",
+    "tabulateIntersection",
+];
+
+/// Whether a tool reads every row of an input whatever is selected in it.
+fn reads_all_rows(tool: &str, param: &str) -> bool {
+    matches!((tool, param), ("selectByLocation", "input") | ("countPoints", "polygons"))
+}
+
+/// What a tool's vector inputs hold that it can't read as areas: rings that loop around a pole
+/// without being cut at ±180° (#1354), in one notice with a count naming each layer that has
+/// them, for the tools that read areas in the analysis plane ([`READ_AREAS_IN_THE_PLANE`]), which
+/// takes longitude and latitude as x and y and so doesn't see the area such a ring goes around.
+/// Only the layers whose stored name `read` accepts are read. The rows counted are those the tool
+/// reads, each once: the layer's selection, or every row without one or where the tool reads them
+/// all ([`reads_all_rows`]). The walk over their vertices looks at Cancel between features, and
+/// stops there; a run canceled meanwhile is refused by [`run_under`] all the same.
+fn pole_loop_note(spec: &ToolSpec, inputs: &dyn Inputs, p: &Value, read: impl Fn(&str) -> bool) -> Option<String> {
+    if !READ_AREAS_IN_THE_PLANE.contains(&spec.id) {
+        return None;
+    }
+    // Each layer once, with every row the tool reads of it through any of the names it was given
+    // by (Spatial Join may read one layer as target and join, through different selections):
+    // `None` for all of them.
+    let mut reads: Vec<(&rustgis_data::Dataset, Option<Vec<usize>>)> = Vec::new();
+    let (mut layers, mut rings, mut features) = (Vec::new(), 0usize, 0usize);
+    let params =
+        spec.params.iter().filter(|param| matches!(param.kind, ParamKind::Layer | ParamKind::PolygonLayer | ParamKind::VectorLayer));
+    for param in params {
+        let Some(name) = p.get(param.name).and_then(Value::as_str) else { continue };
+        let Some(ds) = inputs.dataset(name) else { continue };
+        if !read(&ds.name) {
+            continue;
+        }
+        let selected = inputs.selection(name);
+        let these = if selected.is_empty() || reads_all_rows(spec.id, param.name) { None } else { Some(selected.to_vec()) };
+        match reads.iter_mut().find(|(s, _)| std::ptr::eq(*s, ds)) {
+            Some((_, rows)) => match (rows.as_mut(), these) {
+                (Some(rows), Some(these)) => rows.extend(these),
+                (Some(_), None) => *rows = None,
+                (None, _) => {}
+            },
+            None => reads.push((ds, these)),
+        }
+    }
+    for (ds, rows) in reads {
+        let rows: Box<dyn Iterator<Item = usize>> = match rows {
+            None => Box::new(0..ds.features.len()),
+            Some(mut rows) => {
+                rows.sort_unstable();
+                rows.dedup();
+                Box::new(rows.into_iter())
+            }
+        };
+        let geometries = rows.take_while(|_| control::check().is_ok()).filter_map(|r| ds.features.get(r).and_then(|f| f.geometry.as_ref()));
+        let (r, f) = rustgis_data::pole_loop_count(geometries);
+        if r > 0 {
+            layers.push(ds.name.as_str());
+            rings += r;
+            features += f;
+        }
+    }
+    rustgis_data::pole_loop_message(&layers, rings, features)
+}
+
+/// Validates the rows a pole-aware tool reads, on either execution path.
+fn validate_pole_inputs(spec: &ToolSpec, inputs: &dyn Inputs, p: &Value) -> Result<(), String> {
+    // A projected system's y is no latitude, and its plane has no poles.
+    if convert::plane() == convert::Plane::Own {
+        return Ok(());
+    }
+    if matches!(
+        spec.id,
+        "clip"
+            | "erase"
+            | "intersect"
+            | "identity"
+            | "union"
+            | "symmetricalDifference"
+            | "update"
+            | "split"
+            | "countPoints"
+            | "spatialJoin"
+            | "selectByLocation"
+    ) {
+        for param in spec
+            .params
+            .iter()
+            .filter(|p| matches!(p.kind, ParamKind::Layer | ParamKind::PolygonLayer | ParamKind::PointLayer | ParamKind::VectorLayer))
+        {
+            if let Some(name) = p.get(param.name).and_then(Value::as_str)
+                && let Some(ds) = inputs.dataset(name)
+            {
+                let selected = inputs.selection(name);
+                if selected.is_empty() || reads_all_rows(spec.id, param.name) {
+                    validate_latitudes(ds, 0..ds.features.len())?;
+                } else {
+                    validate_latitudes(ds, selected.iter().copied())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses latitudes outside the Earth, including infinities, instead of clamping them to a pole.
+pub fn validate_latitudes(ds: &rustgis_data::Dataset, rows: impl IntoIterator<Item = usize>) -> Result<(), String> {
+    let invalid = rows
+        .into_iter()
+        .filter(|&row| {
+            let mut invalid = false;
+            if let Some(g) = ds.features.get(row).and_then(|f| f.geometry.as_ref()) {
+                g.for_each_coord(|c| invalid |= c.y.abs() > 90.0);
+            }
+            invalid
+        })
+        .count();
+    if invalid > 0 {
+        Err(format!(
+            "'{name}' has {invalid} feature(s) with a latitude past ±90°; repair their coordinates before analysis",
+            name = ds.name
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// [`run`] under `control`: setting its flag stops the tool at its next check, and its count
+/// follows the tool's progress (see [`control`]). A run cancelled before it returns is an error
+/// saying how far it came, whatever the tool gave back: a tool may stop early however suits it,
+/// and what it made by then is never taken for its result. One cancelled before it starts doesn't
+/// start.
+pub fn run_with(id: &str, inputs: &dyn Inputs, params: &Value, control: &std::sync::Arc<control::Control>) -> Result<ToolResult, String> {
+    run_under(tool(id).map_or(id, |t| t.name), control, || run(id, inputs, params))
+}
+
+/// Runs the captured specification and suite runner under `control`, without resolving its
+/// name again. Plugin execution instead needs the plugin load's own pinned preparation.
+pub fn run_resolved(
+    tool: &ResolvedTool,
+    inputs: &dyn Inputs,
+    params: &Value,
+    control: &std::sync::Arc<control::Control>,
+) -> Result<ToolResult, String> {
+    run_under(tool.spec.name, control, || {
+        let params = tool.resolve_params(params)?;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            in_plane(inputs, || {
+                validate_pole_inputs(tool.spec, inputs, &params)?;
+                let result = match tool.runner {
+                    Some(runner) => runner(tool.spec, inputs, &params),
+                    None => (tool.spec.run)(inputs, &params),
+                };
+                with_pole_loop_notes(result, tool.spec, inputs, &params)
+            })
+        }))
+        .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", tool.spec.name)))
+    })
+}
+
+/// `work` on this thread under `control`, as [`run_with`] runs a tool, for work that isn't one (an
+/// engine command's raster): setting `control`'s flag from another thread stops it at its next
+/// check, its count follows the work's progress, and a cancelled run's error says how far `name`
+/// came.
+pub fn run_under<T>(name: &str, control: &std::sync::Arc<control::Control>, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let still = rustgis_data::source::remote::current_still();
+    rustgis_data::source::remote::check_still(&still)?;
+    if control.is_cancelled() {
+        return Err(format!("{name} was cancelled before it started"));
+    }
+    let _current = control::install(Some(control.clone()));
+    // A file the work writes or reads counts and stops with it too.
+    let _data = control::install_progress(Some(control.clone()));
+    // No count until the work starts one: a control used before doesn't show that run's.
+    control::begin(0);
+    control.cancel_if_started();
+    let res = work();
+    rustgis_data::source::remote::check_still(&still)?;
+    if !control.is_cancelled() {
+        // Finished: its last step is all done, however it counted. A failed one stays where it
+        // stopped.
+        if res.is_ok() {
+            control::finish();
+        }
+        return res;
+    }
+    Err(match control.progress() {
+        Some((done, total)) => {
+            format!("{name} was cancelled {}% of the way through its current step", done.saturating_mul(100) / total.max(1))
+        }
+        None => format!("{name} was cancelled"),
+    })
 }

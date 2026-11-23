@@ -1,6 +1,7 @@
 """The Jupyter widget: its project stays in step with the session both ways."""
 
 import json
+import warnings
 
 import pytest
 
@@ -69,6 +70,45 @@ def test_a_bad_project_from_the_app_is_a_notice_not_a_crash():
     assert m.notices() == [("unknown command", True)]
 
 
+class _LossOnOpen:
+    """The session's engine, reporting a lost ring whenever the app's project is opened."""
+
+    def __init__(self, engine):
+        self._engine = engine
+        self._pending = []
+
+    def __getattr__(self, name):
+        return getattr(self._engine, name)
+
+    def _open_peer_text(self, text):
+        self._pending = [("dropped", "dropped.ring", "Drawn: 1 ring left out")]
+        return self._engine._open_peer_text(text)
+
+    def _take_losses(self):
+        taken, self._pending = self._pending, []
+        return taken
+
+
+def test_a_loss_from_the_app_is_raised_after_its_project_is_kept():
+    """A loss opening the app's project is raised, under an error filter too, once the widget has
+    kept the project; a project that can't be read raises its losses, not its error."""
+    m = rustgis.Map()
+    other = rustgis.Session()
+    other.add_geojson(POINT, name="Drawn")
+    text = other.project_json()
+    m._session._engine = _LossOnOpen(m._session._engine)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", category=rustgis.DataLossWarning)
+        with pytest.raises(rustgis.DroppedWarning, match=r"\[dropped\.ring\]"):
+            from_app(m, text)
+        assert m._project == text
+        with pytest.raises(rustgis.DroppedWarning):
+            from_app(m, "not a project")
+    assert any(error for _, error in m.notices())
+    with pytest.warns(rustgis.DroppedWarning):
+        from_app(m, other.project_json().replace("Drawn", "Drawn again"))
+
+
 def test_options_and_local_files(tmp_path):
     path = tmp_path / "sites.geojson"
     path.write_text(json.dumps(POINT))
@@ -98,3 +138,90 @@ def test_layers_of_a_map_change_the_app():
     sites.rename("Places")
     assert m._project != before and "Places" in m._project
     assert m.layer_names() == ["Places"]
+
+
+def test_widget_exchange_never_sends_keys_and_checks_the_current_slot():
+    """The real receiving method keeps only keys still present on the last pushed slot."""
+    secret = "RGSYNTH_widget_20261103"
+    s = rustgis.Session()
+    s.add_geojson(POINT, name="Sites")
+    project = json.loads(s.project_json())
+    project["maps"][0]["layers"][0]["dataset"]["source"] = f"https://h.invalid/a?token={secret}"
+    s.run("project.openText", text=json.dumps(project))
+    saved = s.project_json()
+    assert secret not in saved
+    other = rustgis.Session()
+    other.run("project.openText", text=saved)
+    assert other._engine._peer_text()[1] == 1
+    m = rustgis.Map(session=s)
+    assert secret not in m._project
+    assert any("without their keys" in notice for notice, _ in m.notices())
+    before = m._project
+    m.run("info.project")
+    assert m._project == before
+    assert m.notices() == []
+    # A different protected source still has one omitted address and needs a fresh warning.
+    project = json.loads(m._project)
+    project["maps"][0]["layers"][0]["dataset"]["source"] = f"https://h.invalid/b?token={secret}"
+    s.run("project.openText", text=json.dumps(project))
+    m.run("info.project")
+    assert any("without their keys" in notice for notice, _ in m.notices())
+    m.run("info.project")
+    assert m.notices() == []
+    incoming = json.loads(m._project)
+    incoming["maps"][0]["layers"][0]["name"] = "Styled by app"
+    from_app(m, json.dumps(incoming))
+    assert m.session._engine._peer_text()[1] == 1
+    assert not any("lost their keys" in notice for notice, _ in m.notices())
+    # Direct session changes do not call the widget's push. Its stale record cannot resurrect
+    # the removed source when the app sends the old slot again.
+    m.session.run("layer.remove", layer="Styled by app")
+    incoming["maps"][0]["layers"][0]["name"] = "Stale app slot"
+    from_app(m, json.dumps(incoming))
+    assert m.session._engine._peer_text()[1] == 0
+
+    for command, params, kind in [
+        ("connection.login", {"apiKey": "demo"}, "executable step(s)"),
+        ("plugin.unknown", {"nested": {"token": "demo"}}, "opaque parameters"),
+    ]:
+        s = rustgis.Session()
+        project = json.loads(s.project_json())
+        clean = {"apiKey": ""} if command == "connection.login" else {"nested": {}}
+        project["tasks"] = [{"name": "Notice fixture", "steps": [{"title": "Stored only", "command": command, "params": clean}]}]
+        s.run("project.openText", text=json.dumps(project))
+        s.notices()
+        m = rustgis.Map(session=s)
+        assert m.notices() == [], "clean bridge output needs no loss notice"
+        before = m._project
+        project["tasks"][0]["steps"][0]["params"] = params
+        s.run("project.openText", text=json.dumps(project))
+        s.notices()
+        m.run("info.project")
+        if command == "connection.login":
+            assert m._project == before, "a newly removed credential need not change public project text"
+        notices = m.notices()
+        assert len(notices) == 1 and kind in notices[0][0] and not notices[0][1]
+        before = m._project
+        m.run("info.project")
+        m.run("info.project")
+        assert m._project == before
+        assert m.notices() == [], "unchanged internal pushes must not repeat bridge notices"
+        m.run("layer.template", template="points", name="Changed output")
+        assert m._project != before
+        assert m.notices() == notices, "changed outgoing content reports its losses again"
+        m.run("info.project")
+        assert m.notices() == []
+
+
+def test_widget_repeated_table_id_cannot_gain_a_retained_key():
+    """The receiving census sees duplicate table ids before project normalization renumbers them."""
+    s = rustgis.Session()
+    project = json.loads(s.project_json())
+    project["tables"] = [{"id":7, "name":"Private table", "geometry_type":"None", "fields":[], "features":[], "source":"https://h.invalid/table?token=RGSYNTH_table_20261103"}]
+    s.run("project.openText", text=json.dumps(project))
+    m = rustgis.Map(session=s)
+    incoming = json.loads(m._project)
+    incoming["tables"].append(dict(incoming["tables"][0]))
+    from_app(m, json.dumps(incoming))
+    assert s._engine._peer_text()[1] == 0
+    assert any("lost their keys" in notice for notice, _ in m.notices())

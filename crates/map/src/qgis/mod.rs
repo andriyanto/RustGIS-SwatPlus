@@ -9,11 +9,14 @@
 //! writing a symbol layer's settings are read: the `<Option type="Map">` of QGIS 3.26 and later,
 //! and the `<prop k="…" v="…">` before it.
 
+mod annotation;
+mod diagram;
 mod expr;
 mod labels;
 mod raster;
 mod renderer;
 mod source;
+mod structure;
 mod symbol;
 #[cfg(test)]
 mod tests;
@@ -25,9 +28,11 @@ use serde::Serialize;
 
 use crate::Rgba;
 use crate::effects::Blend;
-use crate::symbology::{Labeling, LineStroke, MarkerRotation, Renderer};
-pub use expr::to_sql;
-pub use source::{Source, is_drive_relative, is_relative};
+use crate::symbology::{Labeling, LineStroke, MarkerRotation, Picture, Renderer};
+pub use annotation::{Annotation, MAX_ITEMS as MAX_ANNOTATIONS};
+pub use expr::{reads_measure, to_sql};
+pub use source::{MAX_MEMORY_FIELDS, Source, VirtualFrom, WebOptions, is_drive_relative, is_relative};
+pub use structure::{MAX_BOOKMARKS, MAX_RELATIONS, ProjectBookmark, ProjectRelation, listed};
 
 /// The most XML nodes a project or style is read with (a large project's file is some hundred
 /// thousand).
@@ -51,7 +56,26 @@ pub struct Report {
     /// thousands of different notes, and a repeat is found without going through them all.
     #[serde(skip)]
     index: HashMap<(String, NoteKind, String), usize>,
+    /// Different notes past [`MAX_NOTES`], not kept but counted in a closing note of their kind:
+    /// approximated, then skipped.
+    #[serde(skip)]
+    more: [usize; 2],
+    /// Where each kind's closing note is in `notes`, kept in step by [`Report::forget`].
+    #[serde(skip)]
+    closing: [Option<usize>; 2],
+    /// Raster image markers' images by their `imageFile`, read before the symbols showing them
+    /// (`symbol::read_images`): each kept picture with its height over its width, or why it isn't
+    /// drawn. Carried here because every symbol reader already takes the report; passing them
+    /// beside it would add a parameter to each reader and to each of their callers.
+    #[serde(skip)]
+    images: HashMap<String, Result<(Picture, f32), String>>,
 }
+
+/// Reads a raster image marker's image for the importer, which opens no file itself: given its
+/// `base64:` text or its file's path (made absolute from the project's folder), the image as
+/// base64 and its height over its width, or why it isn't drawn, as the end of a note's
+/// "raster image markers …, drawn as circles" (such as "whose file doesn't open").
+pub type ReadImage<'a> = dyn FnMut(&str) -> Result<(String, f32), &'static str> + 'a;
 
 /// One thing an import couldn't carry over as QGIS has it.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -83,6 +107,29 @@ impl Report {
             self.index.insert(key.clone(), self.notes.len());
             let (layer, kind, text) = key;
             self.notes.push(Note { layer, kind, text, count: 1 });
+        } else {
+            // Past the cap, a new note is counted in the one closing note of its kind, never
+            // listed itself.
+            let (_, kind, _) = key;
+            let k = usize::from(kind == NoteKind::Skipped);
+            let more = self.more.get(k).copied().unwrap_or(0).saturating_add(1);
+            let text = format!("{more} more note(s) not listed");
+            let at = self.closing.get(k).copied().flatten();
+            match at.and_then(|i| self.notes.get_mut(i)) {
+                Some(closing) => {
+                    closing.text = text;
+                    closing.count = closing.count.saturating_add(1);
+                }
+                None => {
+                    self.notes.push(Note { layer: String::new(), kind, text, count: 1 });
+                    if let Some(c) = self.closing.get_mut(k) {
+                        *c = Some(self.notes.len() - 1);
+                    }
+                }
+            }
+            if let Some(m) = self.more.get_mut(k) {
+                *m = more;
+            }
         }
     }
 
@@ -92,6 +139,35 @@ impl Report {
 
     pub fn skipped(&mut self, layer: &str, text: impl Into<String>) {
         self.note(layer, NoteKind::Skipped, text);
+    }
+
+    /// How many times `text` was noted for `layer`.
+    fn noted(&self, layer: &str, kind: NoteKind, text: &str) -> usize {
+        let key = (layer.to_string(), kind, text.to_string());
+        self.index.get(&key).and_then(|&i| self.notes.get(i)).map_or(0, |n| n.count)
+    }
+
+    /// Withdraws a provisional note once checking against the destination fields disproves it.
+    fn forget(&mut self, layer: &str, kind: NoteKind, text: &str) {
+        let key = (layer.to_string(), kind, text.to_string());
+        let Some(&at) = self.index.get(&key) else { return };
+        if let Some(note) = self.notes.get_mut(at)
+            && note.count > 1
+        {
+            note.count -= 1;
+            return;
+        }
+        self.notes.retain(|n| n.layer != layer || n.kind != kind || n.text != text);
+        self.index = self.notes.iter().enumerate().map(|(i, n)| ((n.layer.clone(), n.kind, n.text.clone()), i)).collect();
+        // The closing notes moved up with the rest.
+        for (k, kind) in [NoteKind::Approximated, NoteKind::Skipped].into_iter().enumerate() {
+            let more = self.more.get(k).copied().unwrap_or(0);
+            let text = format!("{more} more note(s) not listed");
+            let at = self.notes.iter().rposition(|n| n.kind == kind && n.layer.is_empty() && n.text == text);
+            if let Some(c) = self.closing.get_mut(k) {
+                *c = at.filter(|_| more > 0);
+            }
+        }
     }
 }
 
@@ -108,10 +184,21 @@ pub struct Style {
     pub stroke_levels: Option<bool>,
     /// Point markers turned by a field (`Some(None)`: not turned).
     pub marker_rotation: Option<Option<MarkerRotation>>,
+    /// Its data-defined size, colours, outline width and angle, as expressions (`Some` of an
+    /// empty one: none).
+    pub symbol_by: Option<crate::symbol_by::SymbolBy>,
     pub reference_scale: Option<f64>,
     pub labels: Option<Labeling>,
+    /// Its diagram: a pie or bar chart on each feature.
+    pub diagram: Option<crate::DiagramSettings>,
+    /// The scaled diagram's original classification, for checking once the destination fields
+    /// are known. Import metadata only, not a saved diagram setting.
+    pub diagram_by: Option<String>,
     /// 0 opaque to 100 invisible.
     pub transparency: Option<f32>,
+    /// The field whose dates the time slider reads (QGIS's time settings). Not applied by
+    /// [`Style::apply`]: the importer binds the layer once its fields are checked.
+    pub time: Option<String>,
     pub blend: Option<Blend>,
     /// A raster's colouring, stretch, resampling, brightness, contrast and mask.
     pub raster: Option<crate::raster::RasterStyle>,
@@ -119,9 +206,211 @@ pub struct Style {
     /// and out beyond 1:`max_scale`. `Some(None)` clears a limit.
     pub min_scale: Option<Option<f64>>,
     pub max_scale: Option<Option<f64>>,
+    /// A rule-based renderer's rules classed by expression, in the order a feature meets them.
+    /// Not a setting: what the importer checks the layer's features against (the features
+    /// several rules pick).
+    pub rules: Vec<RuleFilter>,
+    /// A categorized renderer classed by expression: the expression as QGIS wrote it, and what
+    /// the layer is drawn with where it doesn't read on the layer's fields. Not a setting.
+    pub categories_by: Option<CategoriesBy>,
+    /// A categorized renderer's classes from boolean categories (`type="bool"`), by their keys:
+    /// matched to the layer's field where it is added (a boolean field prints `True`, text reads
+    /// `true` as it is). Not a setting.
+    pub bool_classes: Vec<String>,
+}
+
+/// A categorized renderer by an expression, for where the expression doesn't read on the layer
+/// (checked where the layer is added, as rules and filters are, not by [`Style::apply`]): every
+/// feature is drawn with its first switched-on category's symbol, strokes and fills (`first`;
+/// none: nothing drawn), noted with the expression as QGIS wrote it (`qgis`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CategoriesBy {
+    pub qgis: String,
+    pub first: Option<(crate::symbology::Symbol, Vec<LineStroke>, Vec<crate::fills::FillLayer>)>,
+}
+
+/// Renames the Unique Values class `from` of `r` to `to`, with its label, strokes and fills;
+/// `false` (nothing renamed) when there is no such class or another class is already `to`.
+pub fn rename_class(r: &mut Renderer, from: &str, to: &str) -> bool {
+    let Renderer::Unique { classes, class_labels, class_strokes, class_fills, .. } = r else { return false };
+    if from == to {
+        return true;
+    }
+    if classes.iter().any(|c| c.0 == to) {
+        return false;
+    }
+    let Some(c) = classes.iter_mut().find(|c| c.0 == from) else { return false };
+    c.0 = to.to_string();
+    if let Some(v) = class_labels.remove(from) {
+        class_labels.insert(to.to_string(), v);
+    }
+    if let Some(v) = class_strokes.remove(from) {
+        class_strokes.insert(to.to_string(), v);
+    }
+    if let Some(v) = class_fills.remove(from) {
+        class_fills.insert(to.to_string(), v);
+    }
+    true
+}
+
+/// A boolean category's value as RustGIS prints a boolean (`True`, `False`) when `printed`, else
+/// as QGIS writes it (`true`, `false`); `None` for any other value.
+pub fn bool_key(v: &str, printed: bool) -> Option<&'static str> {
+    match (v.eq_ignore_ascii_case("true"), v.eq_ignore_ascii_case("false"), printed) {
+        (true, _, true) => Some("True"),
+        (true, _, false) => Some("true"),
+        (_, true, true) => Some("False"),
+        (_, true, false) => Some("false"),
+        _ => None,
+    }
+}
+
+/// One rule of a rule-based renderer classed by expression: its class (`key`), the condition it
+/// is drawn by (`when`: its filters, an else rule's siblings, its scale range), its filter alone
+/// (its filters and its parents') and the scales it draws between (RustGIS's: out to 1:`out`, in
+/// to 1:`inside`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuleFilter {
+    pub key: String,
+    pub when: String,
+    pub condition: String,
+    pub out: Option<f64>,
+    pub inside: Option<f64>,
+}
+
+/// A rule beside an else rule: its filter (none: every feature), the scales it draws between
+/// (RustGIS's scales: drawn out to 1:`.0`, in to 1:`.1`), and for one that draws nothing itself,
+/// the rules under it it draws through (`under`). The else rule takes what none of them draws.
+pub(super) struct Sibling {
+    pub(super) filter: Option<String>,
+    pub(super) scales: (Option<f64>, Option<f64>),
+    pub(super) under: Option<Vec<Sibling>>,
+}
+
+/// The siblings an else rule beside `rules` is the rest of (`None`: more than `budget` rules
+/// under them, or nested more than 32 deep). As QGIS has it, a rule counts only where it draws
+/// (`itself`: with a symbol or label settings) or where a rule under it does; a switched-off rule
+/// never does. Else rules count among the rules under a sibling (`with_else`), each drawing where
+/// it does.
+pub(super) fn siblings<'a, 'i: 'a>(
+    rules: impl Iterator<Item = Node<'a, 'i>>,
+    parent: (Option<f64>, Option<f64>),
+    itself: &impl Fn(Node) -> bool,
+    with_else: bool,
+    depth: usize,
+    budget: &mut usize,
+) -> Option<Vec<Sibling>> {
+    let mut out = Vec::new();
+    for r in rules.filter(|c| c.has_tag_name("rule") && c.attribute("active") != Some("0")) {
+        if depth > 32 || *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        let filter = r.attribute("filter").map(str::trim).filter(|f| !f.is_empty());
+        let filter = match filter {
+            Some(f) if f.eq_ignore_ascii_case("ELSE") && !with_else => continue,
+            Some(f) if f.eq_ignore_ascii_case("ELSE") => None,
+            f => f.map(str::to_string),
+        };
+        let scales = rule_scales(r, parent);
+        let under = if itself(r) { None } else { Some(siblings(r.children(), scales, itself, true, depth + 1, budget)?) };
+        // (One that draws nothing, nor anything under it, takes nothing from the else rule.)
+        if under.as_ref().is_none_or(|u| !u.is_empty()) {
+            out.push(Sibling { filter, scales, under });
+        }
+    }
+    Some(out)
+}
+
+/// The scales a rule draws between (as [`Sibling::scales`]) inside a parent drawing between
+/// `parent`: its scalemaxdenom is the out-beyond limit, its scalemindenom the in-beyond, and a
+/// rule inside another is drawn only within both ranges.
+pub(super) fn rule_scales(rule: Node, parent: (Option<f64>, Option<f64>)) -> (Option<f64>, Option<f64>) {
+    let denom = |k: &str| {
+        rule.attribute(k).and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0).map(|v| v * QGIS_SCALE)
+    };
+    (
+        match (denom("scalemaxdenom"), parent.0) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        },
+        match (denom("scalemindenom"), parent.1) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        },
+    )
+}
+
+/// `filter` with the conditions of the scale range `scales` (`@map_scale`; none, as in an export,
+/// meets every range).
+pub(super) fn within(filter: String, scales: (Option<f64>, Option<f64>)) -> String {
+    let mut c = filter;
+    if let Some(out) = scales.0 {
+        c.push_str(&format!(" AND (@map_scale IS NULL OR @map_scale <= {})", out.round()));
+    }
+    if let Some(inside) = scales.1 {
+        c.push_str(&format!(" AND (@map_scale IS NULL OR @map_scale >= {})", inside.round()));
+    }
+    c
+}
+
+/// What an else rule beside `siblings` takes: none of what they draw, at their scales. A filter
+/// unknown (null) for a feature isn't met, as QGIS has it. `None` when a filter can't be read, or
+/// the siblings weren't (see [`siblings`]).
+pub(super) fn none_of(siblings: &Option<Vec<Sibling>>) -> Option<String> {
+    let drawn_by = siblings.as_ref()?.iter().map(drawn_by).collect::<Option<Vec<String>>>()?;
+    Some(if drawn_by.is_empty() { String::new() } else { format!("NOT coalesce({}, FALSE)", drawn_by.join(" OR ")) })
+}
+
+/// Where a sibling draws: its filter at its scales, and for one drawing through the rules under
+/// it, where one of them does.
+fn drawn_by(sib: &Sibling) -> Option<String> {
+    let f = match &sib.filter {
+        Some(f) => format!("({})", expr::to_sql(f)?),
+        None => "TRUE".into(),
+    };
+    let mut c = within(f, sib.scales);
+    if let Some(under) = &sib.under {
+        let under = under.iter().map(drawn_by).collect::<Option<Vec<String>>>()?;
+        c = format!("{c} AND ({})", under.join(" OR "));
+    }
+    Some(format!("({c})"))
+}
+
+/// Whether an expression reads the map's scale (`@map_scale`, `$scale`), outside quotes.
+pub fn reads_scale(expr: &str) -> bool {
+    expr::reads_scale(expr)
+}
+
+/// How many of the rules `roots` and those under them draw (`draws`): switched on, and under no
+/// rule switched off. For the rules a reader leaves out.
+pub(super) fn drawing_rules<'a, 'i: 'a>(roots: impl Iterator<Item = Node<'a, 'i>>, draws: impl Fn(Node) -> bool) -> usize {
+    let on = |n: Node| n.attribute("active") != Some("0");
+    roots
+        .filter(|r| r.has_tag_name("rule"))
+        .map(|r| {
+            r.descendants()
+                .filter(|d| d.has_tag_name("rule") && draws(*d))
+                .filter(|d| d.ancestors().take_while(|a| *a != r).chain(std::iter::once(r)).all(|a| !a.has_tag_name("rule") || on(a)))
+                .count()
+        })
+        .sum()
+}
+
+/// The expression that classes a feature by the first of `rules` it meets: `CASE WHEN <when>
+/// THEN '<key>' … END`.
+pub fn rules_expression(rules: &[RuleFilter]) -> String {
+    let whens: Vec<String> = rules.iter().map(|r| format!("WHEN {} THEN '{}'", r.when, r.key.replace('\'', "''"))).collect();
+    format!("CASE {} END", whens.join(" "))
 }
 
 impl Style {
+    /// Checks an imported diagram against the destination's fields. Its size classification
+    /// is compared with the categories actually retained, so provisional import notes agree.
+    pub fn check_diagram_fields(&self, layer: &mut crate::Layer, name: &str, report: &mut Report) {
+        diagram::check_fields(layer, name, self.diagram_by.as_deref(), report);
+    }
+
     /// Gives `layer` this style's parts (those it sets).
     pub fn apply(&self, layer: &mut crate::Layer) {
         if let Some(t) = self.transparency {
@@ -161,11 +450,22 @@ impl Style {
         if let Some(r) = &self.marker_rotation {
             layer.marker_rotation = r.clone().filter(|_| layer.geometry_type() == rustgis_data::GeometryType::Point);
         }
+        if let Some(by) = &self.symbol_by {
+            layer.symbol_by = by.clone();
+            // Only a point layer's markers turn.
+            if layer.geometry_type() != rustgis_data::GeometryType::Point {
+                layer.symbol_by.angle = None;
+            }
+        }
         if let Some(r) = self.reference_scale {
             layer.reference_scale = Some(r);
         }
         if let Some(l) = &self.labels {
             layer.labels = l.clone();
+        }
+        // (A graphics layer takes no diagram.)
+        if let Some(d) = self.diagram.as_ref().filter(|_| !layer.graphics) {
+            layer.diagram = Some(d.clone());
         }
     }
 
@@ -189,6 +489,35 @@ pub struct Project {
     pub extent: Option<[f64; 4]>,
     /// Its layers, top first, as its layer tree orders them.
     pub layers: Vec<ProjectLayer>,
+    /// Its main annotation layer, drawn over its layers, when it holds any annotation.
+    pub main_annotations: Option<ProjectLayer>,
+    /// The groups of its layer tree (of QGIS 2's legend before it), each before the groups in it.
+    pub groups: Vec<ProjectGroup>,
+    /// The map's rotation when it was saved, in degrees: QGIS turns the map this far clockwise.
+    pub rotation: f64,
+    /// Its spatial bookmarks, in the order QGIS lists them.
+    pub bookmarks: Vec<ProjectBookmark>,
+    /// Its relations between layers.
+    pub relations: Vec<ProjectRelation>,
+}
+
+/// A group of a QGIS project's layer tree.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectGroup {
+    pub name: String,
+    /// Its own box checked in the layer tree (the groups holding it apply on top).
+    pub checked: bool,
+    /// Open in the layer tree.
+    pub expanded: bool,
+    /// The group it is in, as an index into [`Project::groups`]: `None` at the top level.
+    pub parent: Option<usize>,
+    /// 0 = opaque, 100 = invisible: the opacity of a QGIS group layer (a group drawn as one).
+    pub transparency: Option<f32>,
+    /// A group layer's visibility range (RustGIS's scales, see [`QGIS_SCALE`]): its layers draw
+    /// only when zoomed in beyond 1:`min_scale` and out beyond 1:`max_scale`. QGIS 4.2 doesn't
+    /// save one for a group layer (measured), but a file may have one.
+    pub min_scale: Option<f64>,
+    pub max_scale: Option<f64>,
 }
 
 /// One layer of a QGIS project.
@@ -207,19 +536,29 @@ pub struct ProjectLayer {
     pub vector: bool,
     /// Checked in the layer tree, and every group holding it too.
     pub visible: bool,
+    /// The group it is in, as an index into [`Project::groups`]: `None` at the top level.
+    pub group: Option<usize>,
+    /// Its own box checked, and those of any groups between it and `group` that weren't kept
+    /// (nested too deep): what it takes inside its group, which applies on top.
+    pub checked: bool,
     /// Its subset string, as a RustGIS definition query when it reads as one.
     pub definition_query: Option<String>,
     pub style: Style,
+    /// An annotation layer's annotations, bottom first, in its coordinates (`crs`, else the
+    /// project's).
+    pub annotations: Vec<Annotation>,
 }
 
 /// Reads a QGIS project. `dir` is the folder the project is in, which its relative paths start
-/// from. Notes on what can't be carried over go to `report`.
-pub fn read_project(text: &str, dir: &str, report: &mut Report) -> Result<Project, String> {
+/// from; `images` reads its raster image markers' images. Notes on what can't be carried over go
+/// to `report`.
+pub fn read_project(text: &str, dir: &str, images: &mut ReadImage, report: &mut Report) -> Result<Project, String> {
     let doc = parse(text, "a QGIS project")?;
     let root = doc.root_element();
     if !root.has_tag_name("qgis") {
         return Err("not a QGIS project (.qgs): its root element isn't <qgis>".into());
     }
+    symbol::read_images(root, dir, images, report);
     // The main map canvas: its view, and (before QGIS 3) the project's coordinate system.
     let canvas = root.children().find(|c| c.has_tag_name("mapcanvas") && c.attribute("name").is_none_or(|n| n == "theMapCanvas"));
     let crs = child(root, "projectCrs")
@@ -234,44 +573,101 @@ pub fn read_project(text: &str, dir: &str, report: &mut Report) -> Result<Projec
         crs,
         extent: canvas.and_then(|c| child(c, "extent")).and_then(extent_of),
         layers: Vec::new(),
+        main_annotations: None,
+        groups: Vec::new(),
+        rotation: 0.0,
+        bookmarks: Vec::new(),
+        relations: Vec::new(),
     };
-    // The layer tree (QGIS 2's legend before it): the order layers draw in (top first) and which
-    // are checked.
-    let mut order: Vec<(String, bool)> = Vec::new();
-    if let Some(t) = child(root, "layer-tree-group") {
-        tree_layers(t, true, &mut order, 0);
-    } else if let Some(l) = child(root, "legend") {
-        legend_layers(l, true, &mut order, 0);
-    }
+    // The layer tree (QGIS 2's legend before it): the order layers draw in (top first), which
+    // are checked, and their groups.
+    let mut tree = Tree::read(root);
     project_notes(root, report);
+    // The map's rotation: one that doesn't read faces north, noted.
+    if let Some(r) = canvas.and_then(|c| child(c, "rotation")).and_then(|r| r.text()).map(str::trim).filter(|r| !r.is_empty()) {
+        match r.parse::<f64>().ok().filter(|r| r.is_finite()) {
+            Some(r) => project.rotation = r,
+            None => {
+                let r: String = r.chars().take(40).collect();
+                report.approximated("", format!("the map's rotation `{r}`, which doesn't read: facing north"));
+            }
+        }
+    }
+    project.bookmarks = structure::bookmarks(root, report);
+    project.relations = structure::relations(root, report);
+    structure::project_time(root, report);
     let maplayers: Vec<Node> =
         child(root, "projectlayers").map(|p| p.children().filter(|c| c.has_tag_name("maplayer")).collect()).unwrap_or_default();
     if maplayers.len() > MAX_LAYERS {
         report.skipped("", format!("layers past the first {MAX_LAYERS}"));
     }
     let mut layers: Vec<(Option<usize>, ProjectLayer)> = Vec::new();
+    // QGIS group layers (a group drawn as one) whose blending mode RustGIS's groups don't have,
+    // and those with a draw effect.
+    let (mut blended, mut effects) = (Vec::new(), Vec::new());
+    // Groups drawn as one past RustGIS's limits whose opacity, blending or effect is left out.
+    let mut unkept = Vec::new();
     for ml in maplayers.into_iter().take(MAX_LAYERS) {
         let id = child(ml, "id").and_then(|n| n.text()).unwrap_or_default().trim().to_string();
         let name = child(ml, "layername").and_then(|n| n.text()).unwrap_or_default().trim().to_string();
         let name = if name.is_empty() { id.clone() } else { name };
-        let at = order.iter().position(|(i, _)| *i == id);
-        let checked = at.and_then(|i| order.get(i)).is_none_or(|(_, c)| *c);
+        // A group layer is its group's opacity and blending, not a layer of its own.
+        if ml.attribute("type") == Some("group")
+            && let Some(g) = tree.groups.iter_mut().find(|g| g.layer.as_deref() == Some(id.as_str()))
+        {
+            // Its notes (a blending mode RustGIS hasn't, say) go under its name.
+            let style = read_style_node(ml, &name, report);
+            g.group.transparency = style.transparency.filter(|t| *t > 0.0);
+            g.group.min_scale = style.min_scale.flatten();
+            g.group.max_scale = style.max_scale.flatten();
+            if style.blend.is_some_and(|b| b != Blend::Normal) {
+                blended.push(g.group.name.clone());
+            }
+            if child(ml, "paintEffect").is_some_and(has_effect) {
+                effects.push(g.group.name.clone());
+            }
+            continue;
+        }
+        // A group layer of a group not kept: its layers went in the group holding it, so what it
+        // gives them is left out, when it gives them anything.
+        // Each id once (removed as it's taken), so a repeated one isn't counted twice; its own
+        // notes aren't given, as it draws nothing of its own.
+        if ml.attribute("type") == Some("group") && tree.folded_layers.remove(&id) {
+            let style = read_style_node(ml, &name, &mut Report::default());
+            let blended = child(ml, "blendMode").and_then(|n| n.text()).and_then(|t| t.trim().parse::<i32>().ok()).is_some_and(|m| m != 0);
+            let effect = child(ml, "paintEffect").is_some_and(has_effect);
+            let ranged = style.min_scale.flatten().is_some() || style.max_scale.flatten().is_some();
+            let parts: Vec<&str> = [
+                (style.transparency.is_some_and(|t| t > 0.0), "opacity"),
+                (blended, "blending"),
+                (effect, "draw effect"),
+                (ranged, "visibility range"),
+            ]
+            .into_iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, part)| part)
+            .collect();
+            if !parts.is_empty() {
+                unkept.push(format!("{name} ({})", parts.join(", ")));
+            }
+            continue;
+        }
+        let at = tree.layers.iter().position(|l| l.id == id);
+        let place = at.and_then(|i| tree.layers.get(i));
+        let (visible, checked, group) = place.map_or((true, true, None), |l| (l.visible, l.checked, l.group));
         let provider = child(ml, "provider").and_then(|n| n.text()).unwrap_or_default().trim().to_string();
         let datasource = child(ml, "datasource").and_then(|n| n.text()).unwrap_or_default().trim().to_string();
         let source = source::read(&provider, &datasource, dir);
         let kind = ml.attribute("type").unwrap_or_default().to_string();
         let vector = kind == "vector";
-        let definition_query = match &source {
-            Source::File { subset: Some(q), .. } => match expr::to_sql(q) {
-                Some(sql) => Some(sql),
-                None => {
-                    report.skipped(&name, format!("its filter (subset string) `{q}`, which doesn't read as a RustGIS definition query"));
-                    None
-                }
-            },
-            _ => None,
-        };
+        let definition_query = definition_query(&source, &name, "subset string", report);
+        if definition_query.is_some()
+            && let Source::File { path, subset: Some(q), .. } = &source
+        {
+            note_matching(&name, "its filter (subset string)", &[(q, dialect(path, &provider))], report);
+        }
         let style = read_style_node(ml, &name, report);
+        let annotations = if kind == "annotation" { annotation::read(ml, dir, &name, report) } else { Vec::new() };
         layers.push((
             at,
             ProjectLayer {
@@ -282,25 +678,257 @@ pub fn read_project(text: &str, dir: &str, report: &mut Report) -> Result<Projec
                 crs: child(ml, "srs").and_then(crs_of),
                 kind,
                 vector,
-                visible: checked,
+                visible,
+                group,
+                checked,
                 definition_query,
                 style,
+                annotations,
             },
         ));
     }
+    project.main_annotations = child(root, "main-annotation-layer").and_then(|m| main_annotations(m, dir, report));
     // In the layer tree's order; layers it doesn't hold go below.
     layers.sort_by_key(|(at, _)| at.unwrap_or(usize::MAX));
     project.layers = layers.into_iter().map(|(_, l)| l).collect();
+    resolve_virtual_layers(&mut project.layers, report);
+    group_notes(&tree, &blended, &effects, report);
+    if !unkept.is_empty() {
+        let names = unkept.iter().take(8).map(String::as_str).collect::<Vec<_>>().join(", ");
+        let more = if unkept.len() > 8 { ", …" } else { "" };
+        report.skipped(
+            "",
+            format!("what groups drawn as one past RustGIS's group limits give their layers ({}: {names}{more})", unkept.len()),
+        );
+    }
+    project.groups = tree.groups.into_iter().map(|g| g.group).collect();
     Ok(project)
 }
 
+/// A layer's filter as a RustGIS definition query, when it reads as one. `what` says where it
+/// came from in the notes ("subset string", or a virtual layer's query).
+fn definition_query(source: &Source, name: &str, what: &str, report: &mut Report) -> Option<String> {
+    let Source::File { subset: Some(q), .. } = source else { return None };
+    match expr::to_sql(q) {
+        // A definition query is read with no map scale, so one reading it would take no feature.
+        Some(_) if expr::reads_scale(q) => {
+            report.skipped(name, format!("its filter ({what}), which reads the map's scale, which a filter has none of"));
+            None
+        }
+        Some(sql) => Some(sql),
+        None => {
+            report.skipped(name, format!("its filter ({what}), which is too long to read"));
+            None
+        }
+    }
+}
+
+/// The dialect of a file's filter: SQLite's for the `spatialite` provider, a GeoPackage or a
+/// SQLite database, OGR SQL's for the rest.
+fn dialect(path: &str, provider: &str) -> expr::Dialect {
+    // An `ogr` SpatiaLite file is told by its extension; one named otherwise reads as OGR SQL's.
+    let ext = path.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+    if provider == "spatialite" || matches!(ext.as_str(), "gpkg" | "sqlite" | "sqlite3" | "db" | "spatialite") {
+        expr::Dialect::Sqlite
+    } else {
+        expr::Dialect::Ogr
+    }
+}
+
+/// Notes, once for `layer`, where `filters` (each read under its dialect) match otherwise in
+/// RustGIS than in QGIS. `what` names them: "its filter (subset string)", "its rules".
+fn note_matching(layer: &str, what: &str, filters: &[(&str, expr::Dialect)], report: &mut Report) {
+    if filters.iter().any(|(f, d)| expr::case_differs(f, *d)) {
+        report.approximated(layer, format!("{what}, matching text ignoring letter case where QGIS tells case apart"));
+    }
+    if filters.iter().any(|(f, _)| expr::null_in_not_in(f)) {
+        report.approximated(
+            layer,
+            format!("{what}, whose NOT IN list holds NULL: RustGIS skips the NULL, so it matches the features QGIS takes as unknown"),
+        );
+    }
+}
+
+/// Virtual layers that select every column of one layer, with or without a `WHERE` clause, read
+/// as that layer's file with the clause as its filter (with the layer's own filter too, when it
+/// is another of the project's layers). A virtual layer on another such one is read once that
+/// one is, whatever their order, up to [`MAX_VIRTUAL_CHAIN`] deep. The rest are left as they are,
+/// for the import to note.
+fn resolve_virtual_layers(layers: &mut [ProjectLayer], report: &mut Report) {
+    // The parts (filter, dialect) of each virtual layer read so far, by id, for one on it to carry.
+    let mut chained: std::collections::HashMap<String, Vec<(String, expr::Dialect)>> = std::collections::HashMap::new();
+    for _ in 0..MAX_VIRTUAL_CHAIN {
+        let mut changed = false;
+        for i in 0..layers.len() {
+            let Some(Source::Virtual { from: Some(from), filter, .. }) = layers.get(i).map(|l| &l.source) else { continue };
+            let max = rustgis_data::query::MAX_LEN;
+            // The layer it selects from, as it reads (its file, with its own filter), copied
+            // without a filter longer than any RustGIS reads (`true`: one was left behind).
+            let base = match from {
+                source::VirtualFrom::Source(s) => Some(&**s),
+                source::VirtualFrom::Layer(id) => layers.iter().find(|l| &l.id == id).map(|l| &l.source),
+                source::VirtualFrom::Missing(_) => None,
+            };
+            let Some(Source::File { path, layer, subset, ignored }) = base else { continue };
+            // A project layer on a file of several named without one: as a source naming none.
+            if layer.is_none() && source::holds_layers(path) {
+                let why = source::no_layer_named(path);
+                if let Some(Source::Virtual { from, filter, .. }) = layers.get_mut(i).map(|l| &mut l.source) {
+                    *from = Some(source::VirtualFrom::Missing(why));
+                    *filter = None;
+                }
+                changed = true;
+                continue;
+            }
+            let (path, layer, ignored) = (path.clone(), layer.clone(), ignored.clone());
+            let (subset, base_too_long) = match subset {
+                Some(q) if q.len() > max => (None, true),
+                q => (q.clone(), false),
+            };
+            let filter = filter.clone();
+            // The parts of the layer below, when it is a virtual one read before; else its filter.
+            let below = match from {
+                source::VirtualFrom::Layer(id) => chained.get(id).cloned(),
+                _ => None,
+            };
+            let provider = match from {
+                source::VirtualFrom::Layer(id) => layers.iter().find(|l| &l.id == id).map(|l| l.provider.clone()),
+                _ => None,
+            }
+            .unwrap_or_default();
+            let base_parts = |a: &String| below.clone().unwrap_or_else(|| vec![(a.clone(), dialect(&path, &provider))]);
+            let Some(l) = layers.get_mut(i) else { continue };
+            if base_too_long {
+                report.skipped(&l.name, "the filter of the layer its virtual layer selects from, which is too long to read");
+            }
+            // Its own filter likewise; the rest of the filter is kept, noted.
+            let filter = match filter {
+                Some(f) if f.len() > max => {
+                    report.skipped(&l.name, "its filter (from its virtual layer's query), which is too long to read");
+                    None
+                }
+                f => f,
+            };
+            // What the combined filter holds, each part under its own dialect.
+            let mut parts: Vec<(String, expr::Dialect)> = Vec::new();
+            let subset = match (subset, filter) {
+                (Some(a), Some(b)) if a.len() + b.len() + 11 > max => {
+                    report.skipped(&l.name, "its filter (from its virtual layer's query) with that of the layer it selects from, too long to read together: the latter alone kept");
+                    parts.extend(base_parts(&a));
+                    Some(a)
+                }
+                (Some(a), Some(b)) => {
+                    parts.extend(base_parts(&a));
+                    parts.push((b.clone(), expr::Dialect::Sqlite));
+                    Some(format!("({a}) AND ({b})"))
+                }
+                (Some(a), None) => {
+                    parts.extend(base_parts(&a));
+                    Some(a)
+                }
+                (None, b) => {
+                    parts.extend(b.iter().map(|f| (f.clone(), expr::Dialect::Sqlite)));
+                    b
+                }
+            };
+            let resolved = Source::File { path, layer, subset, ignored };
+            l.definition_query =
+                definition_query(&resolved, &l.name, "from its virtual layer's query and the layer it selects from", report);
+            if l.definition_query.is_some() {
+                let seen: Vec<(&str, expr::Dialect)> = parts.iter().map(|(q, d)| (q.as_str(), *d)).collect();
+                note_matching(&l.name, "its filter (from its virtual layer's query and the layer it selects from)", &seen, report);
+            }
+            chained.insert(l.id.clone(), parts);
+            l.source = resolved;
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    // One on a layer the project doesn't have (by its id), or on one that is itself on a missing
+    // layer: said as missing, not as unsupported.
+    for _ in 0..MAX_VIRTUAL_CHAIN {
+        let mut changed = false;
+        for i in 0..layers.len() {
+            let missing = match layers.get(i).map(|l| &l.source) {
+                Some(Source::Virtual { from: Some(source::VirtualFrom::Layer(id)), .. }) => {
+                    match layers.iter().find(|l| &l.id == id).map(|l| &l.source) {
+                        None => {
+                            let shown: String = id.chars().take(100).collect();
+                            let more = if id.chars().count() > 100 { "…" } else { "" };
+                            Some(format!("the layer with id `{shown}{more}` it selects from isn't in the project"))
+                        }
+                        // On one itself on a missing layer: the same reason.
+                        Some(Source::Virtual { from: Some(source::VirtualFrom::Missing(why)), .. }) => Some(why.clone()),
+                        Some(_) => None,
+                    }
+                }
+                _ => None,
+            };
+            if let (Some(base), Some(Source::Virtual { from, filter, .. })) = (missing, layers.get_mut(i).map(|l| &mut l.source)) {
+                *from = Some(source::VirtualFrom::Missing(base));
+                *filter = None;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Still on another layer after that: the virtual layers select from each other in a ring, or
+    // go deeper than RustGIS follows (the base at the end of a deep chain is a file's layer by
+    // now, unresolved only because the passes ran out).
+    // Followed link by link: to a file's layer (the passes ran out) or round to a layer already
+    // passed (a ring); at most one link past those followed, a longer chain being too deep
+    // whatever its end. One ending elsewhere (a CSV, memory or database layer, a grouping
+    // query) keeps its own reason.
+    let rings: Vec<bool> = {
+        let by_id: std::collections::HashMap<&str, usize> = layers.iter().enumerate().map(|(i, l)| (l.id.as_str(), i)).collect();
+        (0..layers.len())
+            .map(|i| {
+                let mut passed: Vec<&str> = Vec::new();
+                let mut at = layers.get(i);
+                loop {
+                    match at.map(|l| (&l.id, &l.source)) {
+                        Some((id, Source::Virtual { from: Some(source::VirtualFrom::Layer(next)), .. })) => {
+                            if passed.contains(&id.as_str()) || passed.len() > MAX_VIRTUAL_CHAIN {
+                                break true;
+                            }
+                            passed.push(id);
+                            at = by_id.get(next.as_str()).and_then(|&j| layers.get(j));
+                        }
+                        // (Reached from a virtual layer: the chain's end the passes didn't reach.)
+                        Some((_, Source::File { .. })) => break !passed.is_empty(),
+                        _ => break false,
+                    }
+                }
+            })
+            .collect()
+    };
+    for (l, ring) in layers.iter_mut().zip(rings) {
+        if let (true, Source::Virtual { from, filter, .. }) = (ring, &mut l.source) {
+            *from = Some(source::VirtualFrom::Missing(format!(
+                "the virtual layers it selects from select from each other, or go deeper than the {MAX_VIRTUAL_CHAIN} RustGIS follows"
+            )));
+            *filter = None;
+        }
+    }
+}
+
+/// How many virtual layers on virtual layers are followed.
+const MAX_VIRTUAL_CHAIN: usize = 8;
+
 /// Reads a QGIS layer style (a `.qml` file's text) for the layer named `layer` (for the notes).
-pub fn read_style(text: &str, layer: &str, report: &mut Report) -> Result<Style, String> {
+/// `dir` is the folder relative image paths start from (empty: none); `images` reads its raster
+/// image markers' images.
+pub fn read_style(text: &str, layer: &str, dir: &str, images: &mut ReadImage, report: &mut Report) -> Result<Style, String> {
     let doc = parse(text, "a QGIS layer style")?;
     let root = doc.root_element();
     if !root.has_tag_name("qgis") {
         return Err("not a QGIS layer style (.qml): its root element isn't <qgis>".into());
     }
+    symbol::read_images(root, dir, images, report);
     Ok(read_style_node(root, layer, report))
 }
 
@@ -334,9 +962,11 @@ fn read_style_node(node: Node, layer: &str, report: &mut Report) -> Style {
         style.max_scale = Some(inside.map(|s| s * QGIS_SCALE));
     }
     layer_notes(node, layer, report);
+    style.time = structure::layer_time(node, layer, report);
     if let Some(r) = child(node, "renderer-v2") {
         renderer::read(r, layer, &mut style, report);
     }
+    style.diagram = diagram::read(node, layer, style.reference_scale, &mut style.diagram_by, report);
     // A raster's renderer: its opacity, and its colouring as RustGIS's raster style.
     if let Some(r) = child(node, "pipe").and_then(|p| child(p, "rasterrenderer")) {
         if let Some(o) = r.attribute("opacity").and_then(|o| o.trim().parse::<f32>().ok()).filter(|o| o.is_finite() && *o < 1.0) {
@@ -369,16 +999,6 @@ fn old_labels(node: Node) -> bool {
 
 /// Notes a layer's settings RustGIS has no place for (a project's `<maplayer>` or a style's root).
 fn layer_notes(node: Node, layer: &str, report: &mut Report) {
-    if child(node, "temporal").is_some_and(|t| t.attribute("enabled") == Some("1")) {
-        report.skipped(layer, "its time settings");
-    }
-    let diagrams = node
-        .children()
-        .filter(|c| c.tag_name().name().ends_with("DiagramRenderer"))
-        .any(|r| r.descendants().any(|d| d.has_tag_name("DiagramCategory") && d.attribute("enabled") == Some("1")));
-    if diagrams {
-        report.skipped(layer, "its diagrams");
-    }
     if let Some(m) = child(node, "map-layer-style-manager") {
         let current = m.attribute("current").unwrap_or_default();
         let others: Vec<&str> = m
@@ -404,32 +1024,107 @@ fn layer_notes(node: Node, layer: &str, report: &mut Report) {
     }
 }
 
-/// Notes the project's parts RustGIS has no place for: print layouts, annotations, bookmarks,
-/// map themes and relations.
+/// Notes the project's parts RustGIS has no place for: print layouts, annotations of QGIS's
+/// older kind and map themes.
 fn project_notes(root: Node, report: &mut Report) {
     let count = |list: &str, item: &str| child(root, list).map_or(0, |l| l.children().filter(|c| c.has_tag_name(item)).count());
     let layouts = count("Layouts", "Layout") + root.children().filter(|c| c.has_tag_name("Composer")).count();
     if layouts > 0 {
         report.skipped("", format!("its print layouts ({layouts})"));
     }
-    let items = child(root, "main-annotation-layer")
-        .and_then(|a| child(a, "items"))
-        .map_or(0, |i| i.children().filter(|c| c.has_tag_name("item")).count());
-    if items > 0 {
-        report.skipped("", format!("its annotations ({items}: text, shapes and pictures on the map)"));
-    }
-    let bookmarks = count("Bookmarks", "Bookmark");
-    if bookmarks > 0 {
-        report.skipped("", format!("its bookmarks ({bookmarks})"));
+    // QGIS 3's older annotations, kept beside the annotation layers (form, HTML, SVG and text
+    // balloons).
+    let balloons = child(root, "Annotations").map_or(0, |a| a.children().filter(Node::is_element).count());
+    if balloons > 0 {
+        report.skipped("", format!("its annotations of QGIS's older kind ({balloons}: text, HTML, SVG and form balloons)"));
     }
     let themes = count("visibility-presets", "visibility-preset");
     if themes > 0 {
         report.skipped("", format!("its map themes ({themes})"));
     }
-    let relations = count("relations", "relation");
-    if relations > 0 {
-        report.skipped("", format!("its relations between layers ({relations})"));
+}
+
+/// Notes what the layer tree's groups carry over only in part: groups past RustGIS's limits,
+/// groups showing one layer at a time, group layers' opacity, blending and effects (`blended`,
+/// `effects`: the groups whose blending mode, draw effect is left out), and a drawing order of
+/// its own.
+fn group_notes(tree: &Tree, blended: &[String], effects: &[String], report: &mut Report) {
+    if tree.folded > 0 {
+        report.approximated(
+            "",
+            format!(
+                "groups past RustGIS's {} levels or {} groups ({}): their layers put in the group holding them",
+                crate::MAX_GROUP_DEPTH,
+                crate::MAX_GROUPS,
+                tree.folded
+            ),
+        );
     }
+    let exclusive: Vec<&str> = tree.groups.iter().filter(|g| g.exclusive).map(|g| g.group.name.as_str()).collect();
+    if !exclusive.is_empty() {
+        report.approximated("", format!("groups showing one layer at a time ({}), carried over as ordinary groups", listed(&exclusive)));
+    }
+    let opaque: Vec<&str> = tree.groups.iter().filter(|g| g.group.transparency.is_some()).map(|g| g.group.name.as_str()).collect();
+    if !opaque.is_empty() {
+        report.approximated(
+            "",
+            format!(
+                "the opacity of groups drawn as one ({}), applied to each of their layers rather than to them drawn together",
+                listed(&opaque)
+            ),
+        );
+    }
+    if !blended.is_empty() {
+        let names: Vec<&str> = blended.iter().map(String::as_str).collect();
+        report.approximated("", format!("the blending mode of groups drawn as one ({}), drawn as Normal", listed(&names)));
+    }
+    if !effects.is_empty() {
+        let names: Vec<&str> = effects.iter().map(String::as_str).collect();
+        report.skipped("", format!("the draw effects of groups drawn as one ({})", listed(&names)));
+    }
+    if tree.custom_order {
+        report.approximated("", "its layer order (set apart from the layer tree): drawn in the layer tree's order");
+    }
+    if tree.legend_order {
+        report.approximated("", "its layer order (set apart from the legend), not read: drawn in the legend's order");
+    }
+    if tree.deep > 0 {
+        report.approximated(
+            "",
+            format!("layers below {TREE_DEPTH} levels of groups ({}): put in the group holding them, with their groups' boxes", tree.deep),
+        );
+    }
+    if tree.cut > 0 {
+        report.approximated(
+            "",
+            format!("the layer tree's entries past the first {TREE_LAYERS} ({}): their layers come in at the top level, shown", tree.cut),
+        );
+    }
+}
+
+/// The project's main annotation layer (`<main-annotation-layer>`), drawn over its layers, as a
+/// layer named "Annotations": `None` when it holds no annotation to draw.
+fn main_annotations(node: Node, dir: &str, report: &mut Report) -> Option<ProjectLayer> {
+    const NAME: &str = "Annotations";
+    let annotations = annotation::read(node, dir, NAME, report);
+    if annotations.is_empty() {
+        return None;
+    }
+    Some(ProjectLayer {
+        id: child(node, "id").and_then(|n| n.text()).unwrap_or_default().trim().to_string(),
+        name: NAME.to_string(),
+        provider: String::new(),
+        source: Source::Other { provider: String::new() },
+        crs: child(node, "srs").and_then(crs_of),
+        kind: "annotation".to_string(),
+        vector: false,
+        visible: true,
+        group: None,
+        checked: true,
+        definition_query: None,
+        style: read_style_node(node, NAME, report),
+        annotations,
+    })
 }
 
 /// Whether `node` (a symbol layer, a renderer) has a draw effect on: a shadow, glow, blur or the
@@ -453,54 +1148,210 @@ pub(crate) fn data_defined_on(node: Node) -> bool {
     })
 }
 
-/// The layers in a layer tree group, top first, each with whether it is checked (and every
-/// group above it). Groups are walked to a bounded depth.
-fn tree_layers(group: Node, checked: bool, out: &mut Vec<(String, bool)>, depth: usize) {
-    if depth > 64 || out.len() > MAX_LAYERS * 4 {
-        return;
-    }
-    let on = |n: Node| n.attribute("checked").is_none_or(|c| c == "Qt::Checked" || c == "Qt::PartiallyChecked");
-    for c in group.children().filter(Node::is_element) {
-        if c.has_tag_name("layer-tree-layer") {
-            if let Some(id) = c.attribute("id") {
-                out.push((id.to_string(), checked && on(c)));
+/// A layer of the layer tree, top first.
+struct TreeLayer {
+    id: String,
+    /// Checked, and every group holding it too.
+    visible: bool,
+    /// Its own box, and those of the groups between it and `group` that weren't kept.
+    checked: bool,
+    group: Option<usize>,
+}
+
+/// A group of the layer tree.
+struct TreeGroup {
+    group: ProjectGroup,
+    /// The id of its QGIS group layer (`groupLayer`), drawn as one, if it is one.
+    layer: Option<String>,
+    /// Its layers show one at a time (QGIS's mutually exclusive group).
+    exclusive: bool,
+}
+
+/// Where in the layer tree a walk is: what applies to the children of a group.
+#[derive(Clone, Copy)]
+struct Place {
+    /// Every group above checked.
+    visible: bool,
+    /// The boxes of the groups since `kept` that weren't kept.
+    checked: bool,
+    /// The group its layers go in (an index into [`Tree::groups`]).
+    kept: Option<usize>,
+    /// The level of a group made here (1 at the top).
+    level: usize,
+}
+
+/// A project's layer tree (QGIS 2's legend before it): its layers, top first, and its groups.
+/// Groups past RustGIS's limits ([`crate::MAX_GROUP_DEPTH`] levels, [`crate::MAX_GROUPS`]
+/// groups) aren't kept: their layers go in the group holding them, with their boxes.
+#[derive(Default)]
+struct Tree {
+    layers: Vec<TreeLayer>,
+    groups: Vec<TreeGroup>,
+    /// The groups not kept.
+    folded: usize,
+    /// Layers below [`TREE_DEPTH`] levels of groups, read without walking further in.
+    deep: usize,
+    /// The group layers (by id) of groups drawn as one that weren't kept.
+    folded_layers: std::collections::HashSet<String>,
+    /// Layer entries past [`TREE_LAYERS`], not read.
+    cut: usize,
+    /// A drawing order of its own is on (QGIS's Layer Order panel) and differs from the tree's.
+    custom_order: bool,
+    /// QGIS 2's legend keeps a drawing order of its own (`updateDrawingOrder="false"`).
+    legend_order: bool,
+}
+
+/// The most levels of groups the layer tree is walked into; the layers further in are read
+/// without walking (see [`Tree::flatten`]).
+const TREE_DEPTH: usize = 64;
+/// The most layer entries read from the layer tree.
+const TREE_LAYERS: usize = MAX_LAYERS * 4;
+
+/// Whether a layer tree or legend entry's box is checked.
+fn checked_box(n: Node) -> bool {
+    n.attribute("checked").is_none_or(|c| c == "Qt::Checked" || c == "Qt::PartiallyChecked")
+}
+
+impl Tree {
+    fn read(root: Node) -> Tree {
+        let mut tree = Tree::default();
+        let top = Place { visible: true, checked: true, kept: None, level: 1 };
+        if let Some(t) = child(root, "layer-tree-group") {
+            tree.walk(t, false, top, 0);
+            // The custom order, top first, of the layers in the tree.
+            if let Some(c) = child(t, "custom-order").filter(|c| c.attribute("enabled") == Some("1")) {
+                let known: std::collections::HashSet<&str> = tree.layers.iter().map(|l| l.id.as_str()).collect();
+                let ids: Vec<&str> = c
+                    .children()
+                    .filter(|i| i.has_tag_name("item"))
+                    .take(TREE_LAYERS)
+                    .filter_map(|i| i.text())
+                    .map(str::trim)
+                    .filter(|id| known.contains(id))
+                    .collect();
+                let listed: std::collections::HashSet<&str> = ids.iter().copied().collect();
+                let order: Vec<&str> = tree.layers.iter().map(|l| l.id.as_str()).filter(|id| listed.contains(id)).collect();
+                tree.custom_order = ids != order;
             }
-        } else if c.has_tag_name("layer-tree-group") {
-            tree_layers(c, checked && on(c), out, depth + 1);
+        } else if let Some(l) = child(root, "legend") {
+            tree.walk(l, true, top, 0);
+            // Each legend layer's place in it (`drawingOrder`, -1 when it follows the legend).
+            tree.legend_order = l.attribute("updateDrawingOrder") == Some("false")
+                && l.descendants()
+                    .filter(|n| n.has_tag_name("legendlayer"))
+                    .any(|n| n.attribute("drawingOrder").and_then(|o| o.trim().parse::<i64>().ok()).is_some_and(|o| o >= 0));
+        }
+        tree
+    }
+
+    /// Keeps the id of the group layer of a group not kept (`groupLayer`), if it is one.
+    fn fold_group_layer(&mut self, group: Node) {
+        if let Some(id) = group.attribute("groupLayer").map(str::trim).filter(|l| !l.is_empty()) {
+            self.folded_layers.insert(id.to_string());
+        }
+    }
+
+    /// The tags of a layer and of a group (`legend`: QGIS 2's `<legend>`).
+    fn tags(legend: bool) -> (&'static str, &'static str) {
+        if legend { ("legendlayer", "legendgroup") } else { ("layer-tree-layer", "layer-tree-group") }
+    }
+
+    /// Adds a layer entry's layers (a QGIS 2 legend layer may list several), up to
+    /// [`TREE_LAYERS`]; past that they are counted in `cut`.
+    fn add(&mut self, c: Node, legend: bool, visible: bool, checked: bool, group: Option<usize>) {
+        let ids: Vec<&str> = if legend {
+            c.descendants().filter(|f| f.has_tag_name("legendlayerfile")).filter_map(|f| f.attribute("layerid")).collect()
+        } else {
+            c.attribute("id").into_iter().collect()
+        };
+        for id in ids {
+            if self.layers.len() >= TREE_LAYERS {
+                self.cut += 1;
+            } else {
+                self.layers.push(TreeLayer { id: id.to_string(), visible, checked, group });
+            }
+        }
+    }
+
+    /// Reads a group's children (`legend`: QGIS 2's `<legend>`), walking into the groups in it
+    /// [`TREE_DEPTH`] levels deep; further in, [`Tree::flatten`] reads the layers.
+    fn walk(&mut self, group: Node, legend: bool, at: Place, depth: usize) {
+        if depth > TREE_DEPTH {
+            self.flatten(group, legend, at);
+            return;
+        }
+        let on = checked_box;
+        let (layer_tag, group_tag) = Tree::tags(legend);
+        for c in group.children().filter(Node::is_element) {
+            if c.has_tag_name(layer_tag) {
+                self.add(c, legend, at.visible && on(c), at.checked && on(c), at.kept);
+            } else if c.has_tag_name(group_tag) {
+                let visible = at.visible && on(c);
+                let inside = if at.level <= crate::MAX_GROUP_DEPTH && self.groups.len() < crate::MAX_GROUPS {
+                    let name = c.attribute("name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Group");
+                    let expanded = if legend { c.attribute("open") != Some("false") } else { c.attribute("expanded") != Some("0") };
+                    self.groups.push(TreeGroup {
+                        group: ProjectGroup {
+                            name: name.to_string(),
+                            checked: on(c),
+                            expanded,
+                            parent: at.kept,
+                            transparency: None,
+                            min_scale: None,
+                            max_scale: None,
+                        },
+                        layer: c.attribute("groupLayer").map(str::trim).filter(|l| !l.is_empty()).map(str::to_string),
+                        exclusive: c.attribute("mutually-exclusive") == Some("1"),
+                    });
+                    Place { visible, checked: true, kept: Some(self.groups.len() - 1), level: at.level + 1 }
+                } else {
+                    self.folded += 1;
+                    self.fold_group_layer(c);
+                    Place { visible, checked: at.checked && on(c), kept: at.kept, level: at.level + 1 }
+                };
+                self.walk(c, legend, inside, depth + 1);
+            }
+        }
+    }
+
+    /// Reads the layers in a group too deep to walk into, in order, without recursing: each in
+    /// the group holding them all (`at`), with its box and those of the groups between (counted
+    /// in `deep`).
+    fn flatten(&mut self, group: Node, legend: bool, at: Place) {
+        let (layer_tag, group_tag) = Tree::tags(legend);
+        // Entries to read, the next on top, each with the boxes of the groups above it.
+        let mut stack: Vec<(Node, bool)> = group.children().filter(Node::is_element).rev().map(|c| (c, true)).collect();
+        while let Some((c, boxes)) = stack.pop() {
+            if c.has_tag_name(layer_tag) {
+                let on = boxes && checked_box(c);
+                // Only those read: the ones past the budget are counted in `cut`.
+                let before = self.layers.len();
+                self.add(c, legend, at.visible && on, at.checked && on, at.kept);
+                self.deep += self.layers.len() - before;
+            } else if c.has_tag_name(group_tag) {
+                self.folded += 1;
+                self.fold_group_layer(c);
+                let inside = boxes && checked_box(c);
+                stack.extend(c.children().filter(Node::is_element).rev().map(|n| (n, inside)));
+            }
         }
     }
 }
 
-/// The layers in QGIS 2's legend (`<legend>`, before the layer tree), top first, each with
-/// whether it is checked (and its group). Groups are walked to a bounded depth.
-fn legend_layers(group: Node, checked: bool, out: &mut Vec<(String, bool)>, depth: usize) {
-    if depth > 64 || out.len() > MAX_LAYERS * 4 {
-        return;
-    }
-    let on = |n: Node| n.attribute("checked").is_none_or(|c| c == "Qt::Checked" || c == "Qt::PartiallyChecked");
-    for c in group.children().filter(Node::is_element) {
-        if c.has_tag_name("legendlayer") {
-            for f in c.descendants().filter(|f| f.has_tag_name("legendlayerfile")) {
-                if let Some(id) = f.attribute("layerid") {
-                    out.push((id.to_string(), checked && on(c)));
-                }
-            }
-        } else if c.has_tag_name("legendgroup") {
-            legend_layers(c, checked && on(c), out, depth + 1);
-        }
-    }
-}
-
-/// QGIS's blending modes (`QPainter::CompositionMode`) RustGIS has.
+/// QGIS's blending modes RustGIS has, by the number QGIS saves a layer's (`<blendMode>`): its
+/// own numbering, not Qt's composition modes (measured: QGIS 4.2 saves Multiply as 6). Older
+/// QGIS does too: a QGIS 3.10 project saves 6 and a QGIS 2.2 style 10, which in Qt's numbers
+/// are modes QGIS doesn't offer (DestinationIn, DestinationAtop), in QGIS's Multiply and Hard
+/// Light.
 fn blend_of(mode: i32) -> Option<Blend> {
     Some(match mode {
         0 => Blend::Normal,
-        13 => Blend::Multiply,
-        14 => Blend::Screen,
-        15 => Blend::Overlay,
-        16 => Blend::Darken,
-        17 => Blend::Lighten,
-        22 => Blend::Difference,
+        1 => Blend::Lighten,
+        2 => Blend::Screen,
+        5 => Blend::Darken,
+        6 => Blend::Multiply,
+        8 => Blend::Overlay,
+        11 => Blend::Difference,
         _ => return None,
     })
 }
@@ -519,21 +1370,22 @@ fn extent_of(node: Node) -> Option<[f64; 4]> {
     (e[0] < e[2] && e[1] < e[3]).then_some(e)
 }
 
-/// Parses QGIS's XML with a node limit. QGIS starts its files with `<!DOCTYPE qgis …>`, which
+/// Parses QGIS's XML with a node limit, through [`rustgis_data::xml::parse`] (which bounds its
+/// nesting and its namespaces). QGIS starts its files with `<!DOCTYPE qgis …>`, which
 /// declares nothing: the document is read from past it, and one declaring entities (`[…]`) is
 /// refused rather than expanded.
 fn parse<'a>(text: &'a str, what: &str) -> Result<Document<'a>, String> {
     let opts = ParsingOptions { allow_dtd: false, nodes_limit: MAX_NODES, ..ParsingOptions::default() };
     let doctype = text.find("<!DOCTYPE").filter(|at| text.get(..*at).is_some_and(|before| !before.contains("<q")));
     let Some(at) = doctype else {
-        return Document::parse_with_options(text, opts).map_err(|e| format!("not {what}: {e}"));
+        return rustgis_data::xml::parse(text, opts).map_err(|e| format!("not {what}: {e}"));
     };
     let end = text.get(at..).and_then(|t| t.find('>')).map(|e| at + e + 1).ok_or_else(|| format!("not {what}: an unclosed <!DOCTYPE"))?;
     if text.get(at..end).is_some_and(|d| d.contains('[')) {
         return Err(format!("not {what}: it declares entities (a DTD), which aren't read"));
     }
     let rest = text.get(end..).unwrap_or_default();
-    Document::parse_with_options(rest, opts).map_err(|e| format!("not {what}: {e}"))
+    rustgis_data::xml::parse(rest, opts).map_err(|e| format!("not {what}: {e}"))
 }
 
 /// The first child element named `tag`.
