@@ -1561,15 +1561,27 @@ pub fn geometry_to_geojson(g: &Geometry) -> Json {
 /// A FeatureCollection is read a feature at a time: each one is parsed, turned into a feature and
 /// dropped before the next, so the whole document is never held as JSON values.
 pub fn read_geojson(text: &str, name: &str) -> Result<(Dataset, ReadReport)> {
-    let mut features = Collector::default();
+    read_geojson_as(text, name, false)
+}
+
+/// [`read_geojson`] keeping x and y only: heights and measures are dropped and said
+/// ([`Dataset::zm_dropped`]), as RustGIS reads them. For TopoJSON, which is read through GeoJSON
+/// and whose heights on shared arcs RustGIS-SwatPlus doesn't keep.
+pub(crate) fn read_geojson_flat(text: &str, name: &str) -> Result<(Dataset, ReadReport)> {
+    read_geojson_as(text, name, true)
+}
+
+/// [`read_geojson`], dropping heights when `flat`.
+fn read_geojson_as(text: &str, name: &str, flat: bool) -> Result<(Dataset, ReadReport)> {
+    let mut features = Collector { flat, ..Collector::default() };
     match stream_features(text, &mut features) {
         Ok(rest) => match rest.get("type").and_then(Json::as_str) {
             Some("FeatureCollection") => features.finish(name, &rest),
-            Some(_) => read_geojson_value(Json::Object(rest), name),
+            Some(_) => read_geojson_value(Json::Object(rest), name, flat),
             None => Err(DataError::Format("GeoJSON: missing \"type\"".into())),
         },
         // Not an object, or "features" not an array: read whole, as before.
-        Err(_) => read_geojson_value(serde_json::from_str(text).map_err(|e| DataError::Format(format!("GeoJSON: {e}")))?, name),
+        Err(_) => read_geojson_value(serde_json::from_str(text).map_err(|e| DataError::Format(format!("GeoJSON: {e}")))?, name, flat),
     }
 }
 
@@ -1885,8 +1897,24 @@ pub(crate) fn geojson_attrs(f: &Json, fields: &[Field]) -> Vec<Value> {
         .collect()
 }
 
-/// Whether a feature's geometry has a third value in any position (a height, which reading drops),
-/// a GeometryCollection's members included.
+/// Whether a feature's geometry has a fourth value in any position (a measure, which reading drops;
+/// heights are kept, [`Dataset::zm`]), a GeometryCollection's members included.
+pub(crate) fn geojson_has_m(f: &Json) -> bool {
+    fn positions(v: &Json) -> bool {
+        match v.as_array() {
+            Some(a) if a.first().is_some_and(Json::is_number) => a.iter().skip(3).any(Json::is_number),
+            Some(a) => a.iter().any(positions),
+            None => false,
+        }
+    }
+    fn has_m(g: &Json) -> bool {
+        g.get("coordinates").is_some_and(positions) || g.get("geometries").and_then(Json::as_array).is_some_and(|m| m.iter().any(has_m))
+    }
+    f.get("geometry").is_some_and(has_m)
+}
+
+/// Whether a feature's geometry has a third value in any position (a height or a measure), a
+/// GeometryCollection's members included.
 pub(crate) fn geojson_has_z(f: &Json) -> bool {
     /// Any position under `v` (nested arrays, ending in arrays of numbers) has a number beyond its
     /// first two values: a height or measure (a `null` there isn't one).
@@ -1919,15 +1947,17 @@ pub(crate) fn geojson_geometry(f: &Json) -> std::result::Result<Option<Geometry>
 #[derive(Default)]
 struct Collector {
     schema: Schema,
-    /// Each feature's geometry, its heights and its values by field, typed once every feature is
-    /// in.
-    features: Vec<(Option<Geometry>, Option<Vec<f64>>, Vec<(usize, Value)>)>,
+    /// Each feature's geometry, its heights, its values by field (typed once every feature is in),
+    /// and whether it loses heights or measures it had (measures, or heights when `flat`).
+    features: Vec<(Option<Geometry>, Option<Vec<f64>>, Vec<(usize, Value)>, bool)>,
+    /// Heights dropped (and said), as RustGIS reads GeoJSON, rather than kept ([`Dataset::zm`]).
+    flat: bool,
     skipped: usize,
 }
 
 impl FeatureSink for Collector {
     fn restart(&mut self) {
-        *self = Collector::default();
+        *self = Collector { flat: self.flat, ..Collector::default() };
     }
 
     fn feature(&mut self, raw: &str) {
@@ -1948,8 +1978,10 @@ impl Collector {
         let attrs: Vec<(usize, Value)> = props.into_iter().flatten().map(|(k, v)| (self.schema.see(k, v), Value::from_json(v))).collect();
         match geojson_geometry(f) {
             Ok(geom) => {
-                let z = geom.as_ref().and_then(|_| f.get("geometry")).and_then(geojson_heights);
-                self.features.push((geom, z, attrs));
+                let had = geom.is_some() && geojson_has_z(f);
+                let z = if self.flat { None } else { geom.as_ref().and_then(|_| f.get("geometry")).and_then(geojson_heights) };
+                let lost = had && (z.is_none() || geojson_has_m(f));
+                self.features.push((geom, z, attrs, lost));
             }
             Err(()) => self.skipped += 1,
         }
@@ -1985,12 +2017,12 @@ impl Collector {
         let declared = declared_crs(root, &mut said)?;
         report.messages.extend(said);
         let mut unconverted = 0usize;
-        // Only features kept count toward the heights dropped (a height list that doesn't fit its
-        // geometry; the others are kept, `Dataset::zm`).
+        // Only features kept count toward the heights and measures dropped (measures; heights that
+        // don't fit their geometry, or all of them when `flat`; the others are kept, `Dataset::zm`).
         let mut zm = 0usize;
         // Features kept, as longitude/latitude, with a latitude past the poles.
         let mut swapped = 0usize;
-        for (n, (geom, z, values)) in self.features.into_iter().enumerate() {
+        for (n, (geom, z, values, lost)) in self.features.into_iter().enumerate() {
             // A feature that can't be converted is dropped, and its id is not reused, as when the
             // file is read in place.
             // Kept as the file holds it, in its declared system, when it has a place in
@@ -2015,13 +2047,15 @@ impl Collector {
             // as longitude/latitude can be swapped.
             swapped += usize::from(declared.is_none() && geom.as_ref().is_some_and(latitude_past_poles));
             let id = n as u64 + 1;
+            let mut lost = lost;
             if let Some(h) = z.map(|z| crate::VertexZm { z: Some(z), m: None }) {
                 if h.fits(geom.as_ref().map_or(0, Geometry::coord_count)) {
                     ds.zm.insert(id, h);
                 } else {
-                    zm += 1;
+                    lost = true;
                 }
             }
+            zm += usize::from(lost);
             ds.features.push(crate::Feature { id, geometry: geom, attrs });
         }
         ds.geometry_type = dominant_type(&ds);
@@ -2047,8 +2081,8 @@ impl Collector {
 
 /// Reads a GeoJSON document already parsed: a FeatureCollection, Feature or bare geometry. Only a
 /// FeatureCollection's `crs` is read (a Feature's or a geometry's isn't part of the legacy text).
-fn read_geojson_value(root: Json, name: &str) -> Result<(Dataset, ReadReport)> {
-    let mut features = Collector::default();
+fn read_geojson_value(root: Json, name: &str, flat: bool) -> Result<(Dataset, ReadReport)> {
+    let mut features = Collector { flat, ..Collector::default() };
     let mut top = Map::new();
     match root.get("type").and_then(Json::as_str) {
         Some("FeatureCollection") => {
@@ -6837,8 +6871,10 @@ mod tests {
         );
     }
 
-    /// Z and M values RustGIS doesn't keep are said when read, whole or in place, and the mark
-    /// that exports will lack them survives a project save; 2D data says nothing.
+    /// Z and M values not kept are said when read, and the mark that exports will lack them
+    /// survives a project save; 2D data says nothing. RustGIS-SwatPlus keeps a Shapefile's and a
+    /// GeoJSON file's heights read whole ([`Dataset::zm`]); read in place, they are dropped and said
+    /// as in RustGIS.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn dropped_z_and_m_values_are_said() {
@@ -6858,8 +6894,9 @@ mod tests {
         };
         let (wells, flat) = (shp("wells.shp", true), shp("flat.shp", false));
         let (ds, rep) = read_path(&wells).unwrap();
-        assert!(ds.zm_dropped && rep.messages.says(&crate::zm_note(Some(1))), "{:?}", rep.messages);
+        assert!(!ds.zm_dropped && !said(&rep), "{:?}", rep.messages);
         assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(1.0, 2.0))));
+        assert_eq!(ds.zm_of(&ds.features[0]).and_then(|zm| zm.z.clone()), Some(vec![30.0]));
         let (ds, rep) = read_path(&flat).unwrap();
         assert!(!ds.zm_dropped && !said(&rep));
         let src = crate::source::shp::ShpSource::open_path(&wells, "wells").unwrap();
@@ -6897,15 +6934,17 @@ mod tests {
             )
         };
         let (ds, rep) = read_geojson(&doc("[1,2,9]"), "track").unwrap();
-        assert!(ds.zm_dropped && said(&rep));
+        assert!(!ds.zm_dropped && !said(&rep) && ds.zm_of(&ds.features[0]).is_some(), "{:?}", rep.messages);
         let (ds, rep) = read_geojson(&doc("[1,2]"), "track").unwrap();
         assert!(!ds.zm_dropped && !said(&rep));
         let path = dir.path().join("track.geojson");
         std::fs::write(&path, doc("[1,2,9]")).unwrap();
         assert!(crate::source::geojson::GeoJsonSource::open_path(&path, "track").unwrap().info().zm_dropped);
-        // A height past the first position counts; one only in a geometry that isn't read doesn't.
+        // A height past the first position is kept; one only in a geometry that isn't read isn't
+        // counted.
         let line = r#"{"type":"Feature","properties":{},"geometry":{"type":"LineString","coordinates":[[1,2],[3,4,5]]}}"#;
-        assert!(read_geojson(line, "line").unwrap().0.zm_dropped);
+        let (ds, _) = read_geojson(line, "line").unwrap();
+        assert!(!ds.zm_dropped && ds.zm_of(&ds.features[0]).and_then(|zm| zm.z.clone()).is_some_and(|z| z[1] == 5.0));
         // A `null` third value isn't a height, but a measure after it counts.
         let null_z = r#"{"type":"Feature","properties":{},"geometry":{"type":"LineString","coordinates":[[1,2,null],[3,4]]}}"#;
         assert!(!read_geojson(null_z, "line").unwrap().0.zm_dropped);

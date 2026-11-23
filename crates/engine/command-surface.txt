@@ -454,6 +454,9 @@ project.save path?
 project.saveAs path
 project.saveTemplate path name?
 project.thumbnail create? image? path? clear?
+rain.accumulate layers hours? ignoreMissing? name?
+rain.style layer? scale? breaks? band?
+rain.zonal layers zones field? name?
 ramp.add path? text? data? file? format? name? kind?
 ramp.remove name
 ramp.save path

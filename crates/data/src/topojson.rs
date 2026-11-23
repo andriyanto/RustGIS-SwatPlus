@@ -463,7 +463,7 @@ fn read_with(file_name: &str, text: &str, budget: usize) -> Result<Vec<(Dataset,
             .collect();
         let fc = json!({"type": "FeatureCollection", "features": features});
         let title = if objects.len() == 1 { stem.to_string() } else { format!("{stem} {name}") };
-        let (ds, mut rep) = crate::io::read_geojson(&fc.to_string(), &title)?;
+        let (ds, mut rep) = crate::io::read_geojson_flat(&fc.to_string(), &title)?;
         if properties_left_out > 0 {
             let what = if properties_left_out == 1 {
                 "1 property on a nested geometry was".to_string()

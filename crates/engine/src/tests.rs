@@ -28603,10 +28603,12 @@ fn exporting_features_adds_or_replaces_a_table_in_an_existing_geopackage() {
 fn dropped_z_values_are_said_on_import_and_export() {
     let dir = std::env::temp_dir().join(format!("rustgis-engine-zm-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    // A measure (the height null): RustGIS-SwatPlus keeps a GeoJSON file's heights read whole
+    // (`Dataset::zm`), but no measures, which are dropped and said.
     let src = dir.join("wells.geojson");
     std::fs::write(
         &src,
-        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2,30]}}]}"#,
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2,null,7]}}]}"#,
     )
     .unwrap();
     isolate_plugins();
@@ -28652,10 +28654,12 @@ fn dropped_z_values_are_said_on_import_and_export() {
 fn exporting_a_table_says_its_dropped_z_values() {
     let dir = std::env::temp_dir().join(format!("rustgis-engine-table-zm-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    // A measure (the height null): RustGIS-SwatPlus keeps a GeoJSON file's heights read whole
+    // (`Dataset::zm`), but no measures, which are dropped and said.
     let src = dir.join("wells.geojson");
     std::fs::write(
         &src,
-        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"depth":30},"geometry":{"type":"Point","coordinates":[1,2,30]}}]}"#,
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"depth":30},"geometry":{"type":"Point","coordinates":[1,2,null,7]}}]}"#,
     )
     .unwrap();
     isolate_plugins();

@@ -7267,7 +7267,7 @@ mod batch_tests {
                 "type": "Feature",
                 "geometry": {
                     "type": "Point",
-                    "coordinates": [10.0, 20.0, 30.0]
+                    "coordinates": [10.0, 20.0, null, 7.0]
                 },
                 "properties": {"name": "Test"}
             }]
@@ -7333,7 +7333,8 @@ mod batch_tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
 
-        // f1 is inside extent [0, 0, 50, 50]
+        // f1 is inside extent [0, 0, 50, 50]. Its points carry a measure (the height null), which
+        // reading drops and says: RustGIS-SwatPlus keeps GeoJSON heights (`Dataset::zm`).
         let f1 = root.join("f1.geojson");
         let content_inside = json!({
             "type": "FeatureCollection",
@@ -7341,7 +7342,7 @@ mod batch_tests {
                 "type": "Feature",
                 "geometry": {
                     "type": "Point",
-                    "coordinates": [10.0, 20.0, 30.0]
+                    "coordinates": [10.0, 20.0, null, 7.0]
                 },
                 "properties": {"name": "Inside"}
             }]
@@ -7357,7 +7358,7 @@ mod batch_tests {
                 "type": "Feature",
                 "geometry": {
                     "type": "Point",
-                    "coordinates": [100.0, 100.0, 30.0]
+                    "coordinates": [100.0, 100.0, null, 7.0]
                 },
                 "properties": {"name": "Outside"}
             }]
