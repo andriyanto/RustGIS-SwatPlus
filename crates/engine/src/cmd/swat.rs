@@ -7,6 +7,11 @@
 //! The project is held as its files' text (`rustgis_swat_model`), so saving writes back the same
 //! bytes but for the values changed. It isn't part of the map project and isn't saved with it.
 //!
+//! It is run by the swatplus-rust engine (`swat.run`), a separate program that is never linked
+//! (the engine is LGPL-2.1, RustGIS-SwatPlus Apache-2.0; decision K11): the project as edited is
+//! written to a run folder, unless nothing changed, the program runs it, and each run is recorded
+//! with the engine's version, the changes and a fingerprint of the inputs (`swat.runs`).
+//!
 //! A project opened as confidential (data that may not leave the computer) answers with counts
 //! and statistics only, never a record's name or value; only the user can lift that
 //! (`swat.confidential` is reserved to them).
@@ -40,6 +45,8 @@ pub struct SwatState {
     pub project: Project,
     /// Answers carry statistics only.
     pub confidential: bool,
+    /// The runs made since it was opened (`swat.runs`), each as `swat.run` answered.
+    pub runs: Vec<Value>,
 }
 
 pub fn commands() -> Vec<C> {
@@ -79,6 +86,28 @@ pub fn commands() -> Vec<C> {
             .view()
             .when(need_swat)
             .params(r#"{"on": bool} — answers with statistics only (on), or with record names and values (off; only the user can turn it off)"#),
+        C::new("swat.engine", "SWAT+ Engine", WHERE, engine).roles(&[]).effects(crate::policy::Effects::NONE).view().params(
+            r#"{} — the swatplus-rust program that runs projects: where it was found and its version, or how to get it"#,
+        ),
+        C::new("swat.setEngine", "Locate SWAT+ Engine", WHERE, set_engine)
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved).with(crate::policy::Effect::Files))
+            .view()
+            .params(r#"{"path"?: "the swatplus-rust program (empty: look in the usual places)"}"#),
+        C::new("swat.installEngine", "Install SWAT+ Engine", WHERE, install_engine)
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved))
+            .view()
+            .params(r#"{} — downloads the swatplus-rust release RustGIS-SwatPlus was tested with, checks its SHA-256 and installs it"#),
+        C::new("swat.run", "Run SWAT+ Project", WHERE, run).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).view().when(need_swat).params(
+            r#"{"fixSwat"?: bool (correct SWAT+'s bugs: results then differ from SWAT+'s; default false), "threads"?: number (with fixSwat; default all), "format"?: "parquet" (default) | "text" | "both", "folder"?: "where the runs go (default: the app's data folder)"} — runs the project as edited with the swatplus-rust engine and records the run"#,
+        ),
+        C::new("swat.runs", "SWAT+ Runs", WHERE, runs)
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE)
+            .view()
+            .when(need_swat)
+            .params("{} — the runs made since the project was opened: engine version, mode, changes, inputs' fingerprint, tables"),
     ]
 }
 
@@ -101,7 +130,13 @@ fn state_mut(s: &mut Session) -> Result<&mut SwatState, String> {
 fn open(s: &mut Session, p: &Value) -> CmdResult {
     let dir = std::path::PathBuf::from(ps(p, "path").map(str::trim).filter(|d| !d.is_empty()).ok_or("give the TxtInOut folder's path")?);
     let project = read_folder(&dir)?;
-    let st = SwatState { dir: Some(dir), original: project.clone(), project, confidential: b(p, "confidential").unwrap_or(false) };
+    let st = SwatState {
+        dir: Some(dir),
+        original: project.clone(),
+        project,
+        confidential: b(p, "confidential").unwrap_or(false),
+        runs: Vec::new(),
+    };
     s.swat = Some(Box::new(st));
     summary(s, &json!({}))
 }
@@ -618,6 +653,170 @@ fn confidential(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"confidential": on}))
 }
 
+// ---------------------------------------------------------------------------------------------
+// Running
+
+#[cfg(not(target_arch = "wasm32"))]
+fn engine(_: &mut Session, _: &Value) -> CmdResult {
+    use rustgis_swat_run::runner;
+    Ok(match runner::find() {
+        Some((path, version)) => json!({
+            "found": true, "path": path.display().to_string(), "version": version,
+            "installed": rustgis_swat_run::install::is_installed(&path), "release": runner::RELEASE,
+        }),
+        None => json!({
+            "found": false, "release": runner::RELEASE, "download": runner::download_url(), "env": runner::ENV,
+            "hint": "install it (swat.installEngine), point to it (swat.setEngine), or put swatplus-rust on the PATH",
+        }),
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn set_engine(s: &mut Session, p: &Value) -> CmdResult {
+    let path = ps(p, "path").map(str::trim).filter(|p| !p.is_empty()).map(std::path::PathBuf::from);
+    rustgis_swat_run::runner::choose(path)?;
+    engine(s, &Value::Null)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn install_engine(s: &mut Session, _: &Value) -> CmdResult {
+    let path = rustgis_swat_run::install::install(&|_, _| {})?;
+    rustgis_swat_run::runner::choose(Some(path))?;
+    engine(s, &Value::Null)
+}
+
+/// Where runs go when `swat.run` isn't given a folder: `swat-runs/<project folder's name>` in the
+/// app's data folder.
+#[cfg(not(target_arch = "wasm32"))]
+fn runs_root(st: &SwatState) -> Result<std::path::PathBuf, String> {
+    let name = st.dir.as_ref().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into());
+    let base = rustgis_data::dirs::app_data_dir().ok_or("can't find the app's data folder: give a folder")?;
+    Ok(base.join("swat-runs").join(name))
+}
+
+/// The next free `run-NNNN` folder in `root` (made), and its number.
+#[cfg(not(target_arch = "wasm32"))]
+fn next_run(root: &std::path::Path) -> Result<(u32, std::path::PathBuf), String> {
+    std::fs::create_dir_all(root).map_err(|e| format!("{}: {e}", root.display()))?;
+    for n in 1..=9999u32 {
+        let d = root.join(format!("run-{n:04}"));
+        // `create_dir` fails when it exists, so two runs never share a folder.
+        match std::fs::create_dir(&d) {
+            Ok(()) => return Ok((n, d)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", d.display())),
+        }
+    }
+    Err(format!("{}: 9,999 runs already; give another folder", root.display()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run(s: &mut Session, p: &Value) -> CmdResult {
+    use rustgis_swat_run::run::{Format, Spec};
+    let changes = diff(s, &json!({}))?;
+    let st = state(s)?;
+    let (exe, version) = rustgis_swat_run::runner::find()
+        .ok_or("swatplus-rust isn't found: install it (swat.installEngine), point to it (swat.setEngine), or put it on the PATH")?;
+    let format = match ps(p, "format") {
+        None => Format::Parquet,
+        Some(f) => Format::parse(f).ok_or_else(|| format!("format is parquet, text or both, not {f}"))?,
+    };
+    let fixes = b(p, "fixSwat").unwrap_or(false);
+    let threads = match f(p, "threads") {
+        None => 0,
+        Some(t) if t >= 0.0 && t.fract() == 0.0 && t <= 1024.0 => t as usize,
+        Some(t) => return Err(format!("threads is a whole number from 0 (all) to 1024, not {t}")),
+    };
+    let root = match ps(p, "folder").map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => std::path::PathBuf::from(d),
+        None => runs_root(st)?,
+    };
+    let files = rustgis_swat_txtinout::write(&st.project);
+    let fingerprint = rustgis_swat_run::run::digest(&files);
+    let changed = changed_files(st);
+    let (n, folder) = next_run(&root)?;
+    // The project's own folder when nothing changed (the engine only reads it); otherwise the
+    // project as edited, written beside the run's tables.
+    let input = match (&st.dir, changed.is_empty()) {
+        (Some(d), true) => d.clone(),
+        _ => {
+            let input = folder.join("input");
+            for (name, bytes) in &files {
+                // Names stay inside the folder, as they did when read.
+                if name.contains("..") || std::path::Path::new(name).is_absolute() {
+                    continue;
+                }
+                let path = input.join(name);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+                }
+                std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+            }
+            input
+        }
+    };
+    let spec = Spec { input: input.clone(), output: folder.join("output"), fixes, threads, format };
+    let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let out = rustgis_swat_run::run::run(&exe, &spec, &mut |_| {}, &|| false)?;
+    let tables: Vec<Value> = out.tables.iter().map(|(f, rows)| json!({"file": f, "rows": rows})).collect();
+    let record = json!({
+        "run": n,
+        "folder": folder.display().to_string(),
+        "input": input.display().to_string(),
+        "output": spec.output.display().to_string(),
+        "started": started,
+        "engine": {"path": exe.display().to_string(), "version": version},
+        "mode": if fixes { "fix-swat" } else { "faithful" },
+        "threads": if fixes { json!(threads) } else { json!(1) },
+        "format": format.as_str(),
+        "changed_files": changed,
+        "changes": changes["files"].clone(),
+        "inputs_sha256": fingerprint,
+        "ok": out.ok(),
+        "days": out.days,
+        "first": out.first,
+        "last": out.last,
+        "seconds": out.seconds,
+        "tables": tables,
+        "notes": out.notes,
+        "error": out.error,
+    });
+    // The record beside the run, so a run folder says how it was made.
+    let manifest = folder.join("run.json");
+    std::fs::write(&manifest, serde_json::to_vec_pretty(&record).unwrap_or_default())
+        .map_err(|e| format!("{}: {e}", manifest.display()))?;
+    state_mut(s)?.runs.push(record.clone());
+    match &out.error {
+        Some(e) if !out.ok() => Err(format!("the run failed ({}): {e}", folder.display())),
+        _ => Ok(record),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn engine(_: &mut Session, _: &Value) -> CmdResult {
+    Ok(json!({"found": false, "hint": "SWAT+ projects run in the desktop app"}))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn set_engine(_: &mut Session, _: &Value) -> CmdResult {
+    Err("the SWAT+ engine is located in the desktop app".into())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn install_engine(_: &mut Session, _: &Value) -> CmdResult {
+    Err("the SWAT+ engine is installed in the desktop app".into())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn run(_: &mut Session, _: &Value) -> CmdResult {
+    Err("SWAT+ projects run in the desktop app".into())
+}
+
+fn runs(s: &mut Session, _: &Value) -> CmdResult {
+    let st = state(s)?;
+    Ok(json!({"runs": st.runs}))
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[expect(clippy::unwrap_used, reason = "a test module gated on more than `test`, which clippy's allow-unwrap-in-tests does not see")]
 mod tests {
@@ -720,6 +919,73 @@ mod tests {
         assert_eq!(before.len(), after.len());
         // The other files are the same bytes.
         assert_eq!(std::fs::read(d.path().join("time.sim")).unwrap(), std::fs::read(out.path().join("time.sim")).unwrap());
+    }
+
+    /// A stand-in for swatplus-rust: answers `--version`, and for `run <in> --out <out> …` writes
+    /// what it was given and the input's hydrology.hyd into the output folder, as events say.
+    #[cfg(unix)]
+    fn fake_engine(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("swatplus-rust");
+        std::fs::write(
+            &p,
+            r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 'swatplus-rust 1.2.0'; exit 0; fi
+echo "$@" > "$4/args.txt"
+cp "$2/hydrology.hyd" "$4/hydrology.hyd"
+echo '{"event":"start","version":"1.2.0","days":731,"first":"2015-01-01","last":"2016-12-31"}'
+echo '{"event":"table","file":"channel_sd_day.parquet","rows":731}'
+echo '{"event":"done","days":731,"seconds":0.1}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    /// `swat.run` runs the project as edited, in a run folder of its own, and records it; the
+    /// project's files are untouched.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_runs_the_project_as_edited_and_is_recorded() {
+        let d = scenario();
+        let bin = tempfile::tempdir().unwrap();
+        let runs_dir = tempfile::tempdir().unwrap();
+        let exe = fake_engine(bin.path());
+        let mut s = session(&d, false);
+        s.run("swat.setEngine", &json!({"path": exe.display().to_string()})).unwrap();
+        let e = s.run("swat.engine", &json!({})).unwrap();
+        assert_eq!((e["found"].clone(), e["version"].clone()), (json!(true), json!("swatplus-rust 1.2.0")));
+        let folder = runs_dir.path().display().to_string();
+
+        // Unchanged: the engine reads the project's own folder.
+        let r = s.run("swat.run", &json!({"folder": folder})).unwrap();
+        assert_eq!((r["run"].clone(), r["ok"].clone(), r["mode"].clone()), (json!(1), json!(true), json!("faithful")));
+        assert_eq!(r["input"], json!(d.path().display().to_string()));
+        assert_eq!(r["tables"], json!([{"file": "channel_sd_day.parquet", "rows": 731}]));
+        let args = std::fs::read_to_string(runs_dir.path().join("run-0001/output/args.txt")).unwrap();
+        assert!(args.trim().ends_with("--progress json --format parquet"), "{args}");
+
+        // Changed: the project as edited is written for the run, and only there.
+        let before = std::fs::read_to_string(d.path().join("hydrology.hyd")).unwrap();
+        s.run("swat.set", &json!({"file": "hydrology.hyd", "column": "esco", "value": 0.5})).unwrap();
+        let r2 = s.run("swat.run", &json!({"folder": folder, "fixSwat": true, "threads": 2})).unwrap();
+        assert_eq!((r2["run"].clone(), r2["mode"].clone()), (json!(2), json!("fix-swat")));
+        assert_eq!(r2["changed_files"], json!(["hydrology.hyd"]));
+        assert_ne!(r2["inputs_sha256"], r["inputs_sha256"]);
+        let ran = std::fs::read_to_string(runs_dir.path().join("run-0002/output/hydrology.hyd")).unwrap();
+        assert!(ran.contains("0.50000") && ran != before, "the engine read the edited value: {ran}");
+        assert_eq!(std::fs::read_to_string(d.path().join("hydrology.hyd")).unwrap(), before, "the project's file is untouched");
+        let args = std::fs::read_to_string(runs_dir.path().join("run-0002/output/args.txt")).unwrap();
+        assert!(args.trim().ends_with("--fix-swat --threads 2"), "{args}");
+        let manifest: Value = serde_json::from_slice(&std::fs::read(runs_dir.path().join("run-0002/run.json")).unwrap()).unwrap();
+        assert_eq!(manifest, r2);
+
+        let all = s.run("swat.runs", &json!({})).unwrap();
+        assert_eq!(all["runs"].as_array().map(Vec::len), Some(2));
+        assert!(s.run("swat.run", &json!({"folder": folder, "format": "xml"})).is_err());
+        assert!(s.run("swat.run", &json!({"folder": folder, "threads": -1})).is_err());
+        s.run("swat.setEngine", &json!({})).unwrap();
     }
 
     #[test]

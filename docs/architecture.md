@@ -11,6 +11,7 @@ engine scriptable and the front end swappable.
 | L2 | `rustgis-tiles` | Web map tiles: XYZ/TMS/WMS raster tiles, Mapbox Vector Tiles, PMTiles and MBTiles archives and a subset of MapLibre styles; a cache that fetches in the background (worker threads natively, the browser's `fetch` on the web) |
 | L3 | `rustgis-render` | tiny-skia renderer, label placement, font discovery, map and layout export, and UI-independent GPU scene preparation |
 | L3 | `rustgis-geolibre` | The [GeoLibre tools](user-guide/analysis.md#geolibre-tools) as geoprocessing tools: run by the optional `geolibre` program natively, by geolibre-rust's WASI runner in the browser |
+| L3 | `rustgis-swat-run` | Runs a SWAT+ project with the [swatplus-rust](https://github.com/andriyanto/swatplus-rust) engine: finds or installs the `swatplus-rust` program and runs it as a subprocess, reading its JSON-line events. The engine is LGPL-2.1, so it is run, never linked |
 | L3 | `rustgis-plugins` | [Plugins](plugins.md): sandboxed WebAssembly modules, desktop process plugins and assistant skills packages; `.rgplugin` packages and the plugin registry |
 | L4 | `rustgis-engine` | Session, undo, command registry, projects, sample project |
 | L5 | `rustgis-assistant` | The [AI Assistant](user-guide/assistant.md): provider request/response formats, conversation loop, command tools, skills and agent integration; native HTTP transport and local agent/MCP connections, with browser I/O supplied by the web app |

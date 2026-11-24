@@ -581,12 +581,17 @@ swat.check
 swat.close
 swat.confidential on
 swat.diff file?
+swat.engine
 swat.find query file?
 swat.get file column match? where?
+swat.installEngine
 swat.open path confidential?
 swat.revert file? column?
+swat.run fixSwat? threads? format? folder?
+swat.runs
 swat.save path?
 swat.set file column value mode? match? where? force?
+swat.setEngine path?
 swat.summary
 table.close
 table.open layer?

@@ -1,0 +1,23 @@
+[package]
+name = "rustgis-swat-run"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RustGIS L3: runs SWAT+ projects with the swatplus-rust engine, as a separate program (never linked: the engine is LGPL-2.1)"
+
+[lints]
+workspace = true
+
+[dependencies]
+rustgis-data = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+
+# Finding, installing and running the engine program. Native only: the browser will run the
+# engine's WebAssembly module instead.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier", "gzip"] }
+sha2 = { workspace = true }
+flate2 = "1"
+tar = "0.4"
+zip = { version = "9", default-features = false, features = ["deflate"] }
