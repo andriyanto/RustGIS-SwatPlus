@@ -10,7 +10,9 @@
 //! It is run by the swatplus-rust engine (`swat.run`), a separate program that is never linked
 //! (the engine is LGPL-2.1, RustGIS-SwatPlus Apache-2.0; decision K11): the project as edited is
 //! written to a run folder, unless nothing changed, the program runs it, and each run is recorded
-//! with the engine's version, the changes and a fingerprint of the inputs (`swat.runs`).
+//! with the engine's version, the changes and a fingerprint of the inputs (`swat.runs`). In the
+//! desktop app the run goes on a thread of its own (`reads::IN_BACKGROUND`), with the engine's
+//! days as its progress and Cancel stopping the engine.
 //!
 //! A project opened as confidential (data that may not leave the computer) answers with counts
 //! and statistics only, never a record's name or value; only the user can lift that
@@ -710,13 +712,34 @@ fn next_run(root: &std::path::Path) -> Result<(u32, std::path::PathBuf), String>
     Err(format!("{}: 9,999 runs already; give another folder", root.display()))
 }
 
+/// What [`run_ahead`]'s work is placed under for `swat.run` to take as it lands.
 #[cfg(not(target_arch = "wasm32"))]
-fn run(s: &mut Session, p: &Value) -> CmdResult {
-    use rustgis_swat_run::run::{Format, Spec};
-    let changes = diff(s, &json!({}))?;
-    let st = state(s)?;
-    let (exe, version) = rustgis_swat_run::runner::find()
-        .ok_or("swatplus-rust isn't found: install it (swat.installEngine), point to it (swat.setEngine), or put it on the PATH")?;
+const RUN_KEY: &str = "swat.run";
+
+/// A run as asked for, taken from the session on the window's thread: what changed and its new
+/// bytes, and where the rest of the files are. [`Prepared::go`] does the rest anywhere.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct Prepared {
+    /// The project's folder: the engine reads it when nothing changed, and the unchanged files
+    /// are copied from it when something did (they are the bytes read, as `swat.save` writes).
+    dir: Option<std::path::PathBuf>,
+    /// Every file of the project, in name order.
+    names: Vec<String>,
+    /// The changed files' bytes (all files' for a project with no folder).
+    edited: BTreeMap<String, Vec<u8>>,
+    changed: Vec<String>,
+    changes: Value,
+    root: std::path::PathBuf,
+    fixes: bool,
+    threads: usize,
+    format: rustgis_swat_run::run::Format,
+}
+
+/// Checks `swat.run`'s parameters and takes what the run needs of the session. Cheap: only the
+/// changed files are written out here.
+#[cfg(not(target_arch = "wasm32"))]
+fn prepare_run(s: &mut Session, p: &Value) -> Result<Prepared, String> {
+    use rustgis_swat_run::run::Format;
     let format = match ps(p, "format") {
         None => Format::Parquet,
         Some(f) => Format::parse(f).ok_or_else(|| format!("format is parquet, text or both, not {f}"))?,
@@ -727,67 +750,177 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
         Some(t) if t >= 0.0 && t.fract() == 0.0 && t <= 1024.0 => t as usize,
         Some(t) => return Err(format!("threads is a whole number from 0 (all) to 1024, not {t}")),
     };
+    let changes = diff(s, &json!({}))?;
+    let st = state(s)?;
     let root = match ps(p, "folder").map(str::trim).filter(|d| !d.is_empty()) {
         Some(d) => std::path::PathBuf::from(d),
         None => runs_root(st)?,
     };
-    let files = rustgis_swat_txtinout::write(&st.project);
-    let fingerprint = rustgis_swat_run::run::digest(&files);
     let changed = changed_files(st);
-    let (n, folder) = next_run(&root)?;
-    // The project's own folder when nothing changed (the engine only reads it); otherwise the
-    // project as edited, written beside the run's tables.
-    let input = match (&st.dir, changed.is_empty()) {
-        (Some(d), true) => d.clone(),
-        _ => {
-            let input = folder.join("input");
-            for (name, bytes) in &files {
-                // Names stay inside the folder, as they did when read.
-                if name.contains("..") || std::path::Path::new(name).is_absolute() {
-                    continue;
+    let names: Vec<String> = st.project.files.keys().cloned().collect();
+    let edited = st
+        .project
+        .files
+        .iter()
+        .filter(|(name, _)| st.dir.is_none() || changed.contains(name))
+        .map(|(name, file)| (name.clone(), rustgis_swat_txtinout::encode(file)))
+        .collect();
+    Ok(Prepared { dir: st.dir.clone(), names, edited, changed, changes: changes["files"].clone(), root, fixes, threads, format })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Prepared {
+    /// Writes the project as edited to a run folder of its own (unless nothing changed), runs the
+    /// engine on it and writes the run's record (`run.json`) there, also for a run that failed or
+    /// was stopped; gives the record. The run's progress is the engine's days, counted on the
+    /// thread's control ([`rustgis_analysis::control`]), whose Cancel stops the engine; an error
+    /// here is one before the engine ran.
+    pub(crate) fn go(self) -> Result<Value, String> {
+        use rustgis_data::progress::Probe;
+        use rustgis_swat_run::{Event, run::Spec};
+        let control = rustgis_analysis::control::current();
+        let still = rustgis_data::source::remote::current_still();
+        // Asked between the files and every 50 ms while the engine runs (`Probe::cancelled`, so a
+        // test's control counts the looks).
+        let stop =
+            || control.as_ref().is_some_and(|c| Probe::cancelled(c.as_ref())) || rustgis_data::source::remote::check_still(&still).is_err();
+        let (exe, version) = rustgis_swat_run::runner::find()
+            .ok_or("swatplus-rust isn't found: install it (swat.installEngine), point to it (swat.setEngine), or put it on the PATH")?;
+        let (n, folder) = next_run(&self.root)?;
+        // The project's own folder when nothing changed (the engine only reads it); otherwise the
+        // project as edited, written beside the run's tables. Both are fingerprinted as read.
+        let mut fingerprint = rustgis_swat_run::run::Fingerprint::default();
+        let input = match (&self.dir, self.changed.is_empty()) {
+            (Some(d), true) => {
+                for name in &self.names {
+                    let path = d.join(name);
+                    let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                    fingerprint.add(name, &bytes);
+                    if stop() {
+                        break;
+                    }
                 }
-                let path = input.join(name);
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-                }
-                std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+                d.clone()
             }
-            input
-        }
+            _ => {
+                let input = folder.join("input");
+                for name in &self.names {
+                    // Names stay inside the folder, as they did when read.
+                    if name.contains("..") || std::path::Path::new(name).is_absolute() {
+                        continue;
+                    }
+                    let bytes = match (self.edited.get(name), &self.dir) {
+                        (Some(b), _) => std::borrow::Cow::Borrowed(b),
+                        (None, Some(d)) => {
+                            let from = d.join(name);
+                            std::borrow::Cow::Owned(std::fs::read(&from).map_err(|e| format!("{}: {e}", from.display()))?)
+                        }
+                        (None, None) => continue,
+                    };
+                    fingerprint.add(name, &bytes);
+                    let path = input.join(name);
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+                    }
+                    std::fs::write(&path, bytes.as_ref()).map_err(|e| format!("{}: {e}", path.display()))?;
+                    if stop() {
+                        break;
+                    }
+                }
+                input
+            }
+        };
+        let spec =
+            Spec { input: input.clone(), output: folder.join("output"), fixes: self.fixes, threads: self.threads, format: self.format };
+        let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        // The days done, as the engine counts them.
+        let mut counted = 0u64;
+        let mut on_event = |e: &Event| {
+            let Some(c) = &control else { return };
+            match e {
+                Event::Start { days, .. } => {
+                    c.begin(*days);
+                    counted = 0;
+                }
+                Event::Progress { done, .. } if *done > counted => {
+                    c.advance(done - counted);
+                    counted = *done;
+                }
+                _ => {}
+            }
+        };
+        let out = if stop() {
+            rustgis_swat_run::run::Outcome { stopped: true, ..Default::default() }
+        } else {
+            rustgis_swat_run::run::run(&exe, &spec, &mut on_event, &stop)?
+        };
+        let tables: Vec<Value> = out.tables.iter().map(|(f, rows)| json!({"file": f, "rows": rows})).collect();
+        let record = json!({
+            "run": n,
+            "project": self.dir.as_ref().map(|d| d.display().to_string()),
+            "folder": folder.display().to_string(),
+            "input": input.display().to_string(),
+            "output": spec.output.display().to_string(),
+            "started": started,
+            "engine": {"path": exe.display().to_string(), "version": version},
+            "mode": if self.fixes { "fix-swat" } else { "faithful" },
+            "threads": if self.fixes { json!(self.threads) } else { json!(1) },
+            "format": self.format.as_str(),
+            "changed_files": self.changed,
+            "changes": self.changes,
+            "inputs_sha256": if out.stopped { Value::Null } else { json!(fingerprint.finish()) },
+            "ok": out.ok(),
+            "stopped": out.stopped,
+            "days": out.days,
+            "first": out.first,
+            "last": out.last,
+            "seconds": out.seconds,
+            "tables": tables,
+            "notes": out.notes,
+            "error": out.error,
+        });
+        // The record beside the run, so a run folder says how it was made, however it ended.
+        let manifest = folder.join("run.json");
+        std::fs::write(&manifest, serde_json::to_vec_pretty(&record).unwrap_or_default())
+            .map_err(|e| format!("{}: {e}", manifest.display()))?;
+        Ok(record)
+    }
+}
+
+/// `swat.run`'s work, for the desktop app to do on a thread of its own before the command lands
+/// (`reads::IN_BACKGROUND`), with the engine's days as its progress and Cancel stopping it.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn run_ahead(s: &mut Session, p: &Value) -> Result<Option<super::reads::ReadWork>, String> {
+    let prepared = prepare_run(s, p)?;
+    Ok(Some(super::reads::ahead("Run SWAT+ Project", RUN_KEY.into(), move || prepared.go())))
+}
+
+/// Runs the project as edited, or, in the desktop app, takes the run made on a thread of its own
+/// ([`run_ahead`]); records it with the project it ran (`swat.runs`), unless it was stopped. A run
+/// the engine failed or that was stopped is an error, with its record written beside it all the
+/// same.
+#[cfg(not(target_arch = "wasm32"))]
+fn run(s: &mut Session, p: &Value) -> CmdResult {
+    let record = match super::reads::take::<Result<Value, String>>(s, RUN_KEY) {
+        Some(made) => made?,
+        // Here and now (the command line, a script, the assistant): the run's progress and Cancel
+        // are those of the caller's control, if it has one.
+        None => prepare_run(s, p)?.go()?,
     };
-    let spec = Spec { input: input.clone(), output: folder.join("output"), fixes, threads, format };
-    let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let out = rustgis_swat_run::run::run(&exe, &spec, &mut |_| {}, &|| false)?;
-    let tables: Vec<Value> = out.tables.iter().map(|(f, rows)| json!({"file": f, "rows": rows})).collect();
-    let record = json!({
-        "run": n,
-        "folder": folder.display().to_string(),
-        "input": input.display().to_string(),
-        "output": spec.output.display().to_string(),
-        "started": started,
-        "engine": {"path": exe.display().to_string(), "version": version},
-        "mode": if fixes { "fix-swat" } else { "faithful" },
-        "threads": if fixes { json!(threads) } else { json!(1) },
-        "format": format.as_str(),
-        "changed_files": changed,
-        "changes": changes["files"].clone(),
-        "inputs_sha256": fingerprint,
-        "ok": out.ok(),
-        "days": out.days,
-        "first": out.first,
-        "last": out.last,
-        "seconds": out.seconds,
-        "tables": tables,
-        "notes": out.notes,
-        "error": out.error,
-    });
-    // The record beside the run, so a run folder says how it was made.
-    let manifest = folder.join("run.json");
-    std::fs::write(&manifest, serde_json::to_vec_pretty(&record).unwrap_or_default())
-        .map_err(|e| format!("{}: {e}", manifest.display()))?;
-    state_mut(s)?.runs.push(record.clone());
-    match &out.error {
-        Some(e) if !out.ok() => Err(format!("the run failed ({}): {e}", folder.display())),
+    // Kept with the project it ran, not one opened while it ran; a stopped run only in its folder,
+    // as one cancelled in the app never lands here.
+    if record["stopped"] != json!(true)
+        && let Ok(st) = state_mut(s)
+        && record["project"] == json!(st.dir.as_ref().map(|d| d.display().to_string()))
+    {
+        st.runs.push(record.clone());
+    }
+    let folder = record["folder"].as_str().unwrap_or_default().to_string();
+    if record["stopped"] == json!(true) {
+        return Err(format!("the run was stopped ({folder})"));
+    }
+    match record["error"].as_str() {
+        Some(e) if record["ok"] != json!(true) => Err(format!("the run failed ({folder}): {e}")),
         _ => Ok(record),
     }
 }
@@ -817,10 +950,15 @@ fn runs(s: &mut Session, _: &Value) -> CmdResult {
     Ok(json!({"runs": st.runs}))
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
-#[expect(clippy::unwrap_used, reason = "a test module gated on more than `test`, which clippy's allow-unwrap-in-tests does not see")]
+// `cfg(test)` on its own, as clippy's allow-unwrap-in-tests looks for it.
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
+
+    /// The engine chosen (`swat.setEngine`) is the app's, so the tests that choose one take turns.
+    #[cfg(unix)]
+    static ENGINE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A small scenario: file.cio naming three tables, one missing.
     fn scenario() -> tempfile::TempDir {
@@ -948,6 +1086,7 @@ echo '{"event":"done","days":731,"seconds":0.1}'
     #[cfg(unix)]
     #[test]
     fn a_run_runs_the_project_as_edited_and_is_recorded() {
+        let _turn = ENGINE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = scenario();
         let bin = tempfile::tempdir().unwrap();
         let runs_dir = tempfile::tempdir().unwrap();
@@ -985,6 +1124,88 @@ echo '{"event":"done","days":731,"seconds":0.1}'
         assert_eq!(all["runs"].as_array().map(Vec::len), Some(2));
         assert!(s.run("swat.run", &json!({"folder": folder, "format": "xml"})).is_err());
         assert!(s.run("swat.run", &json!({"folder": folder, "threads": -1})).is_err());
+        s.run("swat.setEngine", &json!({})).unwrap();
+    }
+
+    /// A stand-in for swatplus-rust whose run says its days as it goes, then `then` (shell).
+    #[cfg(unix)]
+    fn counting_engine(dir: &std::path::Path, then: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("swatplus-rust");
+        std::fs::write(
+            &p,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 'swatplus-rust 1.2.0'; exit 0; fi
+echo '{{"event":"start","version":"1.2.0","days":4,"first":"2015-01-01","last":"2015-01-04"}}'
+echo '{{"event":"progress","done":2,"days":4,"date":"2015-01-03"}}'
+{then}
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    /// In the desktop app the run is made on a thread of its own (`reads::IN_BACKGROUND`), with
+    /// the engine's days as its progress, and lands as it would have run here.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_made_ahead_counts_the_days_and_lands_as_one_made_here() {
+        let _turn = ENGINE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        use crate::cmd::reads::{read_ahead, read_land};
+        let d = scenario();
+        let bin = tempfile::tempdir().unwrap();
+        let runs_dir = tempfile::tempdir().unwrap();
+        let exe = counting_engine(
+            bin.path(),
+            r#"echo '{"event":"progress","done":4,"days":4,"date":"2015-01-04"}'
+echo '{"event":"done","days":4,"seconds":0.01}'"#,
+        );
+        let mut s = session(&d, false);
+        s.run("swat.setEngine", &json!({"path": exe.display().to_string()})).unwrap();
+        let folder = runs_dir.path().display().to_string();
+        let ahead = read_ahead(&mut s, "swat.run", &json!({"folder": folder})).unwrap();
+        assert_eq!(ahead.name, "Run SWAT+ Project");
+        let control = rustgis_analysis::control::Control::stoppable();
+        let read = ahead.run(&control).unwrap();
+        assert_eq!(control.progress(), Some((4, 4)), "the engine's days are the progress");
+        assert!(s.run("swat.runs", &json!({})).unwrap()["runs"].as_array().unwrap().is_empty(), "recorded as it lands");
+        let r = read_land(&mut s, read).unwrap();
+        assert_eq!((r["run"].clone(), r["ok"].clone(), r["days"].clone()), (json!(1), json!(true), json!(4)));
+        assert_eq!(r["project"], json!(d.path().display().to_string()));
+        let all = s.run("swat.runs", &json!({})).unwrap();
+        assert_eq!(all["runs"], json!([r]));
+        s.run("swat.setEngine", &json!({})).unwrap();
+    }
+
+    /// Cancel while the engine runs stops it: the run's record says so, beside it, and nothing
+    /// lands.
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_a_run_stops_the_engine_and_records_it() {
+        let _turn = ENGINE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        use crate::cmd::reads::read_ahead;
+        let d = scenario();
+        let bin = tempfile::tempdir().unwrap();
+        let runs_dir = tempfile::tempdir().unwrap();
+        // It would run on for a minute: `exec`, so stopping it stops the sleep.
+        let exe = counting_engine(bin.path(), "exec sleep 60");
+        let mut s = session(&d, false);
+        s.run("swat.setEngine", &json!({"path": exe.display().to_string()})).unwrap();
+        let files = s.swat.as_ref().unwrap().project.files.len() as u64;
+        let ahead = read_ahead(&mut s, "swat.run", &json!({"folder": runs_dir.path().display().to_string()})).unwrap();
+        // The looks before the engine starts are one a file and one more; the next is while it runs.
+        let control = rustgis_analysis::control::Control::cancelled_at_look(files + 2);
+        let started = std::time::Instant::now();
+        let err = ahead.run(&control).err().unwrap();
+        assert!(err.contains("Run SWAT+ Project was cancelled"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(30), "the engine was stopped, not waited for");
+        let record: Value = serde_json::from_slice(&std::fs::read(runs_dir.path().join("run-0001/run.json")).unwrap()).unwrap();
+        assert_eq!((record["stopped"].clone(), record["ok"].clone()), (json!(true), json!(false)));
+        assert_eq!(record["inputs_sha256"], Value::Null);
+        assert!(s.run("swat.runs", &json!({})).unwrap()["runs"].as_array().unwrap().is_empty());
         s.run("swat.setEngine", &json!({})).unwrap();
     }
 

@@ -421,6 +421,7 @@ fn called<'a>(command: &str, what: &'a str) -> &'a str {
         (true, "map.reloadTiles") => tl_raw!("Reload Tile Archive"),
         (true, "map.repairTiles") => tl_raw!("Repair Tile Archive"),
         (true, "offline.keepRows") => tl_raw!("Keep Field Package Rows"),
+        (true, "swat.run") => tl_raw!("Run SWAT+ Project"),
         (true, _) => tl_raw!("A background read"),
     }
 }
@@ -550,6 +551,8 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
                 | "layer.sizeBy"
                 | "data.similar"
                 | "topology.validate"
+                // A model run here would hold the window as long as the model runs.
+                | "swat.run"
         ) || rustgis_engine::cmd::edit::table_edit_in_background(asked.command).is_some()
         {
             let why = crate::i18n::fmt("The background worker could not start ({error}). Retry the command.", &[("error", &e.to_string())]);
@@ -1750,6 +1753,43 @@ mod tests {
         assert_eq!(said(&app), 0, "said on landing, not before");
         landed(&mut app, 60);
         assert_eq!(said(&app), 1);
+    }
+
+    /// A SWAT+ run (RustGIS-SwatPlus) is made on a thread of its own and lands as it finishes:
+    /// the window isn't held while the model runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_swat_run_is_made_off_the_window_and_lands() {
+        use std::os::unix::fs::PermissionsExt;
+        let project = tempfile::tempdir().unwrap();
+        let w = |n: &str, t: &str| std::fs::write(project.path().join(n), t).unwrap();
+        w("file.cio", "file.cio: test\nsimulation        time.sim          null\nhydrology         hydrology.hyd     null\n");
+        w("time.sim", "time.sim: test\nday_start  yrc_start  day_end  yrc_end  step\n       0       2015        0     2015     0\n");
+        w("hydrology.hyd", "hydrology.hyd: test\nname     esco\nhyd001   0.95000\n");
+        let bin = tempfile::tempdir().unwrap();
+        let exe = bin.path().join("swatplus-rust");
+        std::fs::write(
+            &exe,
+            r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 'swatplus-rust 1.2.0'; exit 0; fi
+echo '{"event":"start","version":"1.2.0","days":365,"first":"2015-01-01","last":"2015-12-31"}'
+echo '{"event":"done","days":365,"seconds":0.01}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runs = tempfile::tempdir().unwrap();
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.reads_off_frame = true;
+        app.run("swat.open", json!({"path": project.path().display().to_string()})).unwrap();
+        app.run("swat.setEngine", json!({"path": exe.display().to_string()})).unwrap();
+        let r = app.run_by_user("swat.run", json!({"folder": runs.path().display().to_string()})).unwrap();
+        assert_eq!(r["started"], "Run SWAT+ Project");
+        landed(&mut app, 60);
+        let made = app.run("swat.runs", json!({})).unwrap();
+        assert_eq!(made["runs"][0]["days"], json!(365));
+        assert!(runs.path().join("run-0001/run.json").is_file());
+        app.run("swat.setEngine", json!({})).unwrap();
     }
 
     /// Task steps cannot bypass the worker through direct or scripted table writes.

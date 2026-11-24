@@ -3306,6 +3306,12 @@ impl RustGisApp {
             if id == "style.importQgis" {
                 return readjob::run(self, "style.importQgis", params);
             }
+            // A SWAT+ run lasts as long as the model (RustGIS-SwatPlus): on a thread of its own,
+            // the engine's days as its progress, and Cancel stopping the engine.
+            if id == "swat.run" {
+                let params = if params.is_null() { json!({}) } else { params };
+                return readjob::run(self, "swat.run", params);
+            }
             // Publishing hashes, reads and writes the whole file: on a thread of its own, with
             // progress and Cancel, as an export is.
             if id == "source.publish" {

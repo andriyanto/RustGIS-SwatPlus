@@ -13,17 +13,35 @@ use crate::Event;
 /// length and its bytes, in the order given (sorted by name for the same answer from the same
 /// files). Two runs with the same fingerprint and the same engine version read the same inputs.
 pub fn digest(files: &[(String, Vec<u8>)]) -> String {
-    use sha2::{Digest, Sha256};
     let mut sorted: Vec<&(String, Vec<u8>)> = files.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut h = Sha256::new();
+    let mut f = Fingerprint::default();
     for (name, bytes) in sorted {
-        h.update(name.as_bytes());
-        h.update([0]);
-        h.update((bytes.len() as u64).to_le_bytes());
-        h.update(bytes);
+        f.add(name, bytes);
     }
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    f.finish()
+}
+
+/// [`digest`] a file at a time, so a large project's files needn't all be held at once: add them
+/// in name order (a `BTreeMap`'s) for the same answer.
+#[derive(Default)]
+pub struct Fingerprint(sha2::Sha256);
+
+impl Fingerprint {
+    /// Adds a file.
+    pub fn add(&mut self, name: &str, bytes: &[u8]) {
+        use sha2::Digest;
+        self.0.update(name.as_bytes());
+        self.0.update([0]);
+        self.0.update((bytes.len() as u64).to_le_bytes());
+        self.0.update(bytes);
+    }
+
+    /// The fingerprint of the files added, in hexadecimal.
+    pub fn finish(self) -> String {
+        use sha2::Digest;
+        self.0.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
 }
 
 /// What the tables are written as.
@@ -212,7 +230,9 @@ pub fn run(exe: &Path, spec: &Spec, on_event: &mut dyn FnMut(&Event), stop: &dyn
     Ok(out)
 }
 
-#[cfg(all(test, unix))]
+// `cfg(test)` on its own, as clippy's allow-unwrap-in-tests looks for it.
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
 
@@ -245,6 +265,11 @@ mod tests {
         // Moving a byte from one file to the next changes it.
         let c = vec![("a.txt".to_string(), b"12".to_vec()), ("b.txt".to_string(), Vec::new())];
         assert_ne!(digest(&a), digest(&c));
+        // A file at a time, in name order, gives the same answer.
+        let mut f = Fingerprint::default();
+        f.add("a.txt", b"1");
+        f.add("b.txt", b"2");
+        assert_eq!(f.finish(), digest(&a));
     }
 
     #[test]
