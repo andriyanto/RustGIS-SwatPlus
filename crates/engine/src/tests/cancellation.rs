@@ -399,7 +399,10 @@ pub(super) fn long_commands(boundaries: bool) {
     read(&s, "map.repairTiles", &json!({"index": 0, "path": out("moved.pmtiles")}));
 
     // Reads made ahead that aren't run here, and why.
-    let exempt: [(&str, &str); 0] = [];
+    let exempt: [(&str, &str); 1] = [(
+        "swat.run",
+        "it runs the swatplus-rust program, which the fixtures don't have; cmd::swat's tests run it with a stand-in and cancel it while it runs",
+    )];
     let covered = covered.into_inner();
     for (command, why) in exempt {
         assert!(!covered.contains(command), "{command} is run here: take it out of the exemptions ({why})");

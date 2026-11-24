@@ -2423,16 +2423,21 @@ map project and isn't saved with it.
 | `swat.diff`, `swat.revert` | What changed since the project was opened; undoing all of it, a file's or a column's. |
 | `swat.save` | Writes the changed files over the folder it came from, or the whole project to another folder (`path`). Every other byte is as it was read. |
 
-| `swat.run` | Runs the project, as edited, with the [swatplus-rust](https://github.com/andriyanto/swatplus-rust) engine. Each run gets its own folder (`run-0001`, …) in RustGIS's data folder, or under `folder`: the edited files in `input` (an unchanged project is run from its own folder), the engine's tables in `output` (`format`: `both`, the default, `text` or `parquet`) and `run.json`, which records the engine and its version, the mode, what was changed and a SHA-256 of the inputs. `fixSwat` corrects SWAT+'s known bugs (results then differ from SWAT+); `threads` sets the engine's threads. |
+| `swat.run` | Runs the project, as edited, with the [swatplus-rust](https://github.com/andriyanto/swatplus-rust) engine. Each run gets its own folder (`run-0001`, …) in RustGIS's data folder, or under `folder`: the edited files in `input` (an unchanged project is run from its own folder), the engine's tables in `output` (`format`: `parquet`, the default, `text` or `both`) and `run.json`, which records the project, the engine and its version, the mode, what was changed and a SHA-256 of the inputs. `fixSwat` corrects SWAT+'s known bugs (results then differ from SWAT+); `threads` sets the engine's threads. |
 | `swat.runs` | The runs made since the project was opened, as `run.json` records them. |
 | `swat.engine`, `swat.setEngine`, `swat.installEngine` | Which engine program is used and its version; using another one (`path`, or none to look again); downloading the pinned release for this platform from GitHub, checked against its published SHA-256. |
 
 The engine is LGPL-2.1 (as SWAT+ is) and RustGIS Apache-2.0, so RustGIS doesn't link it: it runs
 the `swatplus-rust` program and reads its progress as JSON lines. RustGIS looks for the program
 where the user chose, then in the `SWATPLUS_RUST` environment variable, the install folder of
-`swat.installEngine`, beside the app and on the `PATH`, and uses versions 1.1 up to 2.0. Runs are
-on the desktop and the command line for now: a run waits for the engine to finish, and the web
-app doesn't run models yet. Reading the output tables is next.
+`swat.installEngine`, beside the app and on the `PATH`, and uses versions 1.1 up to 2.0.
+
+In the desktop app a run goes on a thread of its own, as a large read does: the status bar shows
+it with the days the engine has simulated and Cancel, which stops the engine. A stopped run keeps its
+folder and its `run.json`, which says so (`stopped`), and isn't added to `swat.runs`; a failed one
+is, with the engine's `error`. The command line, scripts and the AI Assistant wait for the run; agents connected over
+MCP get its answer when it lands, with the app free meanwhile. The web app doesn't run models yet.
+Reading the output tables is next.
 
 ## Rain grids
 

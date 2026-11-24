@@ -170,6 +170,7 @@ impl ArchiveBatch {
                                 | "edit.previewShapeConversion"
                                 | "raster.imageGrid"
                                 | "layer.sizeBy"
+                                | "swat.run"
                         )
                     )
                 {
