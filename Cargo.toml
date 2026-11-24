@@ -26,6 +26,7 @@ rustgis-tiles = { path = "crates/tiles" }
 rustgis-assistant = { path = "crates/assistant" }
 rustgis-swat-model = { path = "crates/swat-model" }
 rustgis-swat-txtinout = { path = "crates/swat-txtinout" }
+rustgis-swat-run = { path = "crates/swat-run" }
 rustgis-keychain = { path = "crates/keychain" }
 
 # foundation

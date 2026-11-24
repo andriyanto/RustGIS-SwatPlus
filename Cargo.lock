@@ -5296,6 +5296,7 @@ dependencies = [
  "rustgis-plugins",
  "rustgis-render",
  "rustgis-swat-model",
+ "rustgis-swat-run",
  "rustgis-swat-txtinout",
  "rustls",
  "schemars",
@@ -5447,6 +5448,20 @@ dependencies = [
 [[package]]
 name = "rustgis-swat-model"
 version = "0.8.0"
+
+[[package]]
+name = "rustgis-swat-run"
+version = "0.8.0"
+dependencies = [
+ "flate2",
+ "log",
+ "rustgis-data",
+ "serde_json",
+ "sha2 0.11.1",
+ "tar",
+ "ureq",
+ "zip",
+]
 
 [[package]]
 name = "rustgis-swat-txtinout"

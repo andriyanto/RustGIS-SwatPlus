@@ -201,6 +201,7 @@ Layered crates, each depending only on the ones below it:
 | L3 | `rustgis-render` | tiny-skia renderer, label placement, PNG export, fonts |
 | L3 | `rustgis-plugins` | sandboxed WebAssembly plugins and the plugin registry |
 | L3 | `rustgis-geolibre` | the GeoLibre tool suite as geoprocessing tools |
+| L3 | `rustgis-swat-run` | runs SWAT+ projects with the swatplus-rust program (never linked: LGPL-2.1) |
 | L4 | `rustgis-engine` | session, undo, command registry, sample project |
 | L5 | `rustgis-assistant` | the AI Assistant: a chat agent that acts through commands |
 | L6 | `rustgis-ui-egui` | the ribbon front end (swappable) |

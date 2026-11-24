@@ -44,6 +44,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("keychain", 2),
     ("render", 3),
     ("geolibre", 3),
+    ("swat-run", 3),
     ("plugins", 3),
     ("engine", 4),
     ("assistant", 5),
