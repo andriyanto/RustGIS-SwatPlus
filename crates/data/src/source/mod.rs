@@ -7,6 +7,7 @@
 //!
 //! Sources are hostile input: malformed rows are skipped and counted, never a panic.
 
+pub mod arcgis;
 pub mod credentials;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod duckdb;
@@ -16,6 +17,7 @@ pub(crate) mod external;
 pub mod fgb;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gdal;
+pub mod geodatabase;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod geojson;
 #[cfg(not(target_arch = "wasm32"))]
@@ -33,6 +35,7 @@ pub mod pgconn;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod postgis;
 pub mod remote;
+pub mod sdefile;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod shp;
 #[cfg(not(target_arch = "wasm32"))]
@@ -105,8 +108,17 @@ impl Family {
 /// File types read through a provider.
 pub const EXTENSIONS: &[&str] = &["gpkg", "parquet", "geoparquet", "fgb", "las", "laz"];
 
-/// The most features one read returns, whatever the request asks for.
+/// The most features one read returns, whatever the request asks for. A whole read of a source
+/// read a chunk at a time is bounded by [`MAX_READ_BYTES`] instead.
 pub const MAX_LIMIT: usize = if cfg!(target_arch = "wasm32") { 500_000 } else { 2_000_000 };
+
+/// The most memory a whole read may hold of a source that can be read a chunk at a time
+/// ([`FeatureSource::visits_chunks`]): its features' storage, as [`chunk_memory::features_bytes`]
+/// counts it.
+pub const MAX_READ_BYTES: u64 = if cfg!(target_arch = "wasm32") { 1 << 30 } else { 4 << 30 };
+
+/// The chunk size a whole read asks for; each chunk is moved into the dataset as it comes.
+const READ_CHUNK_BYTES: usize = 8 << 20;
 
 /// Whether a file name is read through a provider.
 pub fn is_source_name(name: &str) -> bool {
@@ -155,35 +167,76 @@ pub struct SourceInfo {
     pub extent: Extent,
     /// Number of features, when known without reading them.
     pub count: Option<u64>,
-    /// The source's coordinate system, as `EPSG:…`.
+    /// The source's coordinate system, as `EPSG:…`, or as its definition ([`Crs::definition_text`]).
     pub crs: String,
     /// Whether extent queries use a spatial index rather than a scan.
     pub indexed: bool,
     /// Things worth telling whoever adds the source (an unknown coordinate system read as
     /// longitude/latitude, tables left out).
-    pub notes: Vec<String>,
+    pub notes: crate::loss::Notes,
+    /// The source has Z or M values, which reading drops (see [`Dataset::zm_dropped`]).
+    pub zm_dropped: bool,
 }
 
 impl SourceInfo {
-    /// The source's coordinate system, when it isn't longitude/latitude and is known by its EPSG
-    /// code.
+    /// Marks the source as having Z or M values, which reading drops, and notes it once: in
+    /// `features` features when known (every one, when the source declares them). A count of 0 (an
+    /// empty source) drops nothing and says nothing.
+    pub(crate) fn drop_zm(&mut self, features: Option<u64>) {
+        if !self.zm_dropped && features != Some(0) {
+            self.zm_dropped = true;
+            self.notes.push(crate::zm_note(features));
+        }
+    }
+
+    /// Notes what happened to some columns in one note, counting them and naming the first 12
+    /// with their kind ("price (decimal)"): `what` says it for one column, then for several.
+    /// Nothing when there are none.
+    pub(crate) fn note_columns(&mut self, cols: &[(String, String)], what: [&str; 2]) {
+        const NAMED: usize = 12;
+        let [one, several] = what;
+        let n = cols.len();
+        let what = match n {
+            0 => return,
+            1 => one,
+            _ => several,
+        };
+        let named: Vec<String> = cols.iter().take(NAMED).map(|(name, kind)| format!("{name} ({kind})")).collect();
+        let more = if n > NAMED { format!(" and {} more", n - NAMED) } else { String::new() };
+        self.notes.push(format!("{n} column{} {what}: {}{more}", if n == 1 { "" } else { "s" }, named.join(", ")));
+    }
+
+    /// The source's coordinate system, when it isn't longitude/latitude: one known by its EPSG
+    /// code or a custom one without. `None` also when `crs` isn't one RustGIS can parse.
     pub fn coordinate_system(&self) -> Option<Crs> {
         Crs::parse(&self.crs).ok().filter(|c| *c != Crs::LonLat)
     }
 }
 
 /// A read: the features intersecting `extent` (longitude/latitude; `None` = all), at most `limit`.
+/// A zero-limit count may be refused when matching would require a full geometry scan.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Request {
     pub extent: Option<Extent>,
     pub limit: usize,
+    /// The same box in a projected system, when the asker has it there exactly (a map in that
+    /// system gives its view in map units), with `extent` its longitude/latitude bounds. A source
+    /// whose own system ([`FeatureSource::coord_crs`]) it is tests each feature's own box against
+    /// it, converting nothing; any other source reads `extent`, as without it.
+    pub own: Option<(Crs, Extent)>,
 }
 
 impl Request {
     /// Every feature, up to [`MAX_LIMIT`].
     pub fn all() -> Self {
-        Request { extent: None, limit: MAX_LIMIT }
+        Request { extent: None, limit: MAX_LIMIT, own: None }
     }
+}
+
+/// Refuses an unknown count rather than reporting an unbounded view as empty. A zero-limit
+/// request does not start the full geometry scan needed to determine its matches.
+pub(crate) fn unbounded_count() -> DataError {
+    DataError::Format("A zero-limit read cannot count a view that cannot be bounded in the source coordinate system; request a nonzero limit to count matching features".into())
 }
 
 /// The answer to a [`Request`].
@@ -198,21 +251,197 @@ pub struct Batch {
     pub complete: bool,
     /// Rows that couldn't be read.
     pub skipped: usize,
+    /// Values in date fields that weren't dates and are read as null, counted for each field by
+    /// its position; empty when there were none. Said by [`unread_dates_note`].
+    pub unread_dates: Vec<usize>,
+    /// Date-times of date fields that had digits past the microsecond, rounded to it, counted for
+    /// each field by its position. Said by [`rounded_dates_note`].
+    pub rounded_dates: Vec<usize>,
+    /// Text values `<Null>` read as null, counted for each field by its position. Said by
+    /// [`null_text_note`].
+    pub null_text: Vec<usize>,
+    /// What else the read lost or assumed, one note per kind with its count (values that don't fit
+    /// their field, rings without area): said as they are.
+    pub notes: crate::loss::Notes,
+    /// Text values of a Shapefile that aren't valid in the encoding they were read in
+    /// ([`FeatureSource::text_encoding`]), so hold U+FFFD in place of those bytes, counted for each
+    /// field by its position. Said by [`not_utf8_note`].
+    pub not_utf8: Vec<usize>,
+}
+
+/// Counts one more value of the field at `k` that wasn't a date, or one date-time rounded to the
+/// microsecond ([`Batch::unread_dates`], [`Batch::rounded_dates`]).
+pub(crate) fn unread_date(counts: &mut Vec<usize>, k: usize) {
+    unread_dates_by(counts, k, 1);
+}
+
+/// Counts one more text value `<Null>` read as null in the field at `k` ([`Batch::null_text`]).
+pub(crate) fn null_text_at(counts: &mut Vec<usize>, k: usize) {
+    unread_dates_by(counts, k, 1);
+}
+
+/// Counts one more text value that isn't valid in its encoding in the field at `k` ([`Batch::not_utf8`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn not_utf8_at(counts: &mut Vec<usize>, k: usize) {
+    unread_dates_by(counts, k, 1);
+}
+
+/// [`unread_date`], `n` more times.
+pub(crate) fn unread_dates_by(counts: &mut Vec<usize>, k: usize, n: usize) {
+    if n == 0 {
+        return;
+    }
+    if counts.len() <= k {
+        counts.resize(k + 1, 0);
+    }
+    if let Some(c) = counts.get_mut(k) {
+        *c = c.saturating_add(n);
+    }
+}
+
+/// The value of the date field at `k` from a database server's ISO 8601 text (PostgreSQL, MySQL,
+/// SQL Server): null for none. Text that isn't a date of the field's type RustGIS holds
+/// (`infinity`, a year BC or past 9999, MySQL's `0000-00-00`) is null too, counted in `unread`
+/// ([`Batch::unread_dates`]); digits past the microsecond make it one that isn't a date.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn server_date(text: Option<&str>, ty: crate::FieldType, unread: &mut Vec<usize>, k: usize) -> crate::Value {
+    let Some(text) = text else { return crate::Value::Null };
+    gpkg_blob::temporal(Some(text), ty, unread, None, k)
+}
+
+/// Adds the counts of a later read to `counts` ([`Batch::unread_dates`]).
+pub fn add_unread_dates(counts: &mut Vec<usize>, more: &[usize]) {
+    if counts.len() < more.len() {
+        counts.resize(more.len(), 0);
+    }
+    for (c, n) in counts.iter_mut().zip(more) {
+        *c = c.saturating_add(*n);
+    }
+}
+
+/// What a read says of values in date fields that weren't dates ([`Batch::unread_dates`]), naming
+/// the first five fields. `None` when there were none.
+pub fn unread_dates_note(fields: &[crate::Field], counts: &[usize]) -> Option<String> {
+    let total: usize = counts.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let what = if total == 1 { "1 value isn't a date and was".to_string() } else { format!("{total} values aren't dates and were") };
+    Some(format!("{what} read as empty, in {}", crate::io::named_fields(fields, counts)))
+}
+
+/// What a read says of text values `<Null>` it read as null ([`crate::Value::is_null_marker`],
+/// [`Batch::null_text`]), naming the first five fields. `None` when there were none. It names the
+/// marker as `Null`, without its brackets: notices are redacted, which takes `<Null>` for a tag.
+pub fn null_text_note(fields: &[crate::Field], counts: &[usize]) -> Option<String> {
+    let total: usize = counts.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let what = if total == 1 { "1 value written as Null was".to_string() } else { format!("{total} values written as Null were") };
+    Some(format!("{what} read as empty, in {}", crate::io::named_fields(fields, counts)))
+}
+
+/// What a read says of a `.dbf`'s text values that aren't valid in the `encoding` they were read in
+/// ([`Batch::not_utf8`], [`FeatureSource::text_encoding`]): how many, in which fields (the first five
+/// named), and why they were read in it. `None` when there were none.
+pub fn not_utf8_note(fields: &[crate::Field], counts: &[usize], encoding: &str) -> Option<String> {
+    let total: usize = counts.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let what = if total == 1 {
+        format!("1 text value isn't valid {encoding} and was")
+    } else {
+        format!("{total} text values aren't valid {encoding} and were")
+    };
+    Some(format!(
+        "{what} read with U+FFFD in place of the bytes that can't be read, in {}; {}",
+        crate::io::named_fields(fields, counts),
+        crate::dbf::cause(encoding)
+    ))
+}
+
+/// What a read says of date-times it rounded to the microsecond ([`Batch::rounded_dates`]), naming
+/// the first five fields. `None` when there were none.
+pub fn rounded_dates_note(fields: &[crate::Field], counts: &[usize]) -> Option<String> {
+    let total: usize = counts.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let what = if total == 1 { "1 date-time was".to_string() } else { format!("{total} date-times were") };
+    Some(format!("{what} rounded to the microsecond, as more digits than that aren't kept, in {}", crate::io::named_fields(fields, counts)))
 }
 
 /// A vector data source read in place.
 pub trait FeatureSource: Send + Sync {
-    /// Whether complete, ordered traversal is available without an interaction row limit.
+    /// Whether the map draws the source by complete traversal ([`FeatureSource::visit_chunks`])
+    /// on every render rather than from a sampled view window. Implies
+    /// [`FeatureSource::visits_chunks`].
     fn streams_chunks(&self) -> bool {
         false
     }
-    /// Visits every matching feature in source painter order. Release each chunk before the
-    /// next callback. `bytes` targets owned feature storage; an indivisible larger row is emitted alone.
-    /// Callback errors stop traversal. Success returns an empty, complete summary batch.
+    /// Whether [`FeatureSource::visit_chunks`] is available, for a pass over the whole source
+    /// (an export) that holds one chunk at a time. Unlike [`FeatureSource::streams_chunks`], it
+    /// leaves drawing alone.
+    fn visits_chunks(&self) -> bool {
+        self.streams_chunks()
+    }
+    /// Whether a read by area ([`FeatureSource::visit_chunks`] with an extent) gives every
+    /// feature of a whole read whose shape meets the area: false where some can't be placed by
+    /// area (a Shapefile's records without a usable box, left out of reads by area), and for a
+    /// source that doesn't say.
+    fn finds_all_by_area(&self) -> bool {
+        false
+    }
+    /// Whether the source is as it was when opened, judged cheaply (its files' sizes and
+    /// modification times), for what was read from it and kept beside it: `Ok(false)` when it
+    /// changed or the source can't say, and the error a read would give when it can't be read.
+    fn same_as_opened(&self) -> Result<bool> {
+        Ok(false)
+    }
+    /// Whether a complete bounded traversal for a geographic extent is available. This also
+    /// covers readers whose view and whole-export paths still use their existing sample or
+    /// whole-read contracts.
+    fn visits_extent_chunks(&self) -> bool {
+        self.visits_chunks()
+    }
+    /// Visits every matching feature in source painter order: the features and ids a complete
+    /// [`FeatureSource::read`] of the same extent gives, in the same order and with the same
+    /// skipped count when there is no extent (an extent read through an index may order and skip
+    /// differently). Release each chunk before the next callback. `bytes` targets owned feature
+    /// storage; an indivisible larger row is emitted alone, and a provider may hold its own unit
+    /// of the file (a GeoParquet row group) or an index's list of matches (FlatGeobuf, for an
+    /// extent) besides. Callback errors stop traversal. Success returns an empty, complete
+    /// summary batch. Its `matched` is the provider's count of matches: the features visited for
+    /// GeoPackage, FlatGeobuf and GeoParquet, the records the index matched for Shapefile (which
+    /// may include rows skipped or deleted).
     fn visit_chunks(&self, _extent: Option<Extent>, _bytes: usize, _visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
-        Err(DataError::Format("this provider does not support chunk traversal".into()))
+        Err(DataError::Unsupported("a source that can't be read a chunk at a time".into()))
     }
     fn info(&self) -> &SourceInfo;
+    /// The coordinate system of the features it gives: a file read in place gives them as the file
+    /// holds them, in its own system (Shapefile, GeoPackage, FlatGeobuf, GeoParquet, GeoJSON); a
+    /// source that converts them (a database or service that answers in longitude/latitude) says
+    /// longitude/latitude, the default. One that wraps another says the other's. A request's
+    /// extent is in longitude/latitude whatever this is.
+    fn coord_crs(&self) -> crate::raster::Crs {
+        crate::raster::Crs::LonLat
+    }
+
+    /// Whether a read given its box in the source's own system ([`Request::own`]) tests its
+    /// features against that box (a file read in place, PostGIS), so a map in that system keeps
+    /// its window in map units for it. A source that reads by the longitude/latitude extent
+    /// whatever it is given (another database, a service, a converted copy) says no: its window is
+    /// kept in longitude/latitude, as it reads.
+    fn reads_own_box(&self) -> bool {
+        false
+    }
+    /// The encoding the source's text values are read in, for the notice of those that aren't
+    /// valid in it ([`not_utf8_note`]).
+    fn text_encoding(&self) -> &'static str {
+        "UTF-8"
+    }
     /// Whether features were left out of every read because the coordinate system the source
     /// declares can't place them, so that defining its projection again can't bring them back.
     fn lost_to_crs(&self) -> bool {
@@ -332,11 +561,11 @@ pub fn open_shared(file_name: &str, bytes: std::sync::Arc<Vec<u8>>, layer: Optio
     }
 }
 
-/// Whether a web address names a file read in place by range: a FlatGeobuf or a GeoParquet. An
-/// address read through a saved S3 connection ([`crate::s3_address`]) is judged by the address it
-/// wraps.
+/// Whether a web address names a file read in place by range: a FlatGeobuf or a GeoParquet.
+/// Saved S3 connection and runtime service-login addresses are judged by the URL they wrap;
+/// the original address remains the range reader's identity.
 pub fn is_remote_name(url: &str) -> bool {
-    let lower = crate::s3_address::inner(url).to_ascii_lowercase();
+    let lower = crate::login_address::inner(crate::s3_address::inner(url)).to_ascii_lowercase();
     let path = lower.split(['?', '#']).next().unwrap_or(&lower);
     // `s3://` too: the app's fetchers check it and read it from its bucket's web address (signed
     // only for a connection that serves the bucket, see rustgis_tiles::s3).
@@ -346,6 +575,7 @@ pub fn is_remote_name(url: &str) -> bool {
 
 /// A layer name from a web address: its file name without the extension.
 fn url_name(url: &str) -> String {
+    let url = crate::login_address::inner(crate::s3_address::inner(url));
     let path = url.split(['?', '#']).next().unwrap_or(url);
     let file = path.rsplit('/').next().unwrap_or(path);
     let stem = file.rsplit_once('.').map(|(a, _)| a).unwrap_or(file);
@@ -361,8 +591,8 @@ pub fn open_url_now(url: &str) -> Result<Box<dyn FeatureSource>> {
 /// [`open_url_now`] from `file`: a drive's reads note what they miss on the file it fetches for,
 /// even after other files pushed it out of those kept.
 fn open_file_now(file: std::sync::Arc<remote::Remote>) -> Result<Box<dyn FeatureSource>> {
-    let url = file.url().to_string();
-    let name = url_name(&url);
+    let url = crate::login_address::inner(crate::s3_address::inner(file.url()));
+    let name = url_name(url);
     let lower = url.to_ascii_lowercase();
     let path = lower.split(['?', '#']).next().unwrap_or(&lower);
     if path.ends_with(".fgb") {
@@ -370,7 +600,10 @@ fn open_file_now(file: std::sync::Arc<remote::Remote>) -> Result<Box<dyn Feature
     } else if path.ends_with(".parquet") || path.ends_with(".geoparquet") {
         Ok(Box::new(parquet::ParquetSource::open_remote(file, &name)?))
     } else {
-        Err(DataError::Unsupported(format!("{url}: only FlatGeobuf and GeoParquet are read in place by address")))
+        Err(DataError::Unsupported(crate::diagnostics::message_with_address(
+            url,
+            "only FlatGeobuf and GeoParquet are read in place by address",
+        )))
     }
 }
 
@@ -462,8 +695,20 @@ impl FeatureSource for Fetching {
         self.0.info()
     }
 
+    fn coord_crs(&self) -> crate::raster::Crs {
+        self.0.coord_crs()
+    }
+
+    fn reads_own_box(&self) -> bool {
+        self.0.reads_own_box()
+    }
+
     fn lost_to_crs(&self) -> bool {
         self.0.lost_to_crs()
+    }
+
+    fn text_encoding(&self) -> &'static str {
+        self.0.text_encoding()
     }
 
     fn skipped_at_open(&self) -> usize {
@@ -484,8 +729,53 @@ pub fn layers(path: &Path) -> Result<Vec<String>> {
     }
 }
 
-/// Reads a whole source into a dataset, refusing sources over [`MAX_LIMIT`] and incomplete reads.
+/// Reads a whole source into a dataset: a chunk at a time up to [`MAX_READ_BYTES`] where the
+/// source can, otherwise in one read up to [`MAX_LIMIT`]. A larger source, or an incomplete read,
+/// is refused.
 pub fn materialize(src: &dyn FeatureSource) -> Result<(Dataset, ReadReport)> {
+    materialize_within(src, MAX_READ_BYTES)
+}
+
+/// [`materialize`], with `budget` bytes for a source read a chunk at a time.
+fn materialize_within(src: &dyn FeatureSource, budget: u64) -> Result<(Dataset, ReadReport)> {
+    let info = src.info();
+    let batch = if src.visits_chunks() { read_chunks(src, budget)? } else { read_at_once(src)? };
+    let Batch { features, skipped, unread_dates, rounded_dates, null_text, notes, not_utf8, .. } = batch;
+    let mut ds = Dataset::new(info.name.clone(), info.geometry_type, info.fields.clone());
+    ds.crs = info.coordinate_system();
+    // A streamed Shapefile skips unconvertible shapes rather than retaining empty geometry.
+    // Once materialized, it must still direct CRS repairs back to the original file.
+    ds.crs_incomplete = (info.format == "Shapefile" && skipped > 0) || src.lost_to_crs();
+    ds.zm_dropped = info.zm_dropped;
+    ds.features = features.into();
+    // Held as the source gives its features, in its own system.
+    ds.held_in = src.coord_crs();
+    let rounded = rounded_dates_note(&info.fields, &rounded_dates);
+    let unread_dates = unread_dates_note(&info.fields, &unread_dates);
+    let mut report = ReadReport {
+        skipped: skipped + src.skipped_at_open(),
+        messages: info.notes.clone().prefixed(&info.name),
+        synced: None,
+        unread_dates: unread_dates.clone(),
+        rounded_dates: rounded.clone(),
+        extrusion: None,
+    };
+    let null_text = null_text_note(&info.fields, &null_text);
+    let not_utf8 = not_utf8_note(&info.fields, &not_utf8, src.text_encoding());
+    report.messages.extend(unread_dates.into_iter().chain(rounded).chain(null_text).map(|n| format!("{}: {n}", info.name)));
+    report.messages.extend(notes.prefixed(&info.name));
+    report.messages.extend(not_utf8.into_iter().map(|n| format!("{}: {n}", info.name)));
+    if ds.geometry_type == GeometryType::None
+        && let Some(g) = ds.features.iter().find_map(|f| f.geometry.as_ref())
+    {
+        ds.geometry_type = g.kind();
+    }
+    Ok((ds, report))
+}
+
+/// Every feature of a source in one read, with the rows it skipped and the values it counted
+/// ([`Batch::unread_dates`]), refusing a source over [`MAX_LIMIT`] and an incomplete read.
+fn read_at_once(src: &dyn FeatureSource) -> Result<Batch> {
     let info = src.info();
     let too_many = |n| DataError::Format(format!("{}: the layer has {n} features, more than the {MAX_LIMIT} read at once", info.name));
     // Refuse before reading or allocating a sample when the source already knows its size.
@@ -508,27 +798,52 @@ pub fn materialize(src: &dyn FeatureSource) -> Result<(Dataset, ReadReport)> {
     if info.count.is_none() && batch.features.len() >= MAX_LIMIT {
         return Err(DataError::Format(format!("{}: the layer has more features than the {MAX_LIMIT} read at once", info.name)));
     }
-    let mut ds = Dataset::new(info.name.clone(), info.geometry_type, info.fields.clone());
-    ds.crs = info.coordinate_system();
-    // A streamed Shapefile skips unconvertible shapes rather than retaining empty geometry.
-    // Once materialized, it must still direct CRS repairs back to the original file.
-    ds.crs_incomplete = (info.format == "Shapefile" && batch.skipped > 0) || src.lost_to_crs();
-    ds.features = batch.features.into();
-    let report = ReadReport {
-        skipped: batch.skipped + src.skipped_at_open(),
-        messages: info.notes.iter().map(|n| format!("{}: {n}", info.name)).collect(),
+    Ok(batch)
+}
+
+/// Every feature of a source that can be read a chunk at a time, with the rows it skipped and the
+/// values it counted, refusing the source once its features would hold more than `budget` bytes.
+fn read_chunks(src: &dyn FeatureSource, budget: u64) -> Result<Batch> {
+    let info = src.info();
+    let row_bytes = std::mem::size_of::<Feature>() as u64;
+    let too_large = || {
+        DataError::Format(format!(
+            "{}: the layer needs more than the {} MiB a whole read may hold: clip or filter it first",
+            info.name,
+            budget >> 20
+        ))
     };
-    if ds.geometry_type == GeometryType::None
-        && let Some(g) = ds.features.iter().find_map(|f| f.geometry.as_ref())
-    {
-        ds.geometry_type = g.kind();
+    let no_memory = || DataError::Format(format!("{}: not enough memory to read the whole layer", info.name));
+    // A count that alone is too many rows is refused before reading. It isn't trusted to size the
+    // rows: a file's header can claim any count.
+    if info.count.is_some_and(|n| n.saturating_mul(row_bytes) > budget) {
+        return Err(too_large());
     }
-    Ok((ds, report))
+    let mut features: Vec<Feature> = Vec::new();
+    let mut held = 0u64;
+    let batch = src.visit_chunks(None, READ_CHUNK_BYTES, &mut |chunk| {
+        held = chunk.iter().fold(held, |n, f| n.saturating_add(chunk_memory::feature_bytes(f) as u64));
+        let needed = features.len().saturating_add(chunk.len());
+        if needed > features.capacity() {
+            // Grow by doubling, but never past what the budget leaves for the rows.
+            let room = usize::try_from(budget.saturating_sub(held) / row_bytes).unwrap_or(usize::MAX);
+            let grown = needed.max(features.capacity().saturating_mul(2)).min(room);
+            if grown < needed {
+                return Err(too_large());
+            }
+            features.try_reserve_exact(grown - features.len()).map_err(|_| no_memory())?;
+        } else if held.saturating_add((features.capacity() as u64).saturating_mul(row_bytes)) > budget {
+            return Err(too_large());
+        }
+        features.extend(chunk);
+        Ok(())
+    })?;
+    Ok(Batch { features, ..batch })
 }
 
 /// The geometry type of a source that doesn't declare one, from its first feature.
 pub(crate) fn peek_kind(src: &dyn FeatureSource) -> GeometryType {
-    src.read(&Request { extent: None, limit: 1 })
+    src.read(&Request { extent: None, limit: 1, own: None })
         .ok()
         .and_then(|b| b.features.into_iter().find_map(|f| f.geometry))
         .map(|g| g.kind())
@@ -537,6 +852,17 @@ pub(crate) fn peek_kind(src: &dyn FeatureSource) -> GeometryType {
 
 fn ext(path: &Path) -> String {
     path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase()
+}
+
+/// The EPSG code a database layer's `crs` gives its geometry when the geometry doesn't say one,
+/// with a note of a shift its WKT gives that the code doesn't apply (#1678). Text without a code is
+/// refused.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn given_epsg(given: &str) -> Result<(u16, Option<String>)> {
+    match Crs::parse(given) {
+        Ok(c) if c.epsg() > 0 => Ok((c.epsg(), crate::raster::wkt::unapplied_note(given, c).map(|note| format!("crs: {note}")))),
+        _ => Err(DataError::Format(format!("'{given}': give the coordinate system as EPSG:<code>"))),
+    }
 }
 
 /// A source's coordinate system: converts its geometry to longitude/latitude and a request's
@@ -549,6 +875,31 @@ pub(crate) struct Reproject {
 }
 
 impl Reproject {
+    /// For [`declared_reproject`]: a coordinate system declared by `authority` and `code` or by a
+    /// `wkt` definition, when it is another body's
+    /// ([`crate::raster::planetary::declared`]). `None` when it isn't.
+    /// - Its longitude/latitude are read as they are, with a note. The layer keeps the system when
+    ///   the definition gives it.
+    /// - Other coordinates are an error, because they would land in the wrong place.
+    ///
+    /// `what` starts the note or the error (`its coordinate system (srs_id 49900)`).
+    pub(crate) fn planetary(
+        what: &str,
+        authority: Option<&str>,
+        code: Option<i64>,
+        wkt: Option<&str>,
+        notes: &mut Vec<String>,
+    ) -> Option<Result<Reproject>> {
+        use crate::raster::planetary::{Declared, declared};
+        Some(match declared(authority, code, wkt)? {
+            Declared::Refused(e) => Err(DataError::Format(format!("{what}: {e}"))),
+            Declared::LonLat { note, crs } => {
+                notes.push(format!("{what}: {note}"));
+                Ok(Reproject::from_crs(crs.unwrap_or(Crs::LonLat), notes))
+            }
+        })
+    }
+
     /// From an EPSG code; an unknown or missing code is taken as longitude/latitude, with a note.
     pub(crate) fn from_epsg(code: Option<u32>, notes: &mut Vec<String>) -> Reproject {
         let crs = match code {
@@ -556,7 +907,9 @@ impl Reproject {
             Some(c) => match Crs::from_epsg(c) {
                 Some(crs) => crs,
                 None => {
-                    notes.push(format!("unknown coordinate system EPSG:{c}; read as longitude/latitude"));
+                    // Unknown, or one only the desktop app can use (an azimuthal equidistant one in
+                    // the web app), which it says.
+                    notes.push(format!("{}; read as longitude/latitude", crate::raster::crs::unusable_epsg(c)));
                     Crs::LonLat
                 }
             },
@@ -605,13 +958,81 @@ impl Reproject {
         self.crs.label()
     }
 
-    /// The geometry in longitude/latitude; `None` when a coordinate can't be converted.
-    pub(crate) fn geometry(&self, g: Geometry) -> Option<Geometry> {
+    /// The system as [`SourceInfo::crs`] gives it ([`Crs::definition_text`]), which
+    /// [`SourceInfo::coordinate_system`] reads back as that very system, as the Shapefile source does.
+    pub(crate) fn info_crs(&self) -> String {
+        self.crs.definition_text()
+    }
+
+    /// The system the source's features are given in ([`FeatureSource::coord_crs`]): its own, as
+    /// the file holds them (longitude/latitude for one read as such).
+    pub(crate) fn crs(&self) -> Crs {
+        self.crs
+    }
+
+    /// The geometry converted to longitude/latitude; `None` when a coordinate can't be converted:
+    /// for a source that gives its features there (a database, a GeoPackage table loaded for
+    /// editing), unlike [`Reproject::read`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn to_lonlat_geometry(&self, g: Geometry) -> Option<Geometry> {
         let Some(t) = &self.t else { return Some(g) };
         let mut ok = true;
         let out = g.map_coords(&|c| t.to_lonlat(c).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
         out.for_each_coord(|c| ok &= c.is_finite());
         ok.then_some(out)
+    }
+
+    /// A geometry as the file holds it, kept in the source's own coordinates
+    /// ([`Reproject::crs`]), with its box in longitude/latitude for a request's extent to test
+    /// ([`Reproject::place`]); `None` when a coordinate can't be converted to longitude/latitude,
+    /// as a feature that can't be placed is left out. Each coordinate is converted to be checked,
+    /// none is kept converted.
+    pub(crate) fn read(&self, g: Geometry) -> Option<Placed> {
+        let Some(t) = &self.t else {
+            let lonlat = g.extent();
+            return Some(Placed { geometry: g, lonlat });
+        };
+        let mut ok = true;
+        let mut lonlat = Extent::EMPTY;
+        g.for_each_coord(|c| match t.to_lonlat(c).filter(|l| l.is_finite()) {
+            Some(l) => lonlat.expand(l),
+            None => ok = false,
+        });
+        ok.then_some(Placed { geometry: g, lonlat })
+    }
+
+    /// A geometry as the file holds it, kept in the source's own coordinates, and whether it is
+    /// within `req`. Given the request's box in those coordinates ([`Request::own`]), its own box
+    /// is tested against it, converting nothing, so a geometry with no place in
+    /// longitude/latitude is kept too (`None` for one with a coordinate that isn't a number).
+    /// Otherwise as [`Reproject::read`]: `None` when a coordinate can't be converted to
+    /// longitude/latitude, and its box there tested against the extent.
+    pub(crate) fn place(&self, g: Geometry, req: &Request) -> Option<Fitted> {
+        if let Some(own) = self.own_box(req) {
+            // A coordinate that isn't a number has no place here either: left out, as `read`
+            // leaves it out, for the reader to count.
+            if !g.is_finite() {
+                return None;
+            }
+            let inside = g.extent().intersects(&own);
+            return Some(Fitted { geometry: g, inside });
+        }
+        let Placed { geometry, lonlat } = self.read(g)?;
+        let inside = req.extent.is_none_or(|e| lonlat.intersects(&e));
+        Some(Fitted { geometry, inside })
+    }
+
+    /// The request's box in the source's own coordinates, when the asker gave it there
+    /// ([`Request::own`]) and they are projected.
+    pub(crate) fn own_box(&self, req: &Request) -> Option<Extent> {
+        req.own.filter(|(crs, _)| self.t.is_some() && *crs == self.crs).map(|(_, e)| e)
+    }
+
+    /// The request's box in the source's own coordinates, for an index to narrow by: the one the
+    /// asker gave there ([`Request::own`]), else its extent converted
+    /// ([`Reproject::extent_from_lonlat`]); `None` for none, or one that can't be bounded there.
+    pub(crate) fn request_box(&self, req: &Request) -> Option<Extent> {
+        self.own_box(req).or_else(|| req.extent.and_then(|e| self.extent_from_lonlat(&e)))
     }
 
     /// A longitude/latitude geometry in the source's coordinates.
@@ -634,17 +1055,228 @@ impl Reproject {
         }
     }
 
-    /// A longitude/latitude extent in native coordinates.
-    pub(crate) fn extent_from_lonlat(&self, e: &Extent) -> Extent {
+    /// A database's query box: refuse an unbounded view before any whole-table sampling.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn database_extent(&self, e: &Extent) -> Result<Extent> {
+        self.extent_from_lonlat(e)
+            .filter(|n| !n.is_empty() && [n.min_x, n.min_y, n.max_x, n.max_y].iter().all(|v| v.is_finite()))
+            .ok_or_else(unbounded_database_view)
+    }
+
+    /// A longitude/latitude extent in native coordinates, or `None` when the system refuses a
+    /// place on its edge (one it can't bring back, #1925): the edge's other places no longer bound
+    /// what's inside it. Local reads scan and filter geometry; database reads refuse explicitly
+    /// rather than sample the whole table before filtering.
+    pub(crate) fn extent_from_lonlat(&self, e: &Extent) -> Option<Extent> {
         match &self.t {
-            None => *e,
+            None => Some(*e),
             Some(t) => {
                 // Clamp to the valid range first: projections fail near the poles.
                 let c = Extent::new(e.min_x.max(-180.0), e.min_y.max(-89.9), e.max_x.min(180.0), e.max_y.min(89.9));
-                around(&c, |p| t.from_lonlat(p))
+                let refused = std::cell::Cell::new(false);
+                let out = around(&c, |p| {
+                    let q = t.from_lonlat(p);
+                    refused.set(refused.get() || q.is_none());
+                    q
+                });
+                (!refused.get()).then_some(out)
             }
         }
     }
+}
+
+/// A refused database view must not become a whole-table sample before local filtering.
+#[cfg(not(target_arch = "wasm32"))]
+fn unbounded_database_view() -> DataError {
+    DataError::Format("the requested view can't be bounded in the database's coordinate system; choose a smaller view".into())
+}
+
+/// A GeoPackage table's `gpkg_spatial_ref_sys` row: organization, its code, and its WKT
+/// definitions (`definition`, and the WKT2 one when the file has the `gpkg_crs_wkt` extension).
+pub(crate) struct GpkgSrs {
+    pub(crate) organization: Option<String>,
+    pub(crate) code: Option<i64>,
+    pub(crate) definition: Option<String>,
+    /// The WKT2 definition of the `gpkg_crs_wkt` extension (GeoPackage 1.2 and later).
+    pub(crate) definition_12_063: Option<String>,
+}
+
+/// A GeoPackage table's coordinate system, decided the same way on the desktop and in the browser
+/// (#1476): as its `gpkg_spatial_ref_sys` row declares it ([`declared_reproject`]), else
+/// longitude/latitude, with a note. The row's WKT2 (`definition_12_063`, the `gpkg_crs_wkt`
+/// extension) takes priority over its `definition`, as OGC 12-128r19 F.10 says. With no row for
+/// `srs_id`, it is taken as an EPSG code only for WGS 84 and Web Mercator, the ids writers commonly
+/// use without defining.
+pub(crate) fn gpkg_reproject(srs_id: i64, row: Option<GpkgSrs>, notes: &mut Vec<String>) -> Result<Reproject> {
+    let wkt2 = row.as_ref().and_then(|r| defined(r.definition_12_063.as_deref()));
+    let wkt1 = row.as_ref().and_then(|r| defined(r.definition.as_deref()));
+    // An EPSG code: the row's when its organization is EPSG (a table-local id such as 100001
+    // isn't one, nor is 0); with no row, or a row naming neither organization nor code nor a
+    // definition, the id itself for WGS 84 and Web Mercator only.
+    let epsg = match &row {
+        Some(GpkgSrs { organization: Some(org), code: Some(code), .. }) if org.eq_ignore_ascii_case("epsg") => {
+            u32::try_from(*code).ok().filter(|c| *c != 0)
+        }
+        Some(GpkgSrs { organization: None, code: None, .. }) if wkt2.or(wkt1).is_none() => {
+            u32::try_from(srs_id).ok().filter(|c| matches!(c, 4326 | 3857))
+        }
+        None => u32::try_from(srs_id).ok().filter(|c| matches!(c, 4326 | 3857)),
+        Some(_) => None,
+    };
+    let what = format!("its coordinate system (srs_id {srs_id})");
+    let declared = DeclaredCrs {
+        what: &what,
+        organization: row.as_ref().and_then(|r| r.organization.as_deref()),
+        code: row.as_ref().and_then(|r| r.code),
+        epsg,
+        wkt1,
+        wkt2,
+    };
+    if let Some(reproject) = declared_reproject(declared, notes) {
+        return reproject;
+    }
+    // Longitude/latitude is what WGS 84 and the spec's "undefined geographic" id 0 mean; any other
+    // id, the "undefined cartesian" -1 too, is assumed to be it.
+    if srs_id != 0 && srs_id != 4326 {
+        notes.push(format!("{what} has no EPSG code; read as longitude/latitude"));
+    }
+    Ok(Reproject::from_crs(Crs::LonLat, notes))
+}
+
+/// A definition's text, unless it is empty or "undefined" (or a writer's "undefined geographic
+/// …"), which defines nothing.
+pub(crate) fn defined(d: Option<&str>) -> Option<&str> {
+    d.map(str::trim).filter(|d| !d.is_empty() && !d.get(..9).is_some_and(|p| p.eq_ignore_ascii_case("undefined")))
+}
+
+/// A coordinate system a file declares by an organization's code and WKT definitions, as a
+/// GeoPackage's `gpkg_spatial_ref_sys` row and a FlatGeobuf header's `crs` do.
+#[derive(Clone, Copy)]
+pub(crate) struct DeclaredCrs<'a> {
+    /// What starts a note or an error (`its coordinate system (srs_id 49900)`).
+    pub(crate) what: &'a str,
+    /// The organization and its code, as the file gives them.
+    pub(crate) organization: Option<&'a str>,
+    pub(crate) code: Option<i64>,
+    /// The EPSG code they stand for, if any.
+    pub(crate) epsg: Option<u32>,
+    /// The WKT definition (`definition`), and a WKT2 one that takes priority over it.
+    pub(crate) wkt1: Option<&'a str>,
+    pub(crate) wkt2: Option<&'a str>,
+}
+
+/// A declared coordinate system, read the same way for every format that declares one so
+/// (GeoPackage, FlatGeobuf): by its EPSG code when the code is known, else by its WKT definition,
+/// with a note. The definition comes before the code when it gives another shift to WGS 84 than
+/// the code's, or is another body's system, as a `.prj` comes before its own `AUTHORITY`
+/// ([`read_wkt_over_code`](crate::raster::wkt::read_wkt_over_code)). Another body's system
+/// ([`Reproject::planetary`]) is said, or an error when its coordinates would be in the wrong place
+/// as longitude/latitude. An Earth definition beside another body's IAU code is read, and said.
+/// `None` when there is nothing to read it by: no EPSG code, no definition and no other body's
+/// code; the format then says what its coordinates are taken as.
+pub(crate) fn declared_reproject(declared: DeclaredCrs, notes: &mut Vec<String>) -> Option<Result<Reproject>> {
+    let DeclaredCrs { what, organization, code: declared_code, epsg, wkt1, wkt2 } = declared;
+    let definition = wkt2.or(wkt1);
+    if let Some(code) = epsg
+        && let Some(crs) = Crs::from_epsg(code)
+    {
+        // The method is the WKT2's, or the WKT1's when the WKT2 can't be parsed. Another body's
+        // WKT2 is used even then, so its system is caught as it is without a code (below).
+        let wkt2_named = wkt2.filter(|d| crate::raster::wkt::parses(d) || crate::raster::wkt::planetary_datum(d).is_some());
+        let named = wkt2_named.or(wkt1).or(wkt2);
+        // The definition that counts (the WKT2 when there is one) is said when it can't be parsed,
+        // as it is without a code (below), with what is `used` in its place. One that parses has
+        // its shift compared with the code's, and the code names its system.
+        let which = if wkt2.is_some() { "WKT2 definition" } else { "definition" };
+        let passed_over = |used: &str| {
+            let e = definition.filter(|d| !crate::raster::wkt::parses(d)).and_then(|d| crate::raster::wkt::read_wkt(d).err())?;
+            Some(format!("{what}: its {which} can't be read ({e}), so {used} is used"))
+        };
+        // The definition is read in place of the code when it gives another shift to WGS 84, or is
+        // another body's system, as a `.prj` is read in place of its own `AUTHORITY` (#1677).
+        match named.and_then(|d| crate::raster::wkt::read_wkt_over_code(d, code)) {
+            Some(Ok((crs, note))) => {
+                // Read from the WKT1, in place of a WKT2 that can't be parsed.
+                if wkt2.is_some() && named != wkt2 {
+                    notes.extend(passed_over("its WKT1 definition"));
+                }
+                notes.extend(note.map(|n| format!("{what}: {n}")));
+                return Some(Ok(Reproject::from_crs(crs, notes)));
+            }
+            // Another body's system that can't be read: not returned here, as the definition path
+            // below refuses it, and says a WKT2 it passes over.
+            Some(Err(_)) => {}
+            None => {
+                notes.extend(passed_over(&format!("EPSG:{code}")));
+                if let Some(note) = named.and_then(|d| crate::raster::wkt::projection_compatibility_note(d, crs)) {
+                    notes.push(format!("{what}: using EPSG:{} parameters in preference to the WKT definition; {note}", crs.epsg()));
+                }
+                // A grid the definition gives isn't applied by the code either (#1678).
+                if let Some(note) = named.and_then(|d| crate::raster::wkt::unapplied_note(d, crs)) {
+                    notes.push(format!("{what}: {note}"));
+                }
+                return Some(Ok(Reproject::from_crs(crs, notes)));
+            }
+        }
+    }
+    // Another body's system that can't be converted is told by its definition, or without one by
+    // its organization and code (an IAU one). Its longitude/latitude are read with a notice. Other
+    // coordinates are refused, because they would land in the wrong place. A planetary definition
+    // that `read_wkt` reads is converted like any other, with its own notice.
+    let other_body =
+        |definition: Option<&str>, notes: &mut Vec<String>| Reproject::planetary(what, organization, declared_code, definition, notes);
+    // Else the WKT it is defined with: a custom system, or a code this build doesn't know.
+    if let Some(mut definition) = definition {
+        // The definition read is the WKT2 whenever there is one.
+        let from_wkt2 = wkt2.is_some();
+        let mut read = crate::raster::wkt::read_wkt(definition);
+        // A WKT2 this build can't read gives way to the WKT1 definition, which should define the
+        // same system. Said, as the two may differ.
+        if let Err(e) = &read
+            && from_wkt2
+            && let Some(wkt1) = wkt1
+        {
+            // Unless the WKT2 is another body's system that is refused: it is the one that counts.
+            // (One the WKT2 can't tell the coordinates of, as when it can't be parsed, gives way,
+            // so the code isn't asked here: an IAU projected code would refuse a WKT1 that reads.)
+            if let Some(Err(refused)) = Reproject::planetary(what, None, None, Some(definition), &mut Vec::new()) {
+                return Some(Err(refused));
+            }
+            notes.push(format!("{what}: its WKT2 definition can't be read ({e}), so its WKT1 definition is used"));
+            definition = wkt1;
+            read = crate::raster::wkt::read_wkt(wkt1);
+        }
+        let crs = match read {
+            Ok((crs, note)) => {
+                notes.extend(note.map(|n| format!("{what}: {n}")));
+                // An IAU code names another body's system, so an Earth definition read in its
+                // place is said.
+                if !crs.is_planetary()
+                    && let (Some(org), Some(code)) = (organization, declared_code)
+                    && crate::raster::planetary::iau_code(org, code).is_some()
+                {
+                    let system = format!("{}:{code}", org.trim());
+                    notes.push(format!("{what}: its code {system} is another body's, but its definition is the Earth's, which is used"));
+                }
+                crs
+            }
+            Err(e) => {
+                // The WKT2 is asked first: when the WKT1 read in its place can't be read either,
+                // the WKT2 still tells another body's system.
+                if let Some(reproject) = wkt2.into_iter().chain([definition]).find_map(|d| other_body(Some(d), notes)) {
+                    return Some(reproject);
+                }
+                notes.push(format!("{what} can't be read ({e}); read as longitude/latitude"));
+                Crs::LonLat
+            }
+        };
+        return Some(Ok(Reproject::from_crs(crs, notes)));
+    }
+    if let Some(reproject) = other_body(None, notes) {
+        return Some(reproject);
+    }
+    // A code this build doesn't know, and no definition to fall back on: said by its code.
+    epsg.map(|_| Ok(Reproject::from_epsg(epsg, notes)))
 }
 
 /// The extent of an extent's edges (sampled, since edges curve when reprojected) through `f`.
@@ -733,11 +1365,26 @@ pub(crate) fn clamp_limit(limit: usize) -> usize {
 }
 
 /// Whether a feature's geometry falls in a request's extent (always true without one).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn in_request(g: &Geometry, req: &Request) -> bool {
     match &req.extent {
         Some(e) => g.extent().intersects(e),
         None => true,
     }
+}
+
+/// A geometry a source read, in its own coordinates, and its box in longitude/latitude
+/// ([`Reproject::read`]).
+pub(crate) struct Placed {
+    pub(crate) geometry: Geometry,
+    pub(crate) lonlat: Extent,
+}
+
+/// A geometry a source read for a request, in its own coordinates, and whether it is within the
+/// request ([`Reproject::place`]).
+pub(crate) struct Fitted {
+    pub(crate) geometry: Geometry,
+    pub(crate) inside: bool,
 }
 
 /// Makes ring rustls's process-wide crypto provider. SQL Server's client also builds aws-lc-rs
@@ -748,8 +1395,76 @@ pub(crate) fn tls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Largest custom CA certificate bundle read (`sslrootcert`, `ssl-ca`, `ca`).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const MAX_CA_BYTES: u64 = 1 << 20;
+
+/// How [`read_ca_roots`] treats non-PEM custom CA files.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaDer {
+    /// PEM only (`sslrootcert`).
+    None,
+    /// Single DER certificate when the file extension is `.der` (`ca`).
+    Extension,
+    /// Single DER certificate regardless of extension when no PEM block header is present (`ssl-ca`).
+    Fallback,
+}
+
+/// Reads and validates a custom CA certificate file (`<= 1 MiB`, regular file, valid PEM or single
+/// DER per `der`), never echoing file contents in an error.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn read_ca_roots(label: &str, file: &Path, der: CaDer) -> Result<rustls::RootCertStore> {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+    use std::io::Read;
+
+    let bad = |msg: &str| DataError::Format(format!("{label} {}: {msg}", file.display()));
+    let io_err = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::NotFound => bad("no such file"),
+        std::io::ErrorKind::PermissionDenied => bad("permission denied"),
+        _ => bad("couldn't read file"),
+    };
+    let meta = std::fs::metadata(file).map_err(io_err)?;
+    if !meta.is_file() {
+        return Err(bad("not a file"));
+    }
+    if meta.len() > MAX_CA_BYTES {
+        return Err(bad("file is larger than 1 MB"));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    std::fs::File::open(file).map_err(io_err)?.take(MAX_CA_BYTES + 1).read_to_end(&mut bytes).map_err(io_err)?;
+    if bytes.len() as u64 > MAX_CA_BYTES {
+        return Err(bad("file is larger than 1 MB"));
+    }
+    if bytes.is_empty() {
+        return Err(bad("no certificates"));
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    let pem_bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+    let has_pem = pem_bytes.windows(10).any(|w| w == b"-----BEGIN");
+    let try_der = match der {
+        CaDer::None => false,
+        CaDer::Extension => !has_pem && file.extension().is_some_and(|e| e.eq_ignore_ascii_case("der")),
+        CaDer::Fallback => !has_pem,
+    };
+    if try_der {
+        roots.add(CertificateDer::from(bytes)).map_err(|_| bad("invalid certificate"))?;
+        return Ok(roots);
+    }
+    for cert in CertificateDer::pem_slice_iter(pem_bytes) {
+        let cert = cert.map_err(|_| bad("invalid certificate"))?;
+        roots.add(cert).map_err(|_| bad("invalid certificate"))?;
+    }
+    if roots.is_empty() {
+        return Err(bad("no certificates"));
+    }
+    Ok(roots)
+}
+
 #[cfg(test)]
-mod tests;
+mod own_box_tests;
+#[cfg(test)]
+pub(crate) mod tests;
 
 pub mod chunk_memory;
 #[cfg(not(target_arch = "wasm32"))]

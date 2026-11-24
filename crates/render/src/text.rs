@@ -6,7 +6,7 @@ use ab_glyph::{Font, FontRef, GlyphId, PxScale, ScaleFont, VariableFont};
 use tiny_skia::{Paint, Pixmap, Rect, Transform};
 
 use crate::fonts::CjkRegion;
-use crate::{PlacedLabel, View};
+use crate::{Canvas, PlacedLabel, View};
 use rustgis_map::Rgba;
 use rustgis_map::layout::TextAlign;
 
@@ -119,6 +119,7 @@ fn family_font(fam: &crate::families::Family, face: Face) -> Option<(&'static Fo
 }
 
 /// The label font's regular face.
+#[cfg(test)]
 pub(crate) fn label_font() -> Option<&'static FontRef<'static>> {
     font(false)
 }
@@ -158,38 +159,119 @@ fn em(f: &FontRef, px: f32) -> PxScale {
 
 /// Characters that never need a glyph: spaces, controls, zero-width joiners, variation selectors,
 /// soft hyphens.
-fn invisible(c: char) -> bool {
+pub(crate) fn invisible(c: char) -> bool {
     c.is_whitespace()
         || c.is_control()
         || matches!(c, '\u{AD}' | '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{E0100}'..='\u{E01EF}')
 }
 
-/// An installed CJK face for `region`, parsed once; `None` when there is none (or on the web).
-fn cjk(region: CjkRegion) -> Option<&'static FontRef<'static>> {
-    static FACES: [OnceLock<Option<FontRef<'static>>>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
-    let slot = match region {
-        CjkRegion::SimplifiedChinese => &FACES[0],
-        CjkRegion::Japanese => &FACES[1],
-        CjkRegion::Korean => &FACES[2],
-    };
-    slot.get_or_init(|| crate::fonts::cjk_font(region).and_then(|(b, i)| FontRef::try_from_slice_and_index(b, *i).ok())).as_ref()
+/// Parses an installed regional face once, independently of downloaded coverage.
+fn installed_cjk(region: CjkRegion) -> Option<&'static FontRef<'static>> {
+    static FACES: [OnceLock<Option<FontRef<'static>>>; 4] = [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    // A test can run in a process of its own with no installed face, as in the browser, so the
+    // downloaded faces are tested alike whatever fonts the machine has.
+    let none_installed = cfg!(test) && std::env::var_os("RUSTGIS_TEST_NO_INSTALLED_CJK").is_some();
+    if none_installed {
+        None
+    } else {
+        FACES.get(cjk_slot(region))?.get_or_init(|| crate::fonts::cjk_font(region).and_then(parse_cjk)).as_ref()
+    }
+}
+
+/// The CJK face the web app downloaded for `region`, parsed once it's there.
+fn downloaded_cjk(region: CjkRegion) -> Option<&'static FontRef<'static>> {
+    static DOWNLOADED: [OnceLock<Option<FontRef<'static>>>; 4] = [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    let downloaded = crate::fonts::downloaded_cjk_font(region)?;
+    DOWNLOADED.get(cjk_slot(region))?.get_or_init(|| parse_cjk(downloaded)).as_ref()
+}
+
+fn cjk_slot(region: CjkRegion) -> usize {
+    match region {
+        CjkRegion::SimplifiedChinese => 0,
+        CjkRegion::Japanese => 1,
+        CjkRegion::Korean => 2,
+        CjkRegion::TraditionalChinese => 3,
+    }
+}
+
+fn parse_cjk((bytes, index): &'static (Vec<u8>, u32)) -> Option<FontRef<'static>> {
+    FontRef::try_from_slice_and_index(bytes, *index).ok()
 }
 
 /// The CJK faces to try for `c`, the region whose glyph style suits it first: Hangul looks for a
 /// Korean face, kana for a Japanese one, everything else (Han ideographs) for Simplified Chinese.
-fn cjk_order(c: char) -> [CjkRegion; 3] {
-    use CjkRegion::{Japanese as Jp, Korean as Kr, SimplifiedChinese as Sc};
-    match c {
-        '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}' | '\u{A960}'..='\u{A97F}' | '\u{AC00}'..='\u{D7FF}' => [Kr, Sc, Jp],
-        '\u{3040}'..='\u{30FF}' | '\u{31F0}'..='\u{31FF}' | '\u{FF66}'..='\u{FF9F}' => [Jp, Sc, Kr],
-        _ => [Sc, Jp, Kr],
+/// Traditional Chinese comes last: on the desktop it is tried only for a character no other face
+/// has, so what draws each character there doesn't change, and in the browser it is the face a
+/// Traditional Chinese interface downloads.
+fn cjk_order(c: char) -> [CjkRegion; 4] {
+    use crate::fonts::CjkScript;
+    use CjkRegion::{Japanese as Jp, Korean as Kr, SimplifiedChinese as Sc, TraditionalChinese as Tc};
+    match CjkScript::of(c) {
+        Some(CjkScript::Hangul) => [Kr, Sc, Jp, Tc],
+        Some(CjkScript::Kana) => [Jp, Sc, Kr, Tc],
+        _ => [Sc, Jp, Kr, Tc],
     }
 }
 
+/// Parses the requested script source lazily, sharing its bytes. Check for a late download
+/// before touching its parsed slot, so an early miss is not cached forever.
+fn script_face(script: crate::fonts::ScriptFont, downloaded: bool) -> Option<&'static FontRef<'static>> {
+    use crate::fonts::ScriptFont;
+    let slot = match script {
+        ScriptFont::Latin => 0,
+        ScriptFont::Arabic => 1,
+        ScriptFont::Bengali => 2,
+        ScriptFont::Lao => 3,
+        ScriptFont::Cjk(_) => return None,
+    };
+    static DOWNLOADED: [OnceLock<Option<FontRef<'static>>>; 4] = [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    static INSTALLED: [OnceLock<Option<FontRef<'static>>>; 4] = [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    let parse = |data: &'static (Vec<u8>, u32)| FontRef::try_from_slice_and_index(&data.0, data.1).ok();
+    if downloaded {
+        let data = crate::fonts::downloaded_script_font(script)?;
+        return DOWNLOADED.get(slot)?.get_or_init(|| parse(data)).as_ref();
+    }
+    if cfg!(test) && std::env::var_os("RUSTGIS_TEST_NO_INSTALLED_CJK").is_some() {
+        return None;
+    }
+    INSTALLED.get(slot)?.get_or_init(|| crate::fonts::script_font(script).and_then(parse)).as_ref()
+}
+
+/// The bundled Hack face supplies the same last-resort Georgian and symbol coverage as the UI.
+fn bundled_fallback() -> Option<&'static FontRef<'static>> {
+    static HACK: OnceLock<Option<FontRef<'static>>> = OnceLock::new();
+    HACK.get_or_init(|| FontRef::try_from_slice(epaint_default_fonts::HACK_REGULAR).ok()).as_ref()
+}
+
+/// The shared label fallback used by character markers as well as text and exported glyph runs.
+pub(crate) fn marker_fallback(c: char) -> Option<(&'static FontRef<'static>, GlyphId)> {
+    let face = font(false)?;
+    let found = glyph(c, face, None);
+    if found.is_none() && !invisible(c) {
+        crate::fonts::note_missing_script(c);
+    }
+    found
+}
+
 /// The face and glyph that draw `c`: `f` when it has the glyph, else `sans` (the label font a
-/// serif text falls back to: an arrow or a script the serif lacks), else the first installed CJK
-/// font that does. `None` when nothing covers it, so no missing-glyph box is drawn.
+/// serif text falls back to), then the downloaded and installed non-CJK script faces, bundled
+/// Hack and regional CJK faces. `None` when nothing covers it, so no missing-glyph box is drawn.
+///
+/// Every character the label font and `sans` lack but kana and Hangul (ideographs above all) tries
+/// the downloaded face the web app prefers first ([`crate::fonts::prefer_downloaded_cjk`]), so
+/// ideographs take its interface's regional forms.
 fn glyph(c: char, f: &'static FontRef<'static>, sans: Option<&'static FontRef<'static>>) -> Option<(&'static FontRef<'static>, GlyphId)> {
+    glyph_with_script_faces(c, f, sans, script_face)
+}
+
+/// Uses the same glyph selection with downloaded and installed script sources supplied lazily.
+fn glyph_with_script_faces(
+    c: char,
+    f: &'static FontRef<'static>,
+    sans: Option<&'static FontRef<'static>>,
+    script_face_from: impl Fn(crate::fonts::ScriptFont, bool) -> Option<&'static FontRef<'static>>,
+) -> Option<(&'static FontRef<'static>, GlyphId)> {
+    use crate::fonts::CjkScript;
     let id = f.glyph_id(c);
     if id.0 != 0 || invisible(c) {
         return (id.0 != 0).then_some((f, id));
@@ -200,7 +282,34 @@ fn glyph(c: char, f: &'static FontRef<'static>, sans: Option<&'static FontRef<'s
             return Some((s, id));
         }
     }
-    cjk_order(c).into_iter().filter_map(cjk).find_map(|f| {
+    if let Some(script) = crate::fonts::ScriptFont::of(c).filter(|s| !matches!(s, crate::fonts::ScriptFont::Cjk(_))) {
+        for downloaded in [true, false] {
+            if let Some(face) = script_face_from(script, downloaded) {
+                let id = face.glyph_id(c);
+                if id.0 != 0 {
+                    return Some((face, id));
+                }
+            }
+        }
+    }
+    if let Some(face) = bundled_fallback() {
+        let id = face.glyph_id(c);
+        if id.0 != 0 {
+            return Some((face, id));
+        }
+    }
+    let not_kana_or_hangul = !matches!(CjkScript::of(c), Some(CjkScript::Kana | CjkScript::Hangul));
+    let preferred = not_kana_or_hangul.then(crate::fonts::preferred_downloaded_cjk).flatten().and_then(downloaded_cjk);
+    cjk_glyph(c, preferred, |region| [installed_cjk(region), downloaded_cjk(region)])
+}
+
+/// Chooses a regional CJK glyph, retaining the preferred downloaded face for Han text.
+fn cjk_glyph(
+    c: char,
+    preferred: Option<&'static FontRef<'static>>,
+    candidates: impl Fn(CjkRegion) -> [Option<&'static FontRef<'static>>; 2],
+) -> Option<(&'static FontRef<'static>, GlyphId)> {
+    preferred.into_iter().chain(cjk_order(c).into_iter().flat_map(|region| candidates(region).into_iter().flatten())).find_map(|f| {
         let id = f.glyph_id(c);
         (id.0 != 0).then_some((f, id))
     })
@@ -209,35 +318,61 @@ fn glyph(c: char, f: &'static FontRef<'static>, sans: Option<&'static FontRef<'s
 /// Whether the label fonts (`bold` or regular, with the installed CJK fallbacks) have a glyph for
 /// every character of `text`, invisible characters aside.
 pub fn covers(text: &str, bold: bool) -> bool {
+    check_coverage(text, bold, true)
+}
+
+/// Probes the current font stack without recording another missing-font request. Useful when
+/// rechecking a report from the previous frame after a font may have arrived.
+pub fn covers_quietly(text: &str, bold: bool) -> bool {
+    check_coverage(text, bold, false)
+}
+
+/// Tile/text output records missing scripts; status rechecks use the same selection silently.
+fn check_coverage(text: &str, bold: bool, note: bool) -> bool {
     let Some(f) = font(bold) else { return true };
-    text.chars().all(|c| invisible(c) || glyph(c, f, None).is_some())
+    text.chars().all(|c| {
+        let covered = invisible(c) || glyph(c, f, None).is_some();
+        if !covered && note {
+            crate::fonts::note_missing_script(c);
+        }
+        covered
+    })
 }
 
 /// Lays out `text` at `px` pixels in `face` (with `sans` for the characters it lacks, as
-/// [`glyph`] takes them): each drawable glyph with its face and pen position (from 0), and the
-/// total advance. Characters no font covers are left out.
+/// [`glyph`] takes them): each drawable glyph with its face, pen position (from 0) and character,
+/// and the total advance. Characters no font covers are left out.
 fn shape(
     text: &str,
     px: f32,
     face: &'static FontRef<'static>,
     sans: Option<&'static FontRef<'static>>,
-) -> (Vec<(&'static FontRef<'static>, GlyphId, f32)>, f32) {
+) -> (Vec<(&'static FontRef<'static>, GlyphId, f32, char)>, f32, Vec<char>) {
     let mut out = Vec::new();
+    let mut missing = Vec::new();
     let mut x = 0.0;
     let mut prev: Option<(&'static FontRef<'static>, GlyphId)> = None;
     for ch in text.chars().take(500) {
-        let Some((f, id)) = glyph(ch, face, sans) else { continue };
+        let Some((f, id)) = glyph(ch, face, sans) else {
+            // Left out. A CJK character is noted, so the web app downloads a face for it; an
+            // invisible one (the ideographic space) draws nothing and needs none.
+            if !invisible(ch) {
+                crate::fonts::note_missing_script(ch);
+                missing.push(ch);
+            }
+            continue;
+        };
         let sf = f.as_scaled(em(f, px));
         if let Some((pf, pid)) = prev
             && std::ptr::eq(pf, f)
         {
             x += sf.kern(pid, id);
         }
-        out.push((f, id, x));
+        out.push((f, id, x, ch));
         x += sf.h_advance(id);
         prev = Some((f, id));
     }
-    (out, x)
+    (out, x, missing)
 }
 
 /// Most lines a label draws: its text comes from files and attributes.
@@ -258,8 +393,11 @@ pub fn line_count(text: &str) -> usize {
 /// Repeated measurements share a bounded retention cache; fonts are discovered once per process.
 /// Long strings and non-finite sizes keep the uncached behavior, including its glyph limit.
 pub fn measure(text: &str, size: f32, bold: bool) -> f32 {
-    static WIDTHS: OnceLock<widths::Cache> = OnceLock::new();
-    WIDTHS.get_or_init(widths::Cache::default).measure(text, size, bold, || measure_uncached(text, size, bold))
+    // Keyed by the faces handed over at run time too: a width measured before a downloaded CJK
+    // face arrived left its characters out.
+    static WIDTHS: OnceLock<widths::Cache<(bool, u32)>> = OnceLock::new();
+    let key = (bold, crate::fonts::font_generation());
+    WIDTHS.get_or_init(widths::Cache::default).measure(text, size, key, || measure_uncached(text, size, bold))
 }
 
 /// The original measurement, including em scaling, font fallbacks and the missing-font estimate.
@@ -278,8 +416,8 @@ pub fn measure_in(text: &str, size: f32, face: Face) -> f32 {
     }
     // Labels in a named family are measured as often as those in the label font (every feature,
     // every frame), so they share its retention, keyed by the whole face.
-    static WIDTHS: OnceLock<widths::Cache<(bool, bool, bool, Option<u16>)>> = OnceLock::new();
-    let key = (face.bold, face.italic, face.serif, face.family);
+    static WIDTHS: OnceLock<widths::Cache<(bool, bool, bool, Option<u16>, u32)>> = OnceLock::new();
+    let key = (face.bold, face.italic, face.serif, face.family, crate::fonts::font_generation());
     WIDTHS.get_or_init(widths::Cache::default).measure(text, size, key, || {
         let Some((f, _)) = face_font(face) else {
             return text.chars().count() as f32 * size * 0.6;
@@ -376,6 +514,21 @@ fn styled(l: &PlacedLabel) -> bool {
     l.italic || l.spacing != 0.0 || l.font.is_some()
 }
 
+/// How far (pixels, its text `px` pixels high) a bold label is drawn a second time to its right:
+/// none unless it is bold in the interface fonts and they have no heavier face
+/// ([`crate::fonts::bold_is_synthetic`]); an installed family's own faces are drawn as they are.
+pub fn thickening(l: &PlacedLabel, px: f32) -> f32 {
+    if !l.bold || !crate::fonts::bold_is_synthetic() {
+        return 0.0;
+    }
+    // An export resolves the same named face that it draws. An unreadable face uses the
+    // interface fallback, just like a label without a family. The UI uses its own font readiness
+    // instead, so deciding an additional strike never asks it to read or parse a font file.
+    let named =
+        l.font.and_then(|i| crate::families::installed_now()?.get(usize::from(i))).and_then(|family| family_font(family, label_face(l)));
+    if named.is_none() { crate::fonts::bold_thickening(px) } else { 0.0 }
+}
+
 /// The face a label is drawn in.
 pub fn label_face(l: &PlacedLabel) -> Face {
     Face { bold: l.bold, italic: l.italic, serif: false, family: l.font }
@@ -402,12 +555,14 @@ fn spaced_line_width(line: &str, size: f32, face: Face, spacing: f32, ppp: f32) 
 
 /// How many glyphs a line is drawn with in `face` (letter spacing goes between them): shaped once
 /// for each line and face, as a size doesn't change it, and kept while the lines kept are few.
+/// Keyed by the faces handed over at run time too: a line shaped before a downloaded CJK face
+/// arrived left its characters out.
 fn letters_of(line: &str, face: Face) -> usize {
     use std::collections::HashMap;
     use std::sync::Mutex;
-    static KEPT: OnceLock<Mutex<HashMap<(String, Face), usize>>> = OnceLock::new();
+    static KEPT: OnceLock<Mutex<HashMap<(String, Face, u32), usize>>> = OnceLock::new();
     let kept = KEPT.get_or_init(Mutex::default);
-    let key = (line.to_string(), face);
+    let key = (line.to_string(), face, crate::fonts::font_generation());
     if let Some(n) = kept.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return *n;
     }
@@ -460,7 +615,7 @@ pub fn background_reach(l: &PlacedLabel) -> [f32; 2] {
 }
 
 /// Draws a label's background (logical coordinates, upright) at `ppp` pixels a point.
-fn draw_background(pm: &mut Pixmap, l: &PlacedLabel, ppp: f32) {
+fn draw_background(pm: &mut Canvas, l: &PlacedLabel, ppp: f32) {
     let (Some(r), Some(b)) = (background_box(l), l.background.as_ref()) else { return };
     let [x0, y0, x1, y1] = r.map(|v| v * ppp);
     let Some(rect) = Rect::from_ltrb(x0, y0, x1, y1) else { return };
@@ -501,17 +656,23 @@ fn blend(pm: &mut Pixmap, x: i32, y: i32, c: Rgba, cov: f32) {
     }
 }
 
-fn draw_text(pm: &mut Pixmap, text: &str, cx: f32, cy: f32, px_size: f32, color: Rgba, bold: bool, offset: (f32, f32)) {
+/// Draws one line of `text` in the label font, centred on (`cx`, `cy`) and moved by `offset`.
+fn draw_text(pm: &mut Canvas, text: &str, cx: f32, cy: f32, px_size: f32, color: Rgba, bold: bool, offset: (f32, f32)) {
     let Some(f) = font(bold) else { return };
     let sf = f.as_scaled(em(f, px_size));
-    let (glyphs, width) = shape(text, px_size, f, None);
+    let (glyphs, width, missing) = shape(text, px_size, f, None);
+    crate::approximations::missing_glyphs(missing);
     let x0 = cx - width / 2.0 + offset.0;
     let base = cy + (sf.ascent() + sf.descent()) / 2.0 + offset.1;
-    for (f, id, x) in glyphs {
+    if pm.is_recording() {
+        keep_glyphs(pm, &glyphs, (x0, base), px_size, 0.0, color, |_| false);
+        return;
+    }
+    for (f, id, x, _) in glyphs {
         let g = id.with_scale_and_position(em(f, px_size), ab_glyph::point(x0 + x, base));
         if let Some(og) = f.outline_glyph(g) {
             let bb = og.px_bounds();
-            og.draw(|gx, gy, cov| blend(pm, bb.min.x as i32 + gx as i32, bb.min.y as i32 + gy as i32, color, cov));
+            og.draw(|gx, gy, cov| blend(pm.pixels(), bb.min.x as i32 + gx as i32, bb.min.y as i32 + gy as i32, color, cov));
         }
     }
 }
@@ -524,12 +685,19 @@ const SLANT: f32 = 0.2126;
 /// and rightmost pixel offsets. With a negative spacing the letters can run backwards past the
 /// pen, and a slant moves their tops right and their descenders left; (0, 0) when nothing draws.
 pub fn styled_extent(text: &str, px: f32, face: Face, spacing: f32) -> (f32, f32) {
-    let Some((f, slanted)) = face_font(face) else { return (0.0, 0.0) };
+    styled_bounds(text, px, face, spacing).map_or((0.0, 0.0), |r| (r.left(), r.right()))
+}
+
+/// Ink bounds relative to the pen's start and the line's centre, measured as [`styled_at`]
+/// draws it. Whitespace has no bounds; fallback glyphs, spacing and synthetic italics count.
+pub(crate) fn styled_bounds(text: &str, px: f32, face: Face, spacing: f32) -> Option<Rect> {
+    let (f, slanted) = face_font(face)?;
     let sf = f.as_scaled(em(f, px));
     let base = (sf.ascent() + sf.descent()) / 2.0;
-    let (glyphs, _) = shape(text, px, f, sans_beside(f, face));
+    let (glyphs, _, _) = shape(text, px, f, sans_beside(f, face));
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-    for (i, (gf, id, x)) in glyphs.into_iter().enumerate() {
+    let (mut top, mut bottom) = (f32::INFINITY, f32::NEG_INFINITY);
+    for (i, (gf, id, x, _)) in glyphs.into_iter().enumerate() {
         // Measured as `styled_at` draws it.
         let italic = leans(face, f, slanted, gf);
         let g = id.with_scale_and_position(em(gf, px), ab_glyph::point(x + spacing * i as f32, base));
@@ -538,23 +706,29 @@ pub fn styled_extent(text: &str, px: f32, face: Face, spacing: f32) -> (f32, f32
         let (lean_top, lean_bottom) = if italic { (SLANT * (base - bb.min.y), SLANT * (base - bb.max.y)) } else { (0.0, 0.0) };
         lo = lo.min(bb.min.x + lean_top.min(lean_bottom));
         hi = hi.max(bb.max.x + lean_top.max(lean_bottom) + if italic { 1.0 } else { 0.0 });
+        top = top.min(bb.min.y);
+        bottom = bottom.max(bb.max.y);
     }
-    if lo.is_finite() && hi.is_finite() { (lo, hi) } else { (0.0, 0.0) }
+    Rect::from_ltrb(lo, top, hi, bottom)
 }
 
 /// Draws `text` from `left` (pixels), its line centred on `cy`, at `px` in `face` with `spacing`
 /// pixels between letters: italic in the family's italic face where it has one, else slanted.
 /// Plain (sans, no spacing, upright) it draws as [`text_at`] does from the left.
-#[allow(clippy::too_many_arguments)]
-pub fn styled_at(pm: &mut Pixmap, text: &str, left: f32, cy: f32, px: f32, color: Rgba, face: Face, spacing: f32) {
+pub fn styled_at(pm: &mut Canvas, text: &str, left: f32, cy: f32, px: f32, color: Rgba, face: Face, spacing: f32) {
     if !(left.is_finite() && cy.is_finite() && px.is_finite() && spacing.is_finite()) || px <= 0.0 {
         return;
     }
     let Some((f, slanted)) = face_font(face) else { return };
     let sf = f.as_scaled(em(f, px));
     let base = cy + (sf.ascent() + sf.descent()) / 2.0;
-    let (glyphs, _) = shape(text, px, f, sans_beside(f, face));
-    for (i, (gf, id, x)) in glyphs.into_iter().enumerate() {
+    let (glyphs, _, missing) = shape(text, px, f, sans_beside(f, face));
+    crate::approximations::missing_glyphs(missing);
+    if pm.is_recording() {
+        keep_glyphs(pm, &glyphs, (left, base), px, spacing, color, |gf| leans(face, f, slanted, gf));
+        return;
+    }
+    for (i, (gf, id, x, _)) in glyphs.into_iter().enumerate() {
         let italic = leans(face, f, slanted, gf);
         let g = id.with_scale_and_position(em(gf, px), ab_glyph::point(left + x + spacing * i as f32, base));
         let Some(og) = gf.outline_glyph(g) else { continue };
@@ -565,7 +739,7 @@ pub fn styled_at(pm: &mut Pixmap, text: &str, left: f32, cy: f32, px: f32, color
         }
         og.draw(|gx, gy, cov| {
             // (Floored, so a row just above or left of the pixmap is clipped, not drawn on row 0.)
-            blend(pm, (bb.min.x + gx as f32).floor() as i32, (bb.min.y + gy as f32).floor() as i32, color, cov);
+            blend(pm.pixels(), (bb.min.x + gx as f32).floor() as i32, (bb.min.y + gy as f32).floor() as i32, color, cov);
         });
     }
 }
@@ -577,7 +751,7 @@ const MAX_SLANTED_PIXELS: usize = 1 << 22;
 /// split across the two pixels it falls between so the slant stays smooth. The halves are added up
 /// before a pixel is drawn once: blended one after the other, two halves cover only three quarters
 /// of it, and rows that fall between pixels came out lighter, in stripes across large letters.
-fn slanted_glyph(pm: &mut Pixmap, og: &ab_glyph::OutlinedGlyph, base: f32, color: Rgba) {
+fn slanted_glyph(pm: &mut Canvas, og: &ab_glyph::OutlinedGlyph, base: f32, color: Rgba) {
     let bb = og.px_bounds();
     let shift = |px_x: f32, px_y: f32| px_x + SLANT * (base - px_y - 0.5);
     // Columns from the leftmost a row can lean to, one more on the right for the split.
@@ -602,14 +776,15 @@ fn slanted_glyph(pm: &mut Pixmap, og: &ab_glyph::OutlinedGlyph, base: f32, color
     for (i, cov) in acc.into_iter().enumerate() {
         if cov > 0.0 {
             let (col, row) = ((i % w) as f32, (i / w) as f32);
-            blend(pm, (left + col) as i32, (bb.min.y + row).floor() as i32, color, cov);
+            blend(pm.pixels(), (left + col) as i32, (bb.min.y + row).floor() as i32, color, cov);
         }
     }
 }
 
 /// Draws a placed label (logical coordinates) with its halo. A label turned with the map (one
 /// along a street) is drawn upright into a picture of its own, which is turned into place.
-pub fn draw(pm: &mut Pixmap, l: &PlacedLabel, ppp: f32) {
+pub fn draw(pm: &mut Canvas, l: &PlacedLabel, ppp: f32) {
+    draw_callout(pm, l, ppp);
     // Curved along a line: each character turned into its place, every character's halo
     // first, so none covers the letter before it.
     if !l.glyphs.is_empty() {
@@ -630,6 +805,28 @@ pub fn draw(pm: &mut Pixmap, l: &PlacedLabel, ppp: f32) {
     }
 }
 
+/// A label's callout line, from its feature to the edge of its text, under the text (and its
+/// halo under the line, so it shows over the map).
+fn draw_callout(pm: &mut Canvas, l: &PlacedLabel, ppp: f32) {
+    let Some([x0, y0, x1, y1]) = l.collide.callout else { return };
+    let mut pb = tiny_skia::PathBuilder::new();
+    pb.move_to((l.x + x0) * ppp, (l.y + y0) * ppp);
+    pb.line_to((l.x + x1) * ppp, (l.y + y1) * ppp);
+    let Some(path) = pb.finish() else { return };
+    let width = (CALLOUT_WIDTH * ppp).max(0.5);
+    let inks = l.halo.map(|h| (h, width + 2.0 * ppp)).into_iter().chain([(l.color, width)]);
+    for (c, w) in inks {
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(c.r(), c.g(), c.b(), c.a());
+        paint.anti_alias = true;
+        let stroke = tiny_skia::Stroke { width: w, line_cap: tiny_skia::LineCap::Round, ..Default::default() };
+        pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    }
+}
+
+/// How wide a callout's line is (points).
+pub const CALLOUT_WIDTH: f32 = 0.9;
+
 /// What of a label to draw: its halo, its text, or both (the halo under the text).
 #[derive(Clone, Copy, PartialEq)]
 enum Ink {
@@ -639,7 +836,7 @@ enum Ink {
 }
 
 /// Draws `l` turned by `angle` (radians, clockwise) about its centre.
-fn draw_turned(pm: &mut Pixmap, l: &PlacedLabel, angle: f32, ppp: f32, ink: Ink) {
+fn draw_turned(pm: &mut Canvas, l: &PlacedLabel, angle: f32, ppp: f32, ink: Ink) {
     let (w, h) = (label_width(l), block_height(&l.text, l.size).max(line_pitch(l.size)));
     // Room for the halo, and for the glyphs reaching past the line.
     // (The halo is drawn at most MAX_HALO_PX wide, so no more room is kept for it.)
@@ -651,17 +848,23 @@ fn draw_turned(pm: &mut Pixmap, l: &PlacedLabel, angle: f32, ppp: f32, ink: Ink)
     if !(pw.is_finite() && ph.is_finite()) || pw > 4096.0 || ph > 4096.0 {
         return;
     }
-    let Some(mut pic) = Pixmap::new(pw.max(1.0) as u32, ph.max(1.0) as u32) else { return };
     let (cx, cy) = (pw / ppp / 2.0, ph / ppp / 2.0);
     let upright = PlacedLabel { x: cx + l.align * w, y: cy, angle: None, framed: false, icon: None, ..l.clone() };
-    draw_upright(&mut pic, &upright, ppp, ink);
     let (tx, ty) = (l.center_x() * ppp, l.y * ppp);
     let t = Transform::from_translate(-pw / 2.0, -ph / 2.0).post_rotate(angle.to_degrees()).post_translate(tx, ty);
+    if pm.is_recording() {
+        // Kept turned: the upright label's glyphs and halo with the turn as their transform.
+        pm.with_transform(t, |c| draw_upright(c, &upright, ppp, ink));
+        return;
+    }
+    let Some(mut pic) = Canvas::new(pw.max(1.0) as u32, ph.max(1.0) as u32) else { return };
+    draw_upright(&mut pic, &upright, ppp, ink);
     let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..tiny_skia::PixmapPaint::default() };
-    pm.draw_pixmap(0, 0, pic.as_ref(), &paint, t, None);
+    pm.draw_pixmap(0, 0, pic.pixmap().as_ref(), &paint, t, None);
 }
 
-fn draw_upright(pm: &mut Pixmap, l: &PlacedLabel, ppp: f32, ink: Ink) {
+/// Draws an upright label: its frame when selected, then its halo and text as `ink` says.
+fn draw_upright(pm: &mut Canvas, l: &PlacedLabel, ppp: f32, ink: Ink) {
     let px = l.size * 1.33 * ppp;
     let (cx, cy) = (l.center_x() * ppp, l.y * ppp);
     // Several lines (#577) as the map view draws them: each aligned in a block as wide as the
@@ -691,13 +894,51 @@ fn draw_upright(pm: &mut Pixmap, l: &PlacedLabel, ppp: f32, ink: Ink) {
         })
         .collect();
     let (styled, spacing) = (styled(l), l.spacing * 1.33 * ppp);
-    let put = |pm: &mut Pixmap, &(line, left, lw, y): &(&str, f32, f32, f32), color: Rgba, (dx, dy): (f32, f32)| {
-        if styled {
-            styled_at(pm, line, left + dx, y + dy, px, color, label_face(l), spacing);
-        } else {
-            draw_text(pm, line, left + lw / 2.0, y, px, color, l.bold, (dx, dy));
+    // Bold with no heavier face to draw it in: each line drawn again a little to its right.
+    let thick = thickening(l, px);
+    let put = |pm: &mut Canvas, &(line, left, lw, y): &(&str, f32, f32, f32), color: Rgba, (dx, dy): (f32, f32)| {
+        for (strike, dx) in std::iter::once(dx).chain((thick > 0.0).then_some(dx + thick)).enumerate() {
+            let draw = |pm: &mut Canvas| {
+                if styled {
+                    styled_at(pm, line, left + dx, y + dy, px, color, label_face(l), spacing);
+                } else {
+                    draw_text(pm, line, left + lw / 2.0, y, px, color, l.bold, (dx, dy));
+                }
+            };
+            if strike == 0 {
+                draw(pm);
+            } else {
+                pm.decoration(draw);
+            }
         }
     };
+    if pm.is_recording() {
+        // Kept as vectors: the background, then each line's halo as a copy of its glyphs filled
+        // and stroked all round (text a PDF keeps as text, #1815), then the text as glyphs.
+        if ink != Ink::Text {
+            draw_background(pm, l, ppp);
+        }
+        if let Some(h) = l.halo.filter(|_| ink != Ink::Text) {
+            let r = match l.halo_width {
+                Some(width) => (halo_reach(width) * 1.33 * ppp).min(MAX_HALO_PX),
+                None => 1.2 * ppp,
+            };
+            // (No width, no halo, as the pixels have it; none built once the recording has
+            // overflowed, as nothing more is kept.)
+            for line in placed.iter().filter(|_| r > 0.0) {
+                if pm.overflowed() {
+                    break;
+                }
+                keep_halo(pm, r, h, |c, color| put(c, line, color, (0.0, 0.0)));
+            }
+        }
+        if ink != Ink::Halo {
+            for line in &placed {
+                put(pm, line, l.color, (0.0, 0.0));
+            }
+        }
+        return;
+    }
     // Its background under everything.
     if ink != Ink::Text {
         draw_background(pm, l, ppp);
@@ -725,13 +966,13 @@ fn draw_upright(pm: &mut Pixmap, l: &PlacedLabel, ppp: f32, ink: Ink) {
                 let (x0, y0) = ((x0 - pad).max(-pad).floor(), (y0 - pad).max(-pad).floor());
                 let (x1, y1) = ((x1 + pad).min(pw + pad).ceil(), (y1 + pad).min(ph + pad).ceil());
                 // (None at all for a halo no wider than nothing.)
-                if let Some(mut mask) = (r > 0.0 && x1 > x0 && y1 > y0).then(|| Pixmap::new((x1 - x0) as u32, (y1 - y0) as u32)).flatten() {
+                if let Some(mut mask) = (r > 0.0 && x1 > x0 && y1 > y0).then(|| Canvas::new((x1 - x0) as u32, (y1 - y0) as u32)).flatten() {
                     for line in &placed {
                         put(&mut mask, line, Rgba::rgb(0, 0, 0), (-x0, -y0));
                     }
-                    let (w, cover) = (mask.width() as usize, spread(&mask, r));
+                    let (w, cover) = (mask.width() as usize, spread(mask.pixmap(), r));
                     for (i, c) in cover.into_iter().enumerate() {
-                        blend(pm, x0 as i32 + (i % w) as i32, y0 as i32 + (i / w) as i32, h, c);
+                        blend(pm.pixels(), x0 as i32 + (i % w) as i32, y0 as i32 + (i / w) as i32, h, c);
                     }
                 }
             }
@@ -858,13 +1099,14 @@ impl Edt {
             z[k + 1] = f64::INFINITY;
         }
         k = 0;
-        for q in 0..n {
+        // (`out` holds `n` values, one for each q.)
+        for (q, out) in self.out.iter_mut().enumerate() {
             while z[k + 1] < q as f64 {
                 k += 1;
             }
             let p = v[k];
             let dq = q as f64 - p as f64;
-            self.out[q] = dq * dq + f[p];
+            *out = dq * dq + f[p];
         }
         &self.out
     }
@@ -887,7 +1129,7 @@ fn spread_direct(mask: &Pixmap, r: f32) -> Vec<f32> {
 }
 
 /// The selection's frame: a light fill and an outline in the selection colour.
-fn frame(pm: &mut Pixmap, r: Rect, ppp: f32) {
+fn frame(pm: &mut Canvas, r: Rect, ppp: f32) {
     let path = tiny_skia::PathBuilder::from_rect(r);
     let fill = crate::paint(crate::SELECTION.with_alpha(40), 1.0);
     pm.fill_path(&path, &fill, tiny_skia::FillRule::Winding, Transform::identity(), None);
@@ -897,7 +1139,7 @@ fn frame(pm: &mut Pixmap, r: Rect, ppp: f32) {
 
 /// A two-tone scale bar in the lower-left corner.
 /// `ground_per_pt` is ground metres per logical pixel at the centre of view.
-pub fn scale_bar(pm: &mut Pixmap, view: &View, ground_per_pt: f64) {
+pub fn scale_bar(pm: &mut Canvas, view: &View, ground_per_pt: f64) {
     let ppp = view.pixels_per_point as f32;
     let target = rustgis_geom::nice_distance(ground_per_pt * 120.0);
     if target <= 0.0 {
@@ -950,25 +1192,68 @@ pub fn scale_bar(pm: &mut Pixmap, view: &View, ground_per_pt: f64) {
 pub enum Align {
     Left,
     Center,
+    Right,
 }
 
 /// Draws one line of text at pixel position (`x`, `y`) (`y` is the line's middle), `px_size`
 /// pixels tall, optionally with a white halo.
-pub fn text_at(pm: &mut Pixmap, text: &str, x: f32, y: f32, px_size: f32, color: Rgba, bold: bool, align: Align, halo: bool) {
+pub fn text_at(pm: &mut Canvas, text: &str, x: f32, y: f32, px_size: f32, color: Rgba, bold: bool, align: Align, halo: bool) {
     if !(x.is_finite() && y.is_finite() && px_size.is_finite()) || px_size <= 0.0 {
         return;
     }
     let cx = match align {
         Align::Center => x,
         Align::Left => x + measure(text, px_size / 1.33, bold) / 2.0,
+        Align::Right => x - measure(text, px_size / 1.33, bold) / 2.0,
     };
-    if halo {
+    if halo && pm.is_recording() {
+        let r = (px_size * 0.09).max(1.0);
+        keep_halo(pm, r, Rgba::new(255, 255, 255, 230), |c, color| draw_text(c, text, cx, y, px_size, color, bold, (0.0, 0.0)));
+    } else if halo {
         let r = (px_size * 0.09).max(1.0);
         for (dx, dy) in [(-r, 0.0), (r, 0.0), (0.0, -r), (0.0, r)] {
             draw_text(pm, text, cx, y, px_size, Rgba::new(255, 255, 255, 230), bold, (dx, dy));
         }
     }
     draw_text(pm, text, cx, y, px_size, color, bold, (0.0, 0.0));
+}
+
+/// A glyph [`shape`] lays out: its face, glyph, pen position and character.
+type Shaped = (&'static FontRef<'static>, GlyphId, f32, char);
+
+/// Keeps `glyphs` on a recording canvas as runs of glyphs, from `origin` (the pen's start on the
+/// baseline) with `spacing` more between letters: a run for each stretch in one face and lean,
+/// `lean` saying which faces' glyphs lean (a slant where the family has no italic).
+fn keep_glyphs(
+    pm: &mut Canvas,
+    glyphs: &[Shaped],
+    origin: (f32, f32),
+    px: f32,
+    spacing: f32,
+    color: Rgba,
+    lean: impl Fn(&FontRef<'static>) -> bool,
+) {
+    let placed: Vec<(usize, &Shaped)> = glyphs.iter().enumerate().collect();
+    for run in placed.chunk_by(|a, b| std::ptr::eq(a.1.0, b.1.0)) {
+        let Some(&(_, &(font, ..))) = run.first() else { continue };
+        let kx = if lean(font) { -SLANT } else { 0.0 };
+        pm.glyphs(crate::vector::GlyphRun {
+            font,
+            size: px,
+            color: tiny_skia::Color::from_rgba8(color.r(), color.g(), color.b(), color.a()),
+            transform: Transform::from_row(1.0, 0.0, kx, 1.0, origin.0, origin.1),
+            glyphs: run.iter().map(|&(i, &(_, id, x, ch))| crate::vector::Glyph { id, x: x + spacing * i as f32, ch }).collect(),
+            halo: None,
+            decorative: false,
+        });
+    }
+}
+
+/// Keeps a halo `r` pixels wide in `color` round the text `draw` sets (given the colour to set it
+/// in): a copy of its glyphs, filled and stroked twice `r` wide, rounded (#1815), opaque in a
+/// group at the colour's alpha, so a see-through halo is one coat where glyphs overlap.
+fn keep_halo(pm: &mut Canvas, r: f32, color: Rgba, draw: impl FnOnce(&mut Canvas, Rgba)) {
+    pm.group(f32::from(color.a()) / 255.0, |c| c.halo(2.0 * r, |c| draw(c, color.with_alpha(255))));
 }
 
 #[cfg(test)]
@@ -1050,7 +1335,7 @@ mod spread_tests {
         let (w, row) = (3000usize, 510usize);
         let draw_at = |l: &crate::PlacedLabel| {
             let mut pm = Pixmap::new(w as u32, 1500).unwrap();
-            draw(&mut pm, l, 3.0);
+            crate::canvas::with_canvas(&mut pm, |c| draw(c, l, 3.0));
             pm.pixels().get(row * w..(row + 1) * w).unwrap().iter().map(|p| p.alpha()).collect::<Vec<u8>>()
         };
         let bare = draw_at(&label(None, None));
@@ -1064,6 +1349,44 @@ mod spread_tests {
 
 #[cfg(test)]
 mod coverage_tests {
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn synthetic_bold_exports_follow_the_baseline_once_as_text() {
+        if std::env::var_os("RUSTGIS_BOLD_EXPORT_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "text::coverage_tests::synthetic_bold_exports_follow_the_baseline_once_as_text", "--nocapture"])
+                .env("RUSTGIS_BOLD_EXPORT_CHILD", "1")
+                .env("RUSTGIS_BUILTIN_FONTS", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        assert!(crate::fonts::bold_is_synthetic());
+        for curved in [false, true] {
+            for angle in [0.0, std::f32::consts::FRAC_PI_2] {
+                let mut label = crate::tests::label("A", 100.0, None, 0.0);
+                (label.y, label.size, label.bold, label.font) = (100.0, 30.0, true, Some(u16::MAX));
+                let thick = super::thickening(&label, label.size * 1.33);
+                assert!(thick > 0.0, "an unavailable family uses synthetic-bold fallback");
+                if curved {
+                    label.glyphs = vec![crate::LabelGlyph { text: "A".into(), dx: 0.0, dy: 0.0, angle }];
+                } else {
+                    label.angle = Some(angle);
+                }
+                let mut canvas = crate::Canvas::recording(200, 200).unwrap();
+                super::draw(&mut canvas, &label, 1.0);
+                let (_, _, items) = canvas.into_drawing().unwrap().finish();
+                let runs: Vec<_> =
+                    items.iter().filter_map(|item| if let crate::vector::Item::Glyphs(run) = item { Some(run) } else { None }).collect();
+                assert_eq!(runs.len(), 2);
+                let (dx, dy) = (runs[1].transform.tx - runs[0].transform.tx, runs[1].transform.ty - runs[0].transform.ty);
+                assert!((dx - thick * angle.cos()).abs() < 1e-3 && (dy - thick * angle.sin()).abs() < 1e-3);
+                assert!(!runs[0].decorative && runs[1].decorative, "the extra visual strike does not duplicate accessible text");
+            }
+        }
+    }
+
     /// Large letters slanted by hand are solid: every row of an "I"'s stem has a fully covered
     /// pixel (rows that fell between pixels used to come out lighter, in stripes).
     #[test]
@@ -1073,7 +1396,7 @@ mod coverage_tests {
         let mut pm = tiny_skia::Pixmap::new(200, 200).unwrap();
         pm.fill(tiny_skia::Color::WHITE);
         let face = Face { italic: true, ..Face::default() };
-        styled_at(&mut pm, "I", 60.0, 100.0, 120.0, Rgba::rgb(0, 0, 0), face, 0.0);
+        crate::canvas::with_canvas(&mut pm, |c| styled_at(c, "I", 60.0, 100.0, 120.0, Rgba::rgb(0, 0, 0), face, 0.0));
         let rows: Vec<u8> =
             (0..200).filter_map(|y| (0..200).map(|x| pm.pixel(x, y).unwrap().red()).min().filter(|darkest| *darkest < 128)).collect();
         assert!(rows.len() > 60, "a tall stem: {} rows", rows.len());
@@ -1099,17 +1422,9 @@ mod coverage_tests {
     fn draws_nothing_for_characters_no_font_has() {
         // A private-use character has no glyph anywhere: it used to come out as a .notdef box.
         let mut pm = tiny_skia::Pixmap::new(80, 40).unwrap();
-        super::text_at(
-            &mut pm,
-            "\u{10FFFD}\u{10FFFD}",
-            40.0,
-            20.0,
-            24.0,
-            rustgis_map::Rgba::rgb(0, 0, 0),
-            false,
-            super::Align::Center,
-            true,
-        );
+        crate::canvas::with_canvas(&mut pm, |c| {
+            super::text_at(c, "\u{10FFFD}\u{10FFFD}", 40.0, 20.0, 24.0, rustgis_map::Rgba::rgb(0, 0, 0), false, super::Align::Center, true)
+        });
         assert!(pm.pixels().iter().all(|p| p.alpha() == 0), "a missing-glyph box was drawn");
         assert_eq!(super::measure("\u{10FFFD}", 10.0, false), 0.0);
     }
@@ -1130,14 +1445,239 @@ mod coverage_tests {
         assert!(super::measure("Mixed 中英 label", 10.0, false) > super::measure("Mixed  label", 10.0, false) + 10.0);
         // And the fallback glyphs are drawn, not just measured.
         let Some(ch) = "碑林区".chars().find(|&c| {
-            let (Some(label), Some(cjk)) = (super::font(false), super::cjk(CjkRegion::SimplifiedChinese)) else { return false };
+            let (Some(label), Some(cjk)) = (super::font(false), super::installed_cjk(CjkRegion::SimplifiedChinese)) else { return false };
             label.glyph_id(c).0 == 0 && cjk.glyph_id(c).0 != 0
         }) else {
             return;
         };
         let mut pm = tiny_skia::Pixmap::new(80, 40).unwrap();
-        super::text_at(&mut pm, &ch.to_string(), 40.0, 20.0, 24.0, rustgis_map::Rgba::rgb(0, 0, 0), false, super::Align::Center, false);
+        crate::canvas::with_canvas(&mut pm, |c| {
+            super::text_at(c, &ch.to_string(), 40.0, 20.0, 24.0, rustgis_map::Rgba::rgb(0, 0, 0), false, super::Align::Center, false)
+        });
         assert!(pm.pixels().iter().any(|p| p.alpha() > 0), "the fallback glyph was not drawn");
+    }
+
+    /// Downloaded coverage must supplement an installed face rather than hide its extra letters.
+    #[test]
+    fn downloaded_script_keeps_installed_glyphs_available() {
+        use ab_glyph::FontRef;
+        use std::sync::OnceLock;
+        static PRIMARY: OnceLock<FontRef<'static>> = OnceLock::new();
+        static DOWNLOADED: OnceLock<FontRef<'static>> = OnceLock::new();
+        static INSTALLED: OnceLock<FontRef<'static>> = OnceLock::new();
+        let primary = PRIMARY.get_or_init(|| FontRef::try_from_slice(include_bytes!("../testdata/test-cff.otf")).unwrap());
+        let downloaded = DOWNLOADED.get_or_init(|| FontRef::try_from_slice(include_bytes!("../testdata/test-fallback.otf")).unwrap());
+        let installed = INSTALLED.get_or_init(|| FontRef::try_from_slice(include_bytes!("../testdata/test-latin-catalog.otf")).unwrap());
+        let select = |c| {
+            super::glyph_with_script_faces(c, primary, None, |_, from_download| Some(if from_download { downloaded } else { installed }))
+        };
+        assert!(std::ptr::eq(select('ə').unwrap().0, downloaded), "downloaded glyphs keep priority");
+        let found = select('Ư').expect("the installed script face must remain available after a download");
+        assert!(std::ptr::eq(found.0, installed), "the installed script face must remain available after a download");
+    }
+
+    /// An installed Japanese probe glyph must not hide a downloaded face's other kana.
+    #[test]
+    fn downloaded_cjk_fills_a_partial_installed_face() {
+        use crate::fonts::CjkRegion;
+        use ab_glyph::FontRef;
+        use std::sync::OnceLock;
+        static PARTIAL: OnceLock<FontRef<'static>> = OnceLock::new();
+        static COMPLETE: OnceLock<FontRef<'static>> = OnceLock::new();
+        let partial = PARTIAL.get_or_init(|| FontRef::try_from_slice(include_bytes!("../testdata/test-fallback.otf")).unwrap());
+        let complete = COMPLETE.get_or_init(|| FontRef::try_from_slice(include_bytes!("../testdata/test-latin-catalog.otf")).unwrap());
+        let select = |c| {
+            super::cjk_glyph(c, None, |region| if region == CjkRegion::Japanese { [Some(partial), Some(complete)] } else { [None, None] })
+        };
+        assert!(std::ptr::eq(select('あ').unwrap().0, partial), "the installed glyph keeps priority");
+        assert!(std::ptr::eq(select('か').expect("the downloaded face supplies the missing kana").0, complete));
+    }
+
+    /// Traditional Chinese is the last face tried for every script, so on the desktop a character
+    /// another face has (a kanji only the Japanese face has, say) is drawn by that face as before.
+    #[test]
+    fn traditional_chinese_is_the_last_cjk_face_tried() {
+        use crate::fonts::CjkRegion::{Japanese as Jp, Korean as Kr, SimplifiedChinese as Sc, TraditionalChinese as Tc};
+        assert_eq!(super::cjk_order('\u{6F22}'), [Sc, Jp, Kr, Tc]);
+        assert_eq!(super::cjk_order('\u{304B}'), [Jp, Sc, Kr, Tc]);
+        assert_eq!(super::cjk_order('\u{D55C}'), [Kr, Sc, Jp, Tc]);
+    }
+
+    /// In the browser, CJK text with no face to draw it is noted by script, for the web app to
+    /// download one, and taken once; other text notes nothing. Ideographs then try the downloaded
+    /// face of the interface's region first. Like the test below, it runs in a process of its own
+    /// with no installed CJK face; two copies of egui's icon face stand in for downloaded ones.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn notes_missing_cjk_and_prefers_the_interface_face() {
+        if std::env::var_os("RUSTGIS_TEST_NO_INSTALLED_CJK").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "text::coverage_tests::notes_missing_cjk_and_prefers_the_interface_face", "--nocapture"])
+                .env("RUSTGIS_TEST_NO_INSTALLED_CJK", "1")
+                .env("RUSTGIS_BUILTIN_FONTS", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "the test didn't run in the child process");
+            return;
+        }
+        use crate::fonts::{CjkRegion, CjkScript, add_downloaded_cjk_font, font_generation, prefer_downloaded_cjk, take_missing_cjk};
+        let _ = take_missing_cjk();
+        super::measure("Taipei 101", 10.0, false);
+        assert_eq!(take_missing_cjk(), vec![], "no CJK text, nothing noted");
+        super::measure("Taipei\u{3000}101", 10.0, false);
+        assert_eq!(take_missing_cjk(), vec![], "the ideographic space draws nothing and needs no face");
+        super::measure("臺北 たいぺい 타이베이", 10.0, false);
+        assert_eq!(take_missing_cjk(), vec![CjkScript::Han, CjkScript::Kana, CjkScript::Hangul]);
+        assert_eq!(take_missing_cjk(), vec![], "taken once");
+
+        let icons = epaint_default_fonts::EGUI_ICONS;
+        assert!(add_downloaded_cjk_font(CjkRegion::SimplifiedChinese, icons.to_vec()).is_ok());
+        assert!(add_downloaded_cjk_font(CjkRegion::TraditionalChinese, icons.to_vec()).is_ok());
+        let label = super::font(false).unwrap();
+        let drawn_by = |region| {
+            let (face, _) = super::glyph('\u{E618}', label, None).unwrap();
+            std::ptr::eq(face, super::downloaded_cjk(region).unwrap())
+        };
+        assert!(drawn_by(CjkRegion::SimplifiedChinese), "the renderer's own order puts Simplified Chinese first");
+        let generation = font_generation();
+        prefer_downloaded_cjk(Some(CjkRegion::TraditionalChinese));
+        assert!(drawn_by(CjkRegion::TraditionalChinese));
+        assert!(font_generation() > generation, "widths cached before are measured again");
+        prefer_downloaded_cjk(None);
+        assert!(drawn_by(CjkRegion::SimplifiedChinese));
+    }
+
+    /// Uses the real tile filter, marker cache, raster drawing and PDF glyph-run path. It runs
+    /// without host fonts in its own process so a late fallback is load-bearing everywhere.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn late_script_fonts_reach_tiles_markers_raster_and_pdf() {
+        use super::{Canvas, Rgba};
+        if std::env::var_os("RUSTGIS_TEST_NO_INSTALLED_CJK").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "text::coverage_tests::late_script_fonts_reach_tiles_markers_raster_and_pdf", "--nocapture"])
+                .env("RUSTGIS_TEST_NO_INSTALLED_CJK", "1")
+                .env("RUSTGIS_BUILTIN_FONTS", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        use crate::fonts::{ScriptFont, add_downloaded_script_font, take_missing_scripts};
+        let tile = || rustgis_tiles::Label {
+            text: "অ".into(),
+            x: 20.0,
+            y: 20.0,
+            size: 12.0,
+            color: [0, 0, 0, 255],
+            halo: None,
+            bold: false,
+            italic: false,
+            letter_spacing: 0.0,
+            max_width: 0.0,
+            justify: 0.0,
+            priority: 0.0,
+            anchor: [0.0, 0.0],
+            offset: [0.0, 0.0],
+            angle: None,
+            icon: None,
+            collide: Default::default(),
+        };
+        let _ = take_missing_scripts();
+        let _ = crate::approximations::take();
+        assert!(crate::tiles::tile_label(tile()).is_none());
+        assert!(take_missing_scripts().contains(&ScriptFont::Bengali), "tile filtering must request its missing font");
+        let marker = rustgis_map::Glyph::new('অ', "");
+        assert!(crate::glyphs::shape(marker).is_none(), "cache an initial missing marker");
+        let _ = crate::approximations::take();
+        let before = super::measure("অ", 12.0, false);
+        assert!(crate::approximations::take().is_empty(), "measurement alone is not an output loss");
+        let bytes = include_bytes!("../testdata/test-fallback.otf");
+        for script in [ScriptFont::Latin, ScriptFont::Arabic, ScriptFont::Bengali, ScriptFont::Lao] {
+            assert!(add_downloaded_script_font(script, bytes.to_vec()).is_ok());
+        }
+        assert!(super::measure("অ", 12.0, false) > before, "invalidate widths measured without the font");
+        assert!(crate::tiles::tile_label(tile()).is_some());
+        assert!(crate::glyphs::shape(marker).is_some(), "invalidate the pre-download marker cache");
+        let text = "əঅກی";
+        assert!(super::covers(text, false));
+        for c in text.chars() {
+            let mut canvas = Canvas::new(32, 32).unwrap();
+            super::text_at(&mut canvas, &c.to_string(), 2.0, 16.0, 20.0, Rgba::new(0, 0, 0, 255), false, super::Align::Left, false);
+            assert!(canvas.into_pixmap().pixels().iter().any(|p| p.alpha() != 0), "{c}: no raster ink");
+        }
+        let draw = || {
+            let mut canvas = Canvas::recording(128, 32).unwrap();
+            super::text_at(&mut canvas, text, 2.0, 16.0, 20.0, Rgba::new(0, 0, 0, 255), false, super::Align::Left, false);
+            canvas.into_drawing().unwrap()
+        };
+        let (_, _, items) = draw().finish();
+        let written: String = items
+            .iter()
+            .filter_map(|item| match item {
+                crate::vector::Item::Glyphs(run) => Some(run),
+                _ => None,
+            })
+            .flat_map(|run| run.glyphs.iter().map(|g| g.ch))
+            .collect();
+        assert_eq!(written, text, "vector export must retain the actual Unicode text");
+        let pages = [crate::pdf::Page::drawing(draw(), 64.0, 16.0)];
+        let (pdf, outlined) = crate::pdf::write_with(&pages, "Fallback", crate::pdf::Options::default());
+        assert!(outlined.is_empty(), "{outlined:?}");
+        let maps: String = crate::pdf::tests::objects(&pdf)
+            .iter()
+            .map(|(_, body)| String::from_utf8_lossy(body).into_owned())
+            .filter(|body| body.contains("beginbfchar"))
+            .collect();
+        for c in text.chars() {
+            assert!(maps.contains(&format!("<{:04X}>", u32::from(c))), "{c}: missing PDF Unicode map");
+        }
+        assert!(crate::approximations::take().is_empty(), "covered text must not report a missing-glyph loss");
+    }
+
+    /// In the browser no CJK font is installed: the face the web app downloads is checked, kept
+    /// once a region and handed back to share, and draws what the label font lacks, in exports and
+    /// the layout view; widths measured before it arrived are measured again. The test runs in a
+    /// process of its own with no installed CJK face and the built-in label font, so it checks the
+    /// same on every machine and its faces reach no other test. egui's icon face stands in for a
+    /// downloaded one.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn draws_with_a_downloaded_face_where_none_is_installed() {
+        if std::env::var_os("RUSTGIS_TEST_NO_INSTALLED_CJK").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "text::coverage_tests::draws_with_a_downloaded_face_where_none_is_installed", "--nocapture"])
+                .env("RUSTGIS_TEST_NO_INSTALLED_CJK", "1")
+                .env("RUSTGIS_BUILTIN_FONTS", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "the test didn't run in the child process");
+            return;
+        }
+        use crate::fonts::{CjkRegion, add_downloaded_cjk_font, downloaded_cjk_font, font_generation};
+        use epaint_default_fonts::{EGUI_ICONS, HACK_REGULAR};
+        let icon = "\u{E618}";
+        assert!(!super::covers(icon, false), "the built-in label font has no icons");
+        let (before, added) = (super::measure(icon, 10.0, false), font_generation());
+        let letters = super::letters_of("\u{E618}\u{E618}", super::Face::default());
+        assert!(add_downloaded_cjk_font(CjkRegion::Japanese, b"not a font".to_vec()).is_err());
+        assert!(downloaded_cjk_font(CjkRegion::Japanese).is_none());
+        assert_eq!(add_downloaded_cjk_font(CjkRegion::Japanese, EGUI_ICONS.to_vec()), Ok(EGUI_ICONS), "the kept bytes are shared");
+        assert_eq!(font_generation(), added + 1);
+        assert_eq!(add_downloaded_cjk_font(CjkRegion::Japanese, HACK_REGULAR.to_vec()), Err(HACK_REGULAR.to_vec()), "one face a region");
+        assert_eq!(font_generation(), added + 1);
+        assert!(super::covers(icon, false));
+        let spaced = super::letters_of("\u{E618}\u{E618}", super::Face::default());
+        assert!(spaced > letters, "a letter count shaped before the face arrived was kept: {letters} then {spaced}");
+        assert!(super::measure(icon, 10.0, false) > before, "a width cached before the face arrived was kept");
+        let mut pm = tiny_skia::Pixmap::new(80, 40).unwrap();
+        crate::canvas::with_canvas(&mut pm, |c| {
+            super::text_at(c, icon, 40.0, 20.0, 24.0, rustgis_map::Rgba::rgb(0, 0, 0), false, super::Align::Center, false)
+        });
+        assert!(pm.pixels().iter().any(|p| p.alpha() > 0), "the downloaded face's glyph was not drawn");
     }
 
     /// A text asking for a serif (#517) where none is installed is drawn in the label font, slanted
@@ -1176,7 +1716,7 @@ mod coverage_tests {
         // A character the serif lacks and the sans has: drawn from the sans.
         let sans = italic;
         let c = ('\u{100}'..='\u{2FFF}').find(|&c| regular.glyph_id(c).0 == 0 && sans.glyph_id(c).0 != 0).expect("a character Hack lacks");
-        let (glyphs, _) = shape(&format!("a{c}"), 24.0, regular, Some(sans));
+        let (glyphs, _, _) = shape(&format!("a{c}"), 24.0, regular, Some(sans));
         assert!(glyphs.len() == 2 && std::ptr::eq(glyphs[1].0, sans), "{c:?} left out");
         // In a real italic, a glyph from another face leans; the italic's own don't.
         let it = Face { italic: true, serif: true, ..Face::default() };
@@ -1227,7 +1767,9 @@ mod coverage_tests {
         // The same words in the serif and the sans draw differently.
         let draw = |face: Face| {
             let mut pm = tiny_skia::Pixmap::new(300, 40).unwrap();
-            super::styled_at(&mut pm, "Rio Amazonas", 2.0, 20.0, 24.0, rustgis_map::Rgba::rgb(0, 0, 0), face, 0.0);
+            crate::canvas::with_canvas(&mut pm, |c| {
+                super::styled_at(c, "Rio Amazonas", 2.0, 20.0, 24.0, rustgis_map::Rgba::rgb(0, 0, 0), face, 0.0)
+            });
             pm.data().to_vec()
         };
         assert_ne!(draw(Face { serif: true, ..Face::default() }), draw(Face::default()));
@@ -1237,7 +1779,7 @@ mod coverage_tests {
         let sans = font(false).unwrap();
         let lacking = ('\u{2190}'..='\u{2BFF}').find(|&c| serif.0.glyph_id(c).0 == 0 && sans.glyph_id(c).0 != 0);
         if let Some(c) = lacking {
-            let (glyphs, _) = super::shape(&c.to_string(), 24.0, &serif.0, super::sans_beside(&serif.0, Face::default()));
+            let (glyphs, _, _) = super::shape(&c.to_string(), 24.0, &serif.0, super::sans_beside(&serif.0, Face::default()));
             assert!(glyphs.len() == 1 && std::ptr::eq(glyphs[0].0, sans), "{c:?} left out");
         }
     }

@@ -13,12 +13,12 @@ pub fn commands() -> Vec<C> {
     vec![
         C::new("nationalMap.services", "List The National Map Services", "Home › Add › Web Data › United States", |_, _| {
             Ok(national_map_list())
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view(),
-        C::new("nationalMap.add", "Add The National Map Service", "Home › Add › Web Data › United States", national_map_add).params(
+        C::new("nationalMap.add", "Add The National Map Service", "Home › Add › Web Data › United States", national_map_add).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
             r#"{"service": "a service's id or title (nationalMap.services lists them), e.g. \"basemap/USGSTopo\"", "name"?: text}"#,
         ),
-        C::new("fieldsOfTheWorld.add", "Add Fields of the World", "Home › Add › Web Data", fields_add).params(
+        C::new("fieldsOfTheWorld.add", "Add Fields of the World", "Home › Add › Web Data", fields_add).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
             r#"{"year"?: 2017–2025 (2025), "draw"?: "both"|"fields"|"density" (both: field density zoomed out, fields from zoom 9), "minScore"?: 0–100 (fields scoring below are hidden; 0)}"#,
         ),
     ]
@@ -360,10 +360,13 @@ fn national_map_add(s: &mut Session, p: &Value) -> CmdResult {
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or(svc.title);
     // Basemaps go with the basemaps; the rest are transparent overlays on top.
     let basemap = svc.category == "Basemaps";
+    // A drawn map (labels, symbols) is asked for as one picture of the view, so they aren't cut
+    // at tile edges (#1162); imagery in tiles.
+    let single = matches!(svc.mode, Mode::Export);
     super::tiles::add(
         s,
         &json!({"url": national_map_template(svc), "kind": "raster", "name": name, "attribution": svc.attribution,
-            "maxZoom": svc.max_zoom, "overlay": !basemap}),
+            "maxZoom": svc.max_zoom, "overlay": !basemap, "singleImage": single}),
     )
 }
 

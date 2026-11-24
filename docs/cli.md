@@ -25,9 +25,23 @@ It defaults to 1600 × 900 pixels at 96 DPI; `--width`, `--height` and `--dpi` c
 A data file is zoomed to its full extent; a project keeps its saved view.
 `--tiles` accepts an XYZ template, vector tiles or a MapLibre-style address.
 
-`--worldview auto|default|china` chooses the disputed borders in the built-in countries and
-world outline, for `render`, `run` and the other subcommands. `auto` follows
-`RUSTGIS_WORLDVIEW`, else the system time zone and locale.
+`--worldview auto|default|CODE` chooses the disputed borders in the built-in countries and
+world outline, for `render`, `run`, `ask` and `mcp`: the default borders, or a
+[worldview](user-guide/maps.md#worldview)'s code, such as `chn`, `ind` or `usa`. A worldview
+other than the default is downloaded once and kept in the cache folder; if the download fails,
+a named one is an error. `auto` follows `RUSTGIS_WORLDVIEW`, else the system time zone and
+locale (China's view in mainland China, falling back to the default borders with a warning when
+it can't be downloaded). `--worldview-detail simplified|original` chooses how detailed: the
+simplified borders (the default, about 250 KB) or Natural Earth's 1:10m ones (a 3 MB download),
+which `--worldview default` also downloads. Given explicitly, it makes a failed download an
+error even with `auto`. Nothing is downloaded by `ask`'s model and sign-in options, by `ask`
+with no request unless it reads or saves a project (with `--account` and no request, not even
+then), nor by `mcp --attach`.
+
+`--threads N` sets the most threads one piece of work uses (1 to 1024, never more than the
+cores), as [`gp.threads`](user-guide/analysis.md#analysis-workflows) sets it. With `mcp --attach` the
+open app's own setting holds, so `--threads` is refused there. Without it, a run takes
+the computer's cores, up to 16.
 
 ## Chaining commands
 
@@ -49,9 +63,12 @@ no parameters; otherwise use `--cmd 'id={json params}'`. What a command reports 
 which the app shows in its status bar, goes to standard error.
 
 Pass `--use-saved-secrets` to load the desktop app's saved connections and let
-`connection.login` and project sources use their remembered database passwords and S3 keys.
+`connection.login` and project sources use their remembered database passwords, S3 keys and
+web-service logins (Basic authentication or an API key in a header or query parameter).
 It also lets `ask` use the API key the app remembers, only for the same provider and address
-when the environment supplies no key, and the ChatGPT sign-in kept in the system keychain.
+when the environment supplies no key, and the ChatGPT sign-in kept in the system keychain, and
+lets files on NASA's Earthdata data servers use the Earthdata Login token the app remembers
+(`earthdata.login` with `"remember": true` remembers one from here, too).
 Command parameters and environment variables take precedence over saved secrets. Connection
 changes aren't saved back to the desktop preferences. The flag applies to `run`, `ask`, `mcp`,
 `render` and `info`; for example, `rustgis-cli run --use-saved-secrets --cmd connection.list`.
@@ -62,6 +79,19 @@ run continues without that saved secret and warns once on standard error. An unr
 malformed preferences file produces a separate warning when opting in; missing preferences are
 normal. On macOS, Keychain may ask once per item whether `rustgis-cli` may read it; **Always
 Allow** stops that question for the executable and item.
+
+Web-service logins are loaded only for the same connection ID, origin and login definition;
+the flag never shares a login with another connection. `connection.login` keeps an entered
+password or API key session-only unless `"remember": true` opts it into the OS store.
+If saving fails, the session login still works and a warning says it was not remembered.
+`connection.forgetLogin` deletes only the saved login, leaving the session login usable.
+`connection.logout` retains the saved login but blocks automatic reuse for the rest of the
+session until an explicit `connection.login`. See [Web-service logins](user-guide/data.md#web-service-logins)
+for exact-origin matching and HTTP confirmation.
+
+An ArcGIS token is pasted with `connection.login {"id":"c1","token":"…"}`. A token made from a user
+name and password (`connection.generateToken`) lands only when `connection.tokenStatus` asks, so it
+suits a session that keeps asking, such as Python or the app, more than one `--cmd` per run.
 
 Nothing waits on `run` the way a window does, so a long run takes the bounds the app's panes give
 it on a thread: a trend over a data cube (`cube.trend`) may compare up to 20 billion pairs, ten
@@ -100,6 +130,42 @@ rustgis-cli run --data dem.tif \
   <figcaption>A map exported by <code>rustgis-cli</code>, with no window open.</figcaption>
 </figure>
 
+### Strict runs
+
+Some notices that say a command lost data carry a loss code, such as `dropped.ring`, that stays
+the same however their wording changes. `run --strict` stops after the first command that reports a
+loss with a code that no `--allow` accepts, and exits with status 3, before the commands after it
+and before `--save`. That command, including a failed one, has already run: a file it wrote, or the
+project `--save` wrote when the save itself reported the loss, is already there. Standard error
+lists each loss by code, with how many notices reported it (each notice says how much it lost)
+and what to do about it. Other failures
+still exit with status 1.
+
+Repeat `--allow` to accept the losses a job expects, by kind (`dropped`, `changed`, `approximated`
+or `assumed`) or by code:
+
+```sh
+rustgis-cli run --strict --allow dropped.ring --data storms.rss \
+  --cmd 'share.exportMap={"path":"storms.png"}'
+```
+
+An `--allow` that names no kind or code is refused with status 2, as is `--allow` without
+`--strict`. A code is never renamed or reused, so a job can match on it.
+
+### Loss codes
+
+| Code | What to do |
+|---|---|
+| `dropped.legend` | Use a service with short HTTP or HTTPS addresses for its legend pictures. |
+| `dropped.ring` | Correct the unreadable polygon ring in the source. |
+| `dropped.extra-attributes` | Add fields for the extra attribute values or remove those values from the input. |
+| `dropped.time` | Write to a date-time field to keep the time of day. |
+| `dropped.value` | Correct the value or use a destination field that can hold it. |
+| `dropped.calculation-result` | Correct the expression or check the input rows named in the notice. |
+| `changed.truncated` | Use a decimal field to keep the fractional part. |
+
+Not every loss has a code yet: losses still reported without one don't stop a strict run.
+
 ## Asking the AI assistant
 
 `ask` gives the [AI Assistant](user-guide/assistant.md) one request. It loads data like `run`,
@@ -110,12 +176,13 @@ export ANTHROPIC_API_KEY=…            # or OPENAI_API_KEY, GEMINI_API_KEY, OPE
 rustgis-cli ask --sample "Which 5 countries have the largest GDP?"
 rustgis-cli ask --sample "Buffer the cities by 200 km and label them" --save buffered.rgis
 rustgis-cli ask --data parcels.geojson --provider ollama --model qwen3:8b "Summarise the fields"
+rustgis-cli ask --sample --image reference.png "Style the countries like this map"
 rustgis-cli ask --models --provider openai          # the provider's models
 rustgis-cli ask --login                             # sign in with ChatGPT to use your ChatGPT plan
 rustgis-cli ask --sample --provider chatgpt "Zoom to Tokyo"
 ```
 
-The provider is `--provider` (`anthropic`, `openai`, `chatgpt`, `gemini`, `openrouter`, `ollama`, `custom`),
+The provider is `--provider` (`anthropic`, `openai`, `chatgpt`, `gemini`, `openrouter`, `ollama`, `custom`, `requesty`, `trustedrouter`, `opper`),
 else `RUSTGIS_ASSISTANT_PROVIDER`, else the first with a key in the environment, else the app's
 saved provider when `--use-saved-secrets` is set, else Ollama. ChatGPT sign-in is used only when
 that provider is selected. Account management and `--models` do not read saved API keys:

@@ -53,14 +53,22 @@ pub fn add_file(app: &mut RustGisApp, path: &str) -> Result<Value, String> {
     if command != "layer.addData" {
         return app.run_by_user(command, json!({"path": path}));
     }
+    // An ArcGIS Pro database connection file opens the geodatabase connection form, filled from it.
+    if path.trim().to_ascii_lowercase().ends_with(".sde") {
+        return app.run("ui.connection", json!({"kind": "sqlserver", "form": true, "sdeFile": path}));
+    }
+    // A drawing asks for its coordinate system and whether its blocks are drawn first.
+    if rustgis_engine::data::dxf::is_dxf_name(path) {
+        return crate::dialogs::open_dxf_path(app, path);
+    }
     if !(app.ui.ask_layers && lists_layers(path)) {
-        return app.run("layer.addData", json!({"path": path}));
+        return add(app, json!({"path": path}));
     }
     // Listed off the frame: a geodatabase's or GDAL's listing can take a while.
     let slot: crate::Slot<Result<Value, String>> = crate::Slot::default();
     let out = slot.clone();
     let listed = path.to_string();
-    std::thread::spawn(move || {
+    crate::work_off_frame("rustgis-list-layers", &slot, move || {
         let mut session = rustgis_engine::Session::new(rustgis_engine::Project::default());
         let result = session.run("info.fileLayers", &json!({"path": listed}));
         *out.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
@@ -70,11 +78,20 @@ pub fn add_file(app: &mut RustGisApp, path: &str) -> Result<Value, String> {
     Ok(json!({"choosing": path}))
 }
 
+/// Adds a file, read on a thread of its own when the desktop app reads it so ([`crate::readjob`]).
+fn add(app: &mut RustGisApp, p: Value) -> Result<Value, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return crate::readjob::run(app, "layer.addData", p);
+    #[cfg(target_arch = "wasm32")]
+    app.run("layer.addData", p)
+}
+
 /// Adds the layers ticked, each by name (a failure is told, by the command, and the rest still
 /// added).
 fn add_chosen(app: &mut RustGisApp, path: &str, layers: &[String]) {
+    // After any file read before them, in turn.
     for layer in layers {
-        let _ = app.run("layer.addData", json!({"path": path, "layer": layer}));
+        let _ = add(app, json!({"path": path, "layer": layer}));
     }
     app.map.invalidate();
 }
@@ -99,7 +116,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 let path = c.path.clone();
                 app.ui.choosing.remove(0);
                 // A failure is told by the command.
-                let _ = app.run("layer.addData", json!({"path": path}));
+                let _ = add(app, json!({"path": path}));
                 app.map.invalidate();
                 return;
             }
@@ -191,6 +208,19 @@ mod tests {
     use super::*;
     use rustgis_engine::{Project, Session};
 
+    /// A `.sde` file dropped or added opens the geodatabase form filled from it, and adds no layer.
+    #[test]
+    fn a_sde_file_added_opens_the_geodatabase_form() {
+        let path = format!("{}/../data/testdata/sde/sqlserver-os.sde", env!("CARGO_MANIFEST_DIR"));
+        let mut app = crate::RustGisApp::with_sample();
+        let layers = app.session.project.maps.first().map_or(0, |m| m.layers.len());
+        add_file(&mut app, &path).unwrap();
+        assert_eq!(app.dialogs.open, Some("newConnection"));
+        assert!(app.ui.connection.form);
+        assert_eq!(app.ui.connection.server, "gisdb.example.invalid");
+        assert_eq!(app.session.project.maps.first().map_or(0, |m| m.layers.len()), layers);
+    }
+
     /// The app drawn for a test, past its first frames (which install the fonts).
     fn harness(app: RustGisApp) -> egui_kittest::Harness<'static, RustGisApp> {
         let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_max_steps(64).build_ui_state(
@@ -234,6 +264,22 @@ mod tests {
             assert_eq!(app.session.map().name, "Dropped map");
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A file in Recent or Favourites with several layers asks which to add, as Add Data does; one
+    /// recorded with its layer adds that layer.
+    #[test]
+    fn a_recent_file_with_several_layers_asks_which() {
+        let mut app = RustGisApp::new(Session::new(Project::default()));
+        let gdb = std::env::temp_dir().join("rustgis-recent-asks.gdb").display().to_string();
+        let file =
+            |extra: Value| rustgis_engine::sources::Source { kind: "file".into(), name: "Parcels".into(), address: gdb.clone(), extra };
+        crate::sourcespane::open(&mut app, &file(Value::Null)).unwrap();
+        assert_eq!(app.ui.choosing.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), [gdb.as_str()]);
+        app.ui.choosing.clear();
+        // (The geodatabase isn't there, so adding its layer fails: but it asks nothing.)
+        let _ = crate::sourcespane::open(&mut app, &file(json!({"layer": "roads"})));
+        assert!(app.ui.choosing.is_empty());
     }
 
     /// A file with several layers lists them, all ticked, and adds the ones chosen, each by name;

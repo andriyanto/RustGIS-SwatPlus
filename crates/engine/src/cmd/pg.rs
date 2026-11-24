@@ -30,20 +30,21 @@ const SSL_MODES: &[&str] = &["disable", "allow", "prefer", "require", "verify-ca
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_LISTED: usize = 5_000;
 
+/// Keeps database writes reserved and declares network and credential-file reach for live checks.
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("pg.connect", "Connect PostGIS", "Home › Add › Add Data", connect).view().params(
+        C::new("pg.connect", "Connect PostGIS", "Home › Add › Add Data", connect).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved).with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).view().params(
             r#"{"connection"?: "host=… port=… dbname=… user=…, or a postgresql:// address (instead of the parts below)", "host"?: string, "port"?: number, "database"?: string, "user"?: string, "password"?: "kept for this session only, never saved", "sslmode"?: "disable"|"prefer"|"require"|"verify-ca"|"verify-full"}"#,
         ),
-        C::new("pg.disconnect", "Disconnect PostGIS", "Home › Add › Add Data", disconnect).view().when(need_connection),
-        C::new("pg.status", "PostGIS Connection", "Home › Add › Add Data", status).view(),
-        C::new("pg.tables", "List PostGIS Tables", "Home › Add › Add Data", tables).view().when(need_connection).params(r#"{"schema"?: string}"#),
-        C::new("pg.pendingEdits", "PostGIS Edits", "Edit › Manage Edits", pending_edits).view().params(r#"{"layer"?: "a layer added with pg.addLayer (default: the active one)"}"#),
-        C::new("pg.saveEdits", "Save to PostGIS", "Edit › Manage Edits", save_edits)
+        C::new("pg.disconnect", "Disconnect PostGIS", "Home › Add › Add Data", disconnect).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved)).view().when(need_connection),
+        C::new("pg.status", "PostGIS Connection", "Home › Add › Add Data", status).roles(&[]).effects(crate::policy::Effects::NONE).view(),
+        C::new("pg.tables", "List PostGIS Tables", "Home › Add › Add Data", tables).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).view().when(need_connection).params(r#"{"schema"?: string}"#),
+        C::new("pg.pendingEdits", "PostGIS Edits", "Edit › Manage Edits", pending_edits).roles(&[]).effects(crate::policy::Effects::NONE).view().params(r#"{"layer"?: "a layer added with pg.addLayer (default: the active one)"}"#),
+        C::new("pg.saveEdits", "Save to PostGIS", "Edit › Manage Edits", save_edits).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved).with(crate::policy::Effect::Network).with(crate::policy::Effect::Files))
             .params(r#"{"layer"?: "a layer added with pg.addLayer (default: the active one)"}"#),
-        C::new("pg.discardEdits", "Discard PostGIS Edits", "Edit › Manage Edits", discard_edits)
+        C::new("pg.discardEdits", "Discard PostGIS Edits", "Edit › Manage Edits", discard_edits).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files))
             .params(r#"{"layer"?: "a layer added with pg.addLayer (default: the active one)"}"#),
-        C::new("pg.addLayer", "Add PostGIS Layer", "Home › Add › Add Data", add_layer).when(need_connection).params(
+        C::new("pg.addLayer", "Add PostGIS Layer", "Home › Add › Add Data", add_layer).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).when(need_connection).params(
             r#"{"table": "table, schema.table, or table:column for one of several geometry columns", "where"?: "an SQL condition on the table's columns", "limit"?: "the most rows of each layer (default and most: 100000)", "name"?: string, "crs"?: "EPSG:… of a geometry that doesn't say"}"#,
         ),
     ]
@@ -79,6 +80,8 @@ fn pending_edits(s: &mut Session, p: &Value) -> CmdResult {
     }))
 }
 
+/// `pg.saveEdits`: writes a layer's pending edits to its PostGIS table in one transaction, and
+/// says what the table didn't keep: fields without a column, offsets its date-time columns drop.
 fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
     #[cfg(target_arch = "wasm32")]
     {
@@ -121,7 +124,11 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
         let src = postgis::PostgisSource::open(conn, t, edit.origin.family, edit.origin.crs.as_deref()).map_err(err)?;
         let rows = changes.insert_rows.clone();
         let edits = rustgis_data::source::edits::Edits { updates: changes.updates, deletes: changes.deletes, inserts: changes.inserts };
-        let saved = match src.save(&edits, &fields).map_err(err)? {
+        // In the system the layer holds its geometry in: the table's own, longitude/latitude for
+        // a layer a project saved before RustGIS kept a table's own coordinates, or another (the
+        // column given another SRID since), converted straight to the table's.
+        let held = s.map().layer(id).ok_or("no such layer")?.dataset.coord_crs();
+        let saved = match src.save(&edits, &fields, held).map_err(err)? {
             Ok(saved) => saved,
             Err(conflicts) => {
                 let mut said: Vec<String> = conflicts.iter().take(20).map(ToString::to_string).collect();
@@ -156,6 +163,7 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
         // The versions saved over, while an undo step can bring them back.
         s.saved_over.retain(rustgis_map::source::Versions::held_elsewhere);
         s.saved_over.push(edit.versions);
+        let written = s.notice_mark();
         s.notify(
             format!("{name}: saved to {table}: {} new, {} changed, {} deleted", saved.inserted.len(), saved.updated, saved.deleted),
             false,
@@ -163,6 +171,10 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
         if !saved.skipped_fields.is_empty() {
             s.notify(format!("{name}: {table} has no column for {}, so it wasn't saved", saved.skipped_fields.join(", ")), false);
         }
+        for note in postgis::saved_dates_notes(&fields, &saved, &super::saved_target(&name, &table)) {
+            s.notify(note, false);
+        }
+        s.retain_written_notices(written);
         Ok(json!({
             "saved": true,
             "inserted": saved.inserted.len(),
@@ -175,6 +187,8 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
     }
 }
 
+/// `pg.discardEdits`: loads a layer's rows again as they are in its PostGIS table, saying how
+/// many values weren't dates RustGIS holds.
 fn discard_edits(s: &mut Session, p: &Value) -> CmdResult {
     #[cfg(target_arch = "wasm32")]
     {
@@ -199,9 +213,13 @@ fn discard_edits(s: &mut Session, p: &Value) -> CmdResult {
         let editable = src.read_editable(edit.condition.as_deref(), limit).map_err(err)?;
         let read: std::collections::HashMap<u64, i64> = editable.versions.iter().copied().collect();
         let n = editable.features.len();
+        let unread = rustgis_data::source::unread_dates_note(&src.info().fields, &editable.unread_dates);
         let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
         l.dataset.fields = src.info().fields.clone();
         l.dataset.features = editable.features.into();
+        // Read again as the table holds it now, which a layer a project saved before RustGIS
+        // kept a table's own coordinates takes too.
+        l.dataset.held_in = src.coord_crs();
         l.selection.clear();
         l.touch_geometry();
         let baseline = rustgis_map::source::versions_of(&l.dataset.features, &Default::default(), &read);
@@ -210,6 +228,9 @@ fn discard_edits(s: &mut Session, p: &Value) -> CmdResult {
             pg.writable = editable.writable;
         }
         s.notify(format!("{name}: edits discarded; {n} rows loaded again from {}", edit.origin.table), false);
+        if let Some(note) = unread {
+            s.notify(format!("{name}: {note}"), false);
+        }
         Ok(json!({"features": n, "matched": editable.matched}))
     }
 }
@@ -333,6 +354,8 @@ fn tables(s: &mut Session, p: &Value) -> CmdResult {
     }
 }
 
+/// Adds a PostGIS table as a layer (one per geometry family when it mixes them), framed on a map
+/// that shows nothing yet.
 fn add_layer(s: &mut Session, p: &Value) -> CmdResult {
     #[cfg(target_arch = "wasm32")]
     {
@@ -353,12 +376,13 @@ fn add_layer(s: &mut Session, p: &Value) -> CmdResult {
         let limit = f(p, "limit").map_or(postgis::MAX_EDITABLE, |n| n.clamp(1.0, postgis::MAX_EDITABLE as f64) as usize);
         let conn = postgis::connect(&dsn, true).map_err(err)?;
         let table = postgis::find_table(&conn, name).map_err(err)?;
-        let families = postgis::families(&conn, &table).map_err(err)?;
+        let mut families = postgis::families(&conn, &table).map_err(err)?;
+        families.sort_by_key(|f| super::layer::bottom_first(*f));
         if families.is_empty() {
             return Err(format!("{label}: {}: the table has no rows with a geometry", table.label()));
         }
         let mixed = families.len() > 1;
-        let empty_before = s.map().layers.is_empty();
+        let empty_before = super::map_is_empty(s);
         let (mut ids, mut loaded, mut matched, mut writable) = (Vec::new(), 0u64, 0u64, true);
         for family in families {
             let src = postgis::PostgisSource::open(conn.clone(), table.clone(), Some(family), crs).map_err(err)?;
@@ -372,6 +396,8 @@ fn add_layer(s: &mut Session, p: &Value) -> CmdResult {
             let info = src.info();
             let mut ds = rustgis_data::Dataset::new(layer_name.clone(), info.geometry_type, info.fields.clone());
             ds.crs = u32::try_from(src.srid()).ok().filter(|&c| c != 0 && c != 4326).and_then(rustgis_data::raster::Crs::from_epsg);
+            // Held as the table holds it, when RustGIS converts its system itself.
+            ds.held_in = src.coord_crs();
             let n = editable.features.len() as u64;
             let read: std::collections::HashMap<u64, i64> = editable.versions.iter().copied().collect();
             let versions = rustgis_map::source::versions_of(&editable.features, &Default::default(), &read);
@@ -384,6 +410,9 @@ fn add_layer(s: &mut Session, p: &Value) -> CmdResult {
                     ),
                     false,
                 );
+            }
+            if let Some(note) = rustgis_data::source::unread_dates_note(&info.fields, &editable.unread_dates) {
+                s.notify(format!("{layer_name}: {note}"), false);
             }
             if !editable.writable {
                 s.notify(format!("{layer_name}: this user can't insert, update or delete its rows, so edits can't be saved to it"), false);

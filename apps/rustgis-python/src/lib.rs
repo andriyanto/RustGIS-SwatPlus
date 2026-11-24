@@ -11,6 +11,7 @@ use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use rustgis_engine::data::loss::LossCode;
 use rustgis_engine::{Project, Session};
 use serde_json::Value;
 use std::io::Write;
@@ -84,13 +85,20 @@ struct Engine {
     /// What the session's store reported (the first failure of the keychain, a preferences file
     /// that couldn't be read), waiting to be logged by the call that is running or the next one.
     diagnostics: Arc<Mutex<Vec<String>>>,
+    /// Classified losses not yet raised as warnings, and where collecting them last stopped (the
+    /// notice mark and the session's loss counts). Only locked inside the session's lock.
+    losses: Mutex<Losses>,
 }
 
 impl Engine {
+    /// Runs `operation` on the session, then sets aside the losses it reported for the thread that
+    /// called it, under the same lock, so a call on another thread can't take them.
     fn with_session<T: Send>(&self, py: Python<'_>, operation: impl FnOnce(&mut Session) -> T + Send) -> T {
         with_native(py, || {
             let mut session = self.session.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            operation(&mut session)
+            let result = operation(&mut session);
+            self.losses.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).collect(&session);
+            result
         })
     }
 
@@ -104,8 +112,43 @@ impl Engine {
     }
 }
 
+/// See [`Engine::losses`].
+struct Losses {
+    /// `(kind, code, text)` for the thread whose call reported it.
+    pending: Vec<(std::thread::ThreadId, (String, String, String))>,
+    mark: u64,
+    given: Vec<(LossCode, u64)>,
+}
+
+impl Losses {
+    /// Sets aside the losses `session` gave since the last call, for the calling thread, while
+    /// their notices are still in its queue (after every call, so before `take_notices` drains
+    /// it). One the queue no longer keeps (past its last 200) is set aside as one entry per code
+    /// that says how many.
+    fn collect(&mut self, session: &Session) {
+        let thread = std::thread::current().id();
+        let kept: Vec<(LossCode, String)> =
+            session.notices_since(self.mark).iter().filter_map(|n| n.loss().map(|code| (code, n.text.clone()))).collect();
+        for &(code, given) in session.losses_given() {
+            let was = self.given.iter().find(|(c, _)| *c == code).map_or(0, |(_, n)| *n);
+            let held = kept.iter().filter(|(c, _)| *c == code).count() as u64;
+            let lost = given.saturating_sub(was).saturating_sub(held);
+            if lost > 0 {
+                let spec = code.spec();
+                let text = format!("{lost} further {} notice(s) were not kept", spec.id);
+                self.pending.push((thread, (spec.kind.id().into(), spec.id.into(), text)));
+            }
+        }
+        self.pending.extend(kept.into_iter().map(|(code, text)| (thread, (code.spec().kind.id().into(), code.spec().id.into(), text))));
+        self.mark = session.notice_mark();
+        self.given = session.losses_given().to_vec();
+    }
+}
+
 #[pymethods]
 impl Engine {
+    /// An empty session; `use_saved_secrets` reads the desktop app's saved connections, and
+    /// asks the system keychain for a secret only when a command needs one.
     #[new]
     #[pyo3(signature = (use_saved_secrets=false))]
     fn new(py: Python<'_>, use_saved_secrets: bool) -> Self {
@@ -121,7 +164,8 @@ impl Engine {
             }
             session
         });
-        let engine = Engine { session: Mutex::new(session), diagnostics };
+        let losses = Losses { pending: Vec::new(), mark: session.notice_mark(), given: session.losses_given().to_vec() };
+        let engine = Engine { session: Mutex::new(session), diagnostics, losses: Mutex::new(losses) };
         engine.flush(py);
         engine
     }
@@ -143,15 +187,18 @@ impl Engine {
     /// `dpi` (96 when left out).
     #[pyo3(signature = (width=None, height=None, dpi=None))]
     fn render_png<'py>(&self, py: Python<'py>, width: Option<f64>, height: Option<f64>, dpi: Option<f64>) -> PyResult<Bound<'py, PyBytes>> {
-        let result = self.with_session(py, |session| rustgis_engine::cmd::share::map_png(session, width, height, dpi));
+        let result = self.with_session(py, |session| {
+            session.follow_style_view();
+            rustgis_engine::cmd::share::map_png(session, width, height, dpi)
+        });
         self.flush(py);
         result.map(|png| PyBytes::new(py, &png)).map_err(RustGISError::new_err)
     }
 
     /// Layer `layer` of the active map as GeoJSON text: an id, or a name (a name that is a number
-    /// is read as an id after the names). Its features as they are in memory (a large file read
-    /// in place holds the features of the last view; run `layer.loadAll` first for all of them),
-    /// or only its selected ones when `selected`.
+    /// is read as an id after the names). All its features (a layer read in place, which holds
+    /// only the features of the last view, is read whole from its source, and rows that couldn't
+    /// be read are said), or only its selected ones when `selected`.
     #[pyo3(signature = (layer, selected=false))]
     fn layer_geojson(&self, py: Python<'_>, layer: LayerRef, selected: bool) -> PyResult<String> {
         let result = self.with_session(py, |session| {
@@ -163,31 +210,144 @@ impl Engine {
                     .or_else(|| name.trim().parse::<u32>().ok().and_then(|id| map.layer(id)))
                     .ok_or_else(|| format!("no layer named '{name}'")),
             }?;
+            if !selected && found.is_streamed() {
+                // Source metadata was reported when this layer opened. A fresh whole read may
+                // discover further notes, which must survive this boundary without replaying those.
+                let opened_notes: Vec<rustgis_engine::data::loss::Note> = found
+                    .source
+                    .as_ref()
+                    .and_then(|source| source.info())
+                    .map(|info| info.notes.iter().map(|note| note.clone().prefixed(&info.name)).collect())
+                    .unwrap_or_default();
+                let (ds, report) = found.load_all_reported().map_err(|e| format!("{}: {e}", found.name))?;
+                let name = found.name.clone();
+                match report.skipped {
+                    0 => {}
+                    1 => session.warn(format!("{name}: 1 row couldn't be read and was left out")),
+                    n => session.warn(format!("{name}: {n} rows couldn't be read and were left out")),
+                }
+                for message in report.messages.into_iter().filter(|message| !opened_notes.contains(message)) {
+                    session.say(message);
+                }
+                if let Some(note) = rustgis_engine::data::zm_export_note([&ds], &format!("{name} as GeoJSON")) {
+                    session.notify(note, false);
+                }
+                // GeoJSON is longitude/latitude, whatever system the source holds its coordinates in;
+                // a feature with a place that can't be given there is in it without its geometry.
+                let (lonlat, unplaced) = ds.in_lonlat_leaving_out()?;
+                if let Some(note) = rustgis_engine::data::unplaced_note(&format!("{name} as GeoJSON"), &ds.name, unplaced) {
+                    session.notify(note, false);
+                }
+                return Ok(rustgis_engine::data::io::to_geojson(&lonlat).to_string());
+            }
             if !selected {
-                return Ok(rustgis_engine::data::io::to_geojson(&found.dataset).to_string());
+                let (lonlat, unplaced) = found.dataset.in_lonlat_leaving_out()?;
+                let text = rustgis_engine::data::io::to_geojson(&lonlat).to_string();
+                let note = rustgis_engine::data::zm_export_note([&found.dataset], &format!("{} as GeoJSON", found.name));
+                let unplaced = rustgis_engine::data::unplaced_note(&format!("{} as GeoJSON", found.name), &found.name, unplaced);
+                for note in note.into_iter().chain(unplaced) {
+                    session.notify(note, false);
+                }
+                return Ok(text);
             }
             let mut ds = rustgis_engine::data::Dataset::new(found.name.clone(), found.geometry_type(), found.dataset.fields.clone());
-            for f in found.selection.iter().filter_map(|r| found.dataset.features.get(*r)) {
-                ds.push(f.geometry.clone(), f.attrs.clone());
+            ds.zm_dropped = found.dataset.zm_dropped;
+            // Copied in longitude/latitude, the system a new dataset holds its coordinates in:
+            // exactly through WGS 84, as the whole layer's GeoJSON is, whatever map it is shown on.
+            // A layer whose system can't be converted fails only with a geometry to convert, as
+            // it did when each geometry was converted on its own.
+            // A geometry with a place that can't be given there is left out, and counted.
+            let to = found.dataset.lonlat_conversion();
+            let mut unplaced = 0usize;
+            for r in found.selection.iter().filter_map(|&i| found.dataset.features.row(i)) {
+                let g = match r.geometry() {
+                    Some(g) => {
+                        let to = to.as_ref().map_err(|e| format!("{}: {e}", found.name))?;
+                        let g = rustgis_engine::data::Dataset::geometry_to_lonlat_by(to, g).ok().map(std::borrow::Cow::into_owned);
+                        unplaced += usize::from(g.is_none());
+                        g
+                    }
+                    None => None,
+                };
+                ds.push(g, r.values().cloned().collect());
             }
-            Ok::<String, String>(rustgis_engine::data::io::to_geojson(&ds).to_string())
+            let text = rustgis_engine::data::io::to_geojson(&ds).to_string();
+            if let Some(note) = rustgis_engine::data::zm_export_note([&ds], &format!("{} as GeoJSON", ds.name)) {
+                session.notify(note, false);
+            }
+            if let Some(note) = rustgis_engine::data::unplaced_note(&format!("{} as GeoJSON", ds.name), &ds.name, unplaced) {
+                session.notify(note, false);
+            }
+            Ok::<String, String>(text)
         });
         self.flush(py);
         result.map_err(RustGISError::new_err)
     }
 
     /// The project as `.rgis` JSON text, as `project.saveAs` writes it (what `project.openText`
-    /// opens).
+    /// opens). This save-equivalent output retains a bounded same-process restore snapshot;
+    /// repeated identical text replaces that snapshot. Unfinished imports are refused.
     fn project_json(&self, py: Python<'_>) -> PyResult<String> {
-        let result = self.with_session(py, |session| serde_json::to_string(&session.project).map_err(|e| e.to_string()));
+        let result = self.with_session(py, |session| {
+            let (text, report) = session.project.saved_text(None)?;
+            for notice in report.notices() {
+                session.notify(notice, false);
+            }
+            Ok::<_, String>(text)
+        });
         self.flush(py);
         result.map_err(RustGISError::new_err)
+    }
+
+    /// Private bridge output: never remembered, and never includes keys in widget state.
+    fn _peer_text(&self, py: Python<'_>) -> PyResult<(String, u32, Vec<String>)> {
+        let result = self.with_session(py, |session| {
+            let (text, report) = session.peer_text(rustgis_engine::Peer::Bridge)?;
+            let addresses = report.layer_addresses();
+            let notices = report.notices_without_layer_addresses();
+            Ok::<_, String>((text, addresses, notices))
+        });
+        self.flush(py);
+        result.map_err(RustGISError::new_err)
+    }
+
+    /// Private bridge ingress bypasses the saved-text cache and creates no User authority.
+    fn _open_peer_text(&self, py: Python<'_>, text: String) -> PyResult<()> {
+        let result = self.with_session(py, |session| {
+            let report = session.open_peer_text(rustgis_engine::Peer::Bridge, &text)?;
+            for notice in report.notices() {
+                session.notify(notice, false);
+            }
+            Ok::<_, String>(())
+        });
+        self.flush(py);
+        result.map_err(RustGISError::new_err)
+    }
+
+    /// The classified losses this thread's calls reported since it last asked, as
+    /// `(kind, code, text)`, oldest first, which the package raises as warnings; `take_notices`
+    /// still returns them too.
+    fn _take_losses(&self, py: Python<'_>) -> Vec<(String, String, String)> {
+        let thread = std::thread::current().id();
+        let losses = &self.losses;
+        // This thread's own call set them aside under the session's lock and has returned, so
+        // only their own lock is needed: taking them doesn't wait for another session's work.
+        py.detach(|| {
+            let mut losses = losses.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mine, others) = std::mem::take(&mut losses.pending).into_iter().partition(|(t, _)| *t == thread);
+            losses.pending = others;
+            mine.into_iter().map(|(_, loss)| loss).collect::<Vec<_>>()
+        })
     }
 
     /// The notices commands have given since the last call (a file's warnings, a tool's
     /// summary): `(text, is_error)` pairs, oldest first.
     fn take_notices(&self, py: Python<'_>) -> Vec<(String, bool)> {
-        let notices: Vec<(String, bool)> = self.with_session(py, |session| session.notices.drain(..).map(|n| (n.text, n.error)).collect());
+        let notices: Vec<(String, bool)> = self.with_session(py, |session| {
+            // A client made on a background thread since the last command may have chosen the trust.
+            session.notice_trust();
+            session.notices.drain(..).map(|n| (n.text, n.error)).collect()
+        });
         self.flush(py);
         notices
     }
@@ -203,6 +363,8 @@ fn load_plugins(py: Python<'_>) -> Vec<String> {
 
 #[pymodule]
 fn _rustgis(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Datum grids: RustGIS's own folder, then those PROJ uses on this computer (#2032 A4).
+    rustgis_engine::data::raster::crs::use_grid_folders();
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("RustGISError", m.py().get_type::<RustGISError>())?;
     m.add_class::<Engine>()?;

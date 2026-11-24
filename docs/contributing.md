@@ -8,15 +8,19 @@ for the conventions.
    UI-only commands (`ui.*`) live in `crates/ui-egui/src/lib.rs`.
 3. Run `cargo xtask ci` and `pre-commit run --all-files`.
 4. Open a pull request. Rust CI runs on Linux by default. A maintainer can label it `ci:windows`,
-   `ci:macos` or `ci:full` to test those platforms before merging; pushes to `main` test all three.
-   `ci:full` also builds the release apps. The nightly workflow tests and release-builds all three
-   when there are new commits, and opens an issue on failure.
-5. The docs workflow builds a site and web-app preview. A first-time fork contributor's preview
-   needs a maintainer to add `preview` or re-run the workflow; returning contributors' previews
-   publish automatically.
+   `ci:macos` or `ci:full` to test those platforms before merging (`ci:windows` tests Windows x64
+   and ARM64); pushes to `main` test them all. `ci:full` also builds the release apps. The nightly
+   workflow tests and release-builds them all when there are new commits, and opens an issue on
+   failure.
+5. The docs workflow builds a site and web-app preview. A fork's preview needs a maintainer to
+   add `preview` or re-run the workflow, for each new commit. Previews share one origin, so the
+   preview app keeps its settings, including AI provider keys, only until the page closes.
 
-A maintainer's `automerge` label approves and squash-merges a pull request after its required
-checks pass. Pushing again removes the label and disables auto-merge; removing the label also
+Pull requests merge through a merge queue: the queue tests each one merged with `main` and the
+pull requests ahead of it, and squash-merges it only if that passes, so two changes that pass apart
+but break together never reach `main`. The queue runs CI's Linux jobs; the Python package, Docker
+images and the phone apps are tested by the push to `main` after the merge. A maintainer's `automerge` label approves a pull request and
+adds it to the queue after its required checks pass. Pushing again removes the label and disables auto-merge; removing the label also
 disables it.
 
 A maintainer's `claude-autofix` label has Claude bring a pull request up to date: it merges the base
@@ -25,26 +29,196 @@ each and resolves the ones it fixed or found already fixed, and pushes the commi
 fork's too, when edits by maintainers are allowed). The label comes off when it's done; add it again
 for another round.
 
+Not every review comment has to be settled before a pull request merges. A quality point (style,
+naming, wording, a refactor, an extra test for code that works) can be left for the **release
+quality pass**: before each release, maintainers gather these from the merged pull requests and fix
+them together. Reply on the comment that it's left for the release quality pass (agents end the
+reply with `<!-- quality-sweep -->`), so it can be found. Bugs, crashes, silent data loss and
+breaks of the rules in AGENTS.md are fixed in the pull request, even when the problem predates it,
+the input that triggers it is rare, the fix needs a wider change or earlier code does the same. A
+defect too large for the pull request gets an issue, filed and linked from the reply, instead of
+the marker.
+
+The Claude review ends each inline comment with its category (`Category: bug`, security,
+performance, quality or agents-md). CI's **Review deferrals** check, which runs on each push and again in the
+merge queue, fails when a reply leaves a bug, security or AGENTS.md finding for the release quality
+pass. A maintainer can override it for one finding by ending a reply in its thread with
+`<!-- deferral-approved -->` and running the check again. The override isn't a reason: it records
+that a maintainer accepts the finding for the release quality pass, or judges it misclassified. A maintainer here is the repository's owner, a member of its organization or a
+collaborator, and the pull request's author may be that maintainer. Comments from
+other reviewers carry no category, so the check lets them through: those reviewers answer the
+reply themselves.
+
+The limits in `xtask/row-uses.txt` and `xtask/memory-limits.txt` only go down. CI's **Limits only go
+down** check, which runs on each push and again in the merge queue, fails when a pull request raises
+or removes one against the base commit; a new memory scenario is fine. A maintainer
+approves a deliberate raise (or a removed scenario) by commenting on the pull request, or reviewing
+it, with the line the failure prints for it on a line of its own, such as
+`<!-- ratchet-raise-approved: xtask/row-uses.txt count=790 -->` (a maintainer as for the deferral
+override above), and the check is run again. The line names the limit and its value, so a later
+push that raises it further needs a new approval.
+
+Changes to saved or generated output must classify each new owning field: address, executable
+parameters, generated text or user data. Use the shared durable-output transaction and keep
+credential removal separate from execution and approval identity. Review every writer that
+consumes the owner, including packages and peer exchange. Reuse a focused regression that checks
+the written output, restoration of live fields on failure, counted notices and clean-input
+silence. Opaque data needs an explicit preservation policy; recursive removal by key name can
+destroy user data.
+
 ## Developer checks
 
 `cargo xtask ci` runs `cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace -q` and
 `cargo xtask layers`. The pre-commit hooks also check TOML, YAML, JSON, whitespace and large files.
 CI separately builds `rustgis-web` for `wasm32-unknown-unknown` and runs
-`cargo deny --locked check licenses` against `deny.toml`.
+`cargo deny --locked check licenses sources` against `deny.toml`, including development
+dependencies. The fuzz workflow applies the same source policy using `fuzz/deny.toml`, which
+also permits NCSA for libFuzzer. Sources are limited to crates.io; an intentional git source needs an explicit
+allowlist entry and a pinned revision. CI also runs `python3 .github/scripts/check-cargo-sources.py`
+to reject repository Cargo configuration with `source`, `paths` or `patch` overrides, including
+case variants of `.cargo/config` and `.cargo/config.toml` used on case-insensitive filesystems.
+Tracked `.cargo` directories must be real directories.
+Config `include` directives are also rejected so those checks cannot be bypassed by loading
+another file; put intentional dependency patches in `Cargo.toml` for review.
+User-level Cargo mirrors are outside this repository check.
+
+CI runs the workspace's tests with [cargo-nextest](https://nexte.st), and `cargo test --doc` for the
+doctests it doesn't run (`.config/nextest.toml`, profile `ci`). Nextest runs a test that fails
+again, up to twice, and a test that passes on a retry is flaky: it is listed in the job summary,
+and on a push to `main` it gets an issue titled `Flaky test: <binary> <test>`. A flaky test is a
+bug to fix, not a retry to rely on; the retries are a stopgap for tests that wait on timers
+(`cargo xtask test-hygiene`) and go back to zero once those are gone. `cargo xtask ci` still runs
+`cargo test` locally.
+
+A pull request's CI runs the tests of the packages it changes and those that depend on them, as
+`cargo xtask changed --list` finds them. The whole workspace is tested for a push to `main`, a
+`ci:` label, a manual run on every platform, a change to `Cargo.lock`, `rust-toolchain*`, `.github/`
+or `.config/`, and a file outside every package that nothing includes. Lint, the wasm build, the
+licence check and the schema check always run whole. The `Tests pass` job fails when any other job
+does; it is the check to require before merging.
+
+Workflow actions are pinned to full commit SHAs with the previous version or branch in a comment.
+Dependabot's existing GitHub Actions updates keep these pins current. When changing an action,
+resolve the commit in that action's own repository and keep the version comment in step.
 
 Other workspace tasks:
 
 | Task | Purpose |
 | --- | --- |
-| `cargo xtask layers` | Check crate dependency direction and keep UI dependencies out of lower layers |
-| `cargo xtask notices` | Regenerate the shipped `THIRD-PARTY-LICENSES.txt` files after changing dependencies; requires `cargo-about` |
+| `cargo xtask changed [--list] [base]` | Run the `cargo xtask ci` checks on only the packages your branch changes and those that depend on them: a quicker check while you work. A file outside every package that no package includes, such as `Cargo.lock`, checks the whole workspace. `--list` prints the packages without checking them |
+| `cargo xtask layers` | Check crate dependency direction (target-specific dependencies included) and keep UI dependencies out of lower layers; a new crate under `crates/` needs a layer in `LAYERS` |
+| `cargo xtask attribution` | Check that every image and font file has a row in `ATTRIBUTION.md` (its path, a directory above it or a pattern in backticks; a bare name covers a file at the repository root) |
+| `cargo xtask notices` | Regenerate the shipped `THIRD-PARTY-LICENSES.txt` files after changing dependencies, or after adding code or data from another project to `INCLUDED` in `xtask/src/notices.rs` (with its licence text in `third-party/`); requires `cargo-about` |
 | `cargo xtask notices --check` | Check the notices without writing them; stale notices warn in CI but block releases |
 | `cargo xtask web-pwa <dir>` | Generate the service worker in a Trunk build output directory, such as `dist/web` |
 
 Interface strings must be translatable: use `tl!("…")` for literals and
 `i18n::fmt("… {name} …", &[("name", value)])` for messages with values. New strings can fall back
 to English until the catalogs are updated; see [Languages](i18n.md).
+
+### Saved-file compatibility
+
+`crates/engine/src/project.rs::FORMAT` is the saved-document compatibility version that
+RustGIS writes, separate from the application release version; `READ_FORMAT` is the newest it
+reads. Project, map, layer and style imports check a top-level `format`, and a top-level
+`requires` (the capabilities a document needs, `CAPABILITIES` listing those this RustGIS knows),
+before interpreting their payloads. Missing metadata remains supported legacy content;
+style files currently remain arrays. Current companion writers keep their existing output.
+Every project serialization, including templates and packages, writes the current `FORMAT`,
+even when the project was loaded from an older supported file.
+These reader checks prepare for future writers; they do not protect already released readers
+or detect new information in files that omit the required version.
+
+When a future change would cause an older reader to misinterpret or lose meaningful saved
+information on resaving, name it in the document's `requires` and add the name to `CAPABILITIES`
+where it is read; a format beyond `READ_FORMAT` is for a change a capability can't describe. This
+includes additive fields that parse successfully but disappear when an older writer saves. Task,
+presentation and notebook documents, and models inside a task's steps, don't check `requires` yet:
+a change to them that an older reader would lose needs that check first (see
+[maintaining](maintaining.md#saved-files-and-settings)). For a style file that needs metadata,
+the future writer must use an object rather than the legacy array; readers with this guard refuse
+its newer format before interpreting it.
+A payload or wrapper for such a new format belongs in that future change. Keep existing legacy
+readers and test that unsupported versions fail before typed deserialization, normalization or
+source reopening, including alternate import and package paths.
+
+### Faster local builds and test runs
+
+All of this is optional and on your side: the repository's profiles stay as they are, and
+`cargo xtask ci` is still the check before each commit and pull request.
+
+**Less debug information.** Much of a debug build's size and link time is debug information,
+most of it the dependencies'. In your user-level `~/.cargo/config.toml`:
+
+```toml
+[profile.dev]
+debug = "line-tables-only"   # backtraces keep file:line
+
+[profile.dev.package."*"]
+debug = false
+```
+
+On Linux, `split-debuginfo = "unpacked"` under `[profile.dev]` also keeps the linker from copying
+what is left of it, and [mold](https://github.com/rui314/mold) links faster still than the
+`rust-lld` Rust already uses on x86-64 Linux. Install mold first (the link fails without it), then:
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+```
+
+The settings change every build's fingerprint, so the next build is a full one.
+
+**Build only what you're testing.** `cargo test --workspace` builds every crate's library, test
+binaries and examples; a change in `ui-egui` alone means its library twice (plain and for its unit
+tests), its integration test binaries and the examples. While you work, name what you need:
+`cargo test -p rustgis-ui-egui --lib`, `cargo test -p rustgis-engine --test integration project_save::`, or
+`cargo clippy -p rustgis-ui-egui --all-targets` to check without linking.
+
+**cargo-nextest.** [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`, or
+`brew install cargo-nextest` for a pre-built one) runs the test binaries side by side, each test in
+its own process, and filters tests by expression:
+
+```sh
+cargo nextest run --workspace --no-fail-fast -E 'not (package(rustgis-engine) and test(hostile_params_never_panic))'
+cargo test --workspace --doc   # nextest doesn't run doctests
+```
+
+The engine's `hostile_params_never_panic`, which runs every command with junk parameters, is by far
+its slowest test; leaving it out while you iterate keeps a run short. Run it before you push, with
+`cargo nextest run -p rustgis-engine -E 'test(hostile_params_never_panic)'` or `cargo xtask ci`.
+A test that fails now and then can be retried with `--retries 1`.
+
+**Dev optimization levels.** In `Cargo.toml`, `[profile.dev]` defaults to `opt-level = 0` so UI,
+engine, CLI and test binaries compile quickly, while third-party crates and `rustgis-render` build
+at `opt-level = 2` and `rustgis-geom`, `rustgis-data`, `rustgis-analysis` and `rustgis-plugins`
+build at `opt-level = 1` so geometry, raster, analysis and plugin tests stay fast and reliable.
+
+**rust-analyzer in its own folder.** An editor's rust-analyzer and the terminal share `target/`:
+each waits for the other's lock ("Blocking waiting for file lock"), and as they build with
+different settings, each undoes the other's work. With `rust-analyzer.cargo.targetDir` set to
+`true` it builds in `target/rust-analyzer` instead, at the cost of the disk space.
+
+**On macOS.** No linker setting is needed: mold doesn't run there, Apple's own linker (Xcode 15
+and later) is already fast, and `split-debuginfo = "unpacked"` is already the default for debug
+builds.
+
+- Leave `target/` out of backups and search, which otherwise go through every file a build
+  changes: `tmutil addexclusion target` once it exists, and add the folder to Spotlight's privacy
+  list in System Settings.
+- macOS checks a program the first time it runs, and each build makes new test binaries. If even
+  the simplest tests take more than 0.2 seconds under nextest, run
+  `sudo spctl developer-mode enable-terminal`, turn your terminal on under System Settings ›
+  Privacy & Security › Developer Tools, and restart it. From then on, nothing that terminal starts
+  gets the first-run check, programs you download included, so do it only for a terminal you
+  trust; turning its switch off there undoes it. Working inside tmux or zellij, add the
+  multiplexer too, since its shells aren't the terminal's children, and add it again after each
+  update of a Homebrew build (signed ad hoc, it gets a new identity each time). Measure before
+  and after: on some machines it makes no difference (an M1 Max with macOS 15.7, for one).
+
+**`cargo clean` now and then.** `target/` keeps the artifacts of every branch and setting you have
+built, and can grow past a hundred gigabytes.
 
 ## Ribbon guidelines
 
@@ -154,6 +328,44 @@ test similarly generates its KML, KMZ, CSV and GeoJSON inputs. These run automat
 `cargo test --workspace --locked` and `cargo xtask ci`, without a separate setup step or a
 public service. Extend these generators when adding cases.
 
+`crates/engine/tests/integration/workflows.rs` runs everyday jobs from start to finish: join, overlay,
+summarise, map, save, reopen and export, and the same saved job twice. Its real-data case,
+Shelby County's census tracts checked against the areas the Census Bureau publishes, is
+`#[ignore]`d: the nightly build downloads the public-domain files, pinned by checksum, and runs it
+with `RUSTGIS_WORKFLOW_DATA` naming their folder (the list of files is in `nightly.yml`). To run
+it locally, download the files listed there into one folder, check them with `sha256sum` against
+the checksums beside them, and run
+`RUSTGIS_WORKFLOW_DATA=<folder> cargo test -p rustgis-engine --test integration workflows:: -- --ignored`.
+
+### Performance regressions
+
+When changing a large-data path, add a work budget to an ordinary test. Count what the operation
+does, such as bytes fetched, tiles requested, features decoded or passes over a raster. Use a
+small fixture, check the result as well as the count, and explain the budget beside the assertion.
+Count at the read or processing boundary so repeated work counts too. For example, the
+[GeoTIFF window test](../crates/tiles/src/cog/raster.rs) counts response bytes for a view that
+crosses one source tile boundary. Use timed benchmarks to measure processing speed.
+
+### Property tests
+
+A property test checks a rule over generated inputs instead of a few written ones: an export
+comes back the same or says what changed (`crates/engine/tests/integration/never_silent_roundtrip.rs`). They
+use [proptest](https://docs.rs/proptest) (a dev-dependency) and follow one pattern, so CI runs
+them all the same way:
+
+- An integration test (`crates/<crate>/tests/`) seeds its runner from `PROPERTY_SEED` (1 if
+  unset) and runs `PROPERTY_CASES` cases, with a default that takes a few seconds, and no
+  failure file. A value set that isn't a whole number fails rather than running the defaults.
+  A failure panics with `PROPERTY_SEED=<seed>` and the smallest input found.
+- Pull requests run the fixed seed with `cargo test`. The nightly runs each property test on a
+  new seed with more cases; add a new one to its step in `nightly.yml`.
+- What the rule allows (a format's limits, a tolerance) is a list in the test, each entry with
+  its reason. A rule about notices is tested both ways: lossy input gives the notice of that
+  kind, clean input gives none.
+
+To run a failing seed again, or deeper:
+`PROPERTY_SEED=7 PROPERTY_CASES=2000 cargo test -p rustgis-engine --test integration never_silent_roundtrip::`.
+
 ## Documentation
 
 The site is built with [Zensical](https://zensical.org):
@@ -179,12 +391,14 @@ pane (see [AI Assistant](user-guide/assistant.md#choosing-a-model)).
 
 ## Releases
 
-1. Bump `version` in the workspace `Cargo.toml` and merge it.
-2. Refresh third-party notices if dependencies changed (`cargo xtask notices`).
-3. Run the **Release dry run** workflow, which checks the version and builds the desktop/CLI
+1. Handle the review points left for the release quality pass since the last pass, in a few pull
+   requests.
+2. Bump `version` in the workspace `Cargo.toml` and merge it.
+3. Refresh third-party notices if dependencies changed (`cargo xtask notices`).
+4. Run the **Release dry run** workflow, which checks the version and builds the desktop/CLI
    packages without publishing anything:
    `gh workflow run release-dry-run.yml -R opengeos/RustGIS --ref main -f version=<version>`
-4. When it passes, publish a GitHub release tagged `v<version>` (the tag must match `Cargo.toml`).
+5. When it passes, publish a GitHub release tagged `v<version>` (the tag must match `Cargo.toml`).
 
 The **Release** workflow then builds and attaches the Windows installers, zip and MSIX, the
 macOS DMGs, the Linux tarballs, `.deb` and `.rpm` packages and AppImages, and `SHA256SUMS`. To try the packaging locally:

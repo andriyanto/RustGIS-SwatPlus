@@ -16,11 +16,13 @@ base64 = { workspace = true }
 sha2 = { workspace = true }
 log = { workspace = true }
 web-time = { workspace = true }
+# Pictures the user attaches to a message: read, turned upright, drawn smaller and encoded again.
+image = { workspace = true, features = ["jpeg", "webp"] }
 
 # Calling the model on the desktop and the command line. The browser calls it with its own fetch
 # (the web app's `Services::http`).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier", "gzip"] }
 # Random bytes for the sign-in's PKCE verifier and state.
 getrandom = "0.4"
 # Atomic owner-only credential writes on desktop platforms.
@@ -33,3 +35,7 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # The relay's token folder and file must belong to the user running the process.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
+
+[dev-dependencies]
+# Exercise the existing real Wasm fixture through Agent and MCP entry points.
+rustgis-engine = { workspace = true, features = ["testing"] }

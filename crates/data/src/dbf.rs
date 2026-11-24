@@ -27,6 +27,27 @@ impl DbfEncoding {
         }
     }
 
+    /// Whether `text` holds bytes this encoding can't read. Its decoder puts U+FFFD in place of
+    /// them without a word, so the read counts them itself ([`not_utf8`]). It asks the decoder
+    /// `dbase` calls, so a count is of the values that were replaced. A DOS page gives every
+    /// byte a character, so nothing is.
+    pub(crate) fn malformed(&self, text: &[u8]) -> bool {
+        match self {
+            Self::Standard(encoding) if *encoding != rs::UTF_8 => !text.is_ascii() && encoding.decode(text).2,
+            Self::Standard(_) | Self::Utf8 => std::str::from_utf8(text).is_err(),
+            Self::Oem(_) => false,
+        }
+    }
+
+    /// The name of the encoding, for the notices of text it can't read.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::Standard(encoding) => encoding.name(),
+            Self::Oem(_) => "a DOS code page",
+            Self::Utf8 => "UTF-8",
+        }
+    }
+
     fn from_number(number: u16) -> Option<Self> {
         // DOS 437, 850, 852, 861 and 865 go to dbase's OEM adapter; DOS 866 and the other pages
         // decoded here keep encoding_rs, because dbase's yore adapter is strict for those and can
@@ -159,26 +180,267 @@ fn page_name(page: u16) -> Option<&'static str> {
     })
 }
 
+/// The end of each note of text that isn't UTF-8: why a `.dbf`'s text was read as UTF-8, and what
+/// names another encoding. A `.cpg` comes before the code page, so text is read as UTF-8 only when
+/// no `.cpg` names another encoding RustGIS reads: the file names none, names UTF-8, or names a
+/// code page RustGIS can't decode.
+pub(crate) const NO_OTHER_ENCODING: &str = "no .cpg file names another encoding RustGIS reads (a .cpg file containing 950 names Big5)";
+
+/// The end of each note of text that isn't valid in `encoding`: for UTF-8, why the text was read as
+/// it ([`NO_OTHER_ENCODING`]); for another, that the file declares it.
+pub(crate) fn cause(encoding: &str) -> String {
+    if encoding == "UTF-8" { NO_OTHER_ENCODING.to_string() } else { format!("the .cpg or the .dbf's language driver declares {encoding}") }
+}
+
+/// What opening a `.dbf` says of its field names that aren't valid in its `encoding` ([`not_utf8`]),
+/// naming the first five by their column (from 1). `None` when there are none.
+pub(crate) fn not_utf8_names_note(columns: &[usize], encoding: &str) -> Option<String> {
+    let (what, label) = match columns.len() {
+        0 => return None,
+        1 => (format!("1 field name isn't valid {encoding} and was"), "field"),
+        n => (format!("{n} field names aren't valid {encoding} and were"), "fields"),
+    };
+    let named: Vec<String> = columns.iter().take(5).map(usize::to_string).collect();
+    let more = if columns.len() > 5 { format!(" and {} more", columns.len() - 5) } else { String::new() };
+    Some(format!(
+        "Shapefile: {what} read with U+FFFD in place of the bytes that can't be read, in {label} {}{more}; {}",
+        named.join(", "),
+        cause(encoding)
+    ))
+}
+
+/// What a `.dbf` holds that isn't valid in its `encoding`: which of its field names (by column, from
+/// 1), and for each column by its position how many of its text values. `dbase` reads them with
+/// U+FFFD in place of those bytes and doesn't say so. They are counted on the bytes, since U+FFFD in
+/// the text read can also be what the file holds. The values are the ones `dbase` decodes as text: a
+/// character (`C`) column's, up to a NUL, in the rows the header counts that aren't marked deleted
+/// (a row the read then leaves out as unreadable is counted too). It doesn't look at Cancel: it is
+/// one pass over a file that is read whole, so of at most [`crate::io::max_bytes`].
+pub(crate) fn not_utf8(dbf: &[u8], encoding: &DbfEncoding) -> (Vec<usize>, Vec<usize>) {
+    let lossy = |text: &[u8]| encoding.malformed(text.split(|b| *b == 0).next().unwrap_or(&[]));
+    let header_len = usize::from(u16::from_le_bytes([dbf.get(8).copied().unwrap_or(0), dbf.get(9).copied().unwrap_or(0)]));
+    let rows = dbf.get(4..8).and_then(|b| <[u8; 4]>::try_from(b).ok()).map_or(0, |b| u32::from_le_bytes(b) as usize);
+    let mut names = Vec::new();
+    // Each column's width, and whether its values are text.
+    let mut columns = Vec::new();
+    for start in (32..header_len.min(dbf.len())).step_by(32) {
+        let Some(d) = dbf.get(start..start + 32).filter(|d| d.first() != Some(&0x0D)) else { break };
+        if d.get(..11).is_some_and(lossy) {
+            names.push(columns.len() + 1);
+        }
+        columns.push((usize::from(d.get(16).copied().unwrap_or(0)), d.get(11) == Some(&b'C')));
+    }
+    let mut values = vec![0; columns.len()];
+    let row_len = 1 + columns.iter().map(|(len, _)| len).sum::<usize>();
+    for row in dbf.get(header_len..).unwrap_or(&[]).chunks_exact(row_len).take(rows) {
+        if row.first() == Some(&b'*') {
+            continue;
+        }
+        let mut at = 1;
+        for ((len, text), count) in columns.iter().zip(&mut values) {
+            if *text && row.get(at..at + len).is_some_and(lossy) {
+                *count += 1;
+            }
+            at += len;
+        }
+    }
+    (names, values)
+}
+
+/// Makes a `.dbf` header's last-update date (bytes 1–3: years since 1900, month, day) one `dbase`
+/// accepts, so a writer that leaves it zero doesn't make the file unreadable (#1272). Nothing reads
+/// the date, so a placeholder (1 January of its year) is all it takes; a real date is kept.
+pub(crate) fn readable_header_date(dbf: &mut [u8]) {
+    if let Some([month, day]) = dbf.get_mut(2..4)
+        && (!(1..=12).contains(month) || !(1..=31).contains(day))
+    {
+        (*month, *day) = (1, 1);
+    }
+}
+
+/// Marks a `.dbf`'s date (`D`) columns as character columns in its header, so `dbase` hands their
+/// bytes over as text for [`date`] to read instead of failing the whole record on a date it can't
+/// read (`20260230`, `00000000`). Returns the positions of those columns.
+pub(crate) fn dates_as_text(dbf: &mut [u8]) -> Vec<usize> {
+    retype_columns(dbf, b'D', b'C')
+}
+
+/// Marks a `.dbf`'s floating point (`F`) columns as numeric (`N`) in its header: `dbase` reads the
+/// same text of both, but an `F` column only as an `f32`, which rounds `1809878594` to
+/// `1809878656` and a latitude after its seventh digit. As `N` it is read as an `f64`, as GDAL does.
+pub(crate) fn floats_as_numeric(dbf: &mut [u8]) {
+    retype_columns(dbf, b'F', b'N');
+}
+
+/// The number of decimal places declared for each field in the `.dbf` header.
+pub(crate) fn field_decimals(dbf: &[u8]) -> Vec<u8> {
+    let header_len = usize::from(u16::from_le_bytes([dbf.get(8).copied().unwrap_or(0), dbf.get(9).copied().unwrap_or(0)]));
+    let mut decimals = Vec::new();
+    for start in (32..header_len.min(dbf.len())).step_by(32) {
+        if dbf.get(start).is_none_or(|b| *b == 0x0D) {
+            break;
+        }
+        decimals.push(dbf.get(start + 17).copied().unwrap_or(0));
+    }
+    decimals
+}
+
+/// Changes the type of the `.dbf` columns whose type letter is `from` (either case) to `to` in the
+/// header, and returns their positions among the columns.
+fn retype_columns(dbf: &mut [u8], from: u8, to: u8) -> Vec<usize> {
+    let header_len = usize::from(u16::from_le_bytes([dbf.get(8).copied().unwrap_or(0), dbf.get(9).copied().unwrap_or(0)]));
+    let mut changed = Vec::new();
+    for (k, start) in (32..header_len.min(dbf.len())).step_by(32).enumerate() {
+        if dbf.get(start).is_none_or(|b| *b == 0x0D) {
+            break;
+        }
+        if let Some(ty) = dbf.get_mut(start + 11)
+            && ty.eq_ignore_ascii_case(&from)
+        {
+            *ty = to;
+            changed.push(k);
+        }
+    }
+    changed
+}
+
+/// The records of a `.dbf` marked deleted (`*`), by their position, with their marks cleared so
+/// dBASE's reader gives every record the header counts, one for each shape: it passes over a
+/// deleted record, which would pair every later shape with the next record. Only the records the
+/// header counts that the file holds are looked at.
+pub(crate) fn take_deleted(dbf: &mut [u8]) -> Vec<usize> {
+    let le16 = |at: usize| Some(usize::from(u16::from_le_bytes([*dbf.get(at)?, *dbf.get(at + 1)?])));
+    let (Some(header_len), Some(record_len)) = (le16(8), le16(10)) else { return Vec::new() };
+    let count = dbf.get(4..8).and_then(|b| <[u8; 4]>::try_from(b).ok()).map_or(0, u32::from_le_bytes);
+    if record_len == 0 {
+        return Vec::new();
+    }
+    let Some(body) = dbf.get_mut(header_len..) else { return Vec::new() };
+    let mut deleted = Vec::new();
+    for (k, record) in body.chunks_exact_mut(record_len).take(usize::try_from(count).unwrap_or(usize::MAX)).enumerate() {
+        if let Some(flag) = record.first_mut().filter(|f| **f == b'*') {
+            *flag = b' ';
+            deleted.push(k);
+        }
+    }
+    deleted
+}
+
+/// A column of a `.dbf` as its header describes it: its name's bytes (up to the first NUL),
+/// type letter, length in bytes and decimals.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Column {
+    pub name: Vec<u8>,
+    pub ty: u8,
+    pub len: u8,
+    pub decimals: u8,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// A `.dbf` read as its bytes, without decoding a value: its columns, and each record that isn't
+/// marked deleted, as the bytes of each of its columns. `None` when the header doesn't describe
+/// records that fit the file.
+pub(crate) struct RawTable<'a> {
+    pub columns: Vec<Column>,
+    pub records: Vec<Vec<&'a [u8]>>,
+    /// The records marked deleted, which aren't among `records`.
+    pub deleted: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Reads `dbf` as a [`RawTable`]: what a rewrite is compared with, byte for byte, where a
+/// decoded value would hide a difference (text with leading spaces, which a read trims; a code
+/// page's bytes).
+pub(crate) fn raw_table(dbf: &[u8]) -> Option<RawTable<'_>> {
+    let le16 = |at: usize| Some(usize::from(u16::from_le_bytes([*dbf.get(at)?, *dbf.get(at + 1)?])));
+    let count = usize::try_from(u32::from_le_bytes(dbf.get(4..8)?.try_into().ok()?)).ok()?;
+    let (header_len, record_len) = (le16(8)?, le16(10)?);
+    let mut columns = Vec::new();
+    for start in (32..header_len.min(dbf.len())).step_by(32) {
+        let d = dbf.get(start..start + 32).filter(|d| d.first() != Some(&0x0D));
+        let Some(d) = d else { break };
+        let name = d.get(..11)?;
+        let name = name.get(..name.iter().position(|b| *b == 0).unwrap_or(11))?.to_vec();
+        columns.push(Column { name, ty: *d.get(11)?, len: *d.get(16)?, decimals: *d.get(17)? });
+    }
+    let width: usize = 1 + columns.iter().map(|c| usize::from(c.len)).sum::<usize>();
+    if width != record_len || record_len == 0 {
+        return None;
+    }
+    let body = dbf.get(header_len..)?;
+    // Every byte must belong to a counted record or the optional EOF marker. A rewrite
+    // must not discard uncounted records or other data left past the declared body.
+    let trailing = body.get(count.checked_mul(record_len)?..)?;
+    if !trailing.is_empty() && trailing != [0x1a] {
+        return None;
+    }
+    let (mut records, mut deleted) = (Vec::new(), 0);
+    for record in body.chunks_exact(record_len).take(count) {
+        if record.first() == Some(&b'*') {
+            deleted += 1;
+            continue;
+        }
+        let mut at = 1;
+        let mut values = Vec::with_capacity(columns.len());
+        for c in &columns {
+            let end = at + usize::from(c.len);
+            values.push(record.get(at..end)?);
+            at = end;
+        }
+        records.push(values);
+    }
+    Some(RawTable { columns, records, deleted })
+}
+
+/// A date (`D`) field's value, `YYYYMMDD`: `Ok(None)` when it's blank or zeros, as writers leave
+/// a date empty, and `Err(())` when it isn't a date (`20260230`, `2026-3-5`). A year padded with
+/// spaces (`   10101`, year 1, as GDAL writes it with `%4d`) is read as the zeros it stands for.
+pub(crate) fn date(field: &[u8]) -> std::result::Result<Option<crate::date::Date>, ()> {
+    let t = field.trim_ascii();
+    if t.is_empty() || t == b"00000000" || field.iter().all(|b| *b == 0) {
+        return Ok(None);
+    }
+    let padded: [u8; 8];
+    let t = match <[u8; 8]>::try_from(field) {
+        Ok(mut f) if t.len() != 8 => {
+            f.iter_mut().take(4).take_while(|b| **b == b' ').for_each(|b| *b = b'0');
+            padded = f;
+            &padded[..]
+        }
+        _ => t,
+    };
+    let [y0, y1, y2, y3, m0, m1, d0, d1] = *t else { return Err(()) };
+    let digits = |b: &[u8]| -> std::result::Result<i64, ()> {
+        b.iter().try_fold(0i64, |n, c| if c.is_ascii_digit() { Ok(n * 10 + i64::from(c - b'0')) } else { Err(()) })
+    };
+    crate::date::Date::from_ymd(digits(&[y0, y1, y2, y3])?, digits(&[m0, m1])?, digits(&[d0, d1])?).map(Some).ok_or(())
+}
+
 /// A code-page label should be a few bytes. Bound reads even for a hostile sidecar.
 pub(crate) fn read_cpg(path: &std::path::Path, notes: &mut Vec<String>) -> Option<Vec<u8>> {
     match try_read_cpg(path) {
         Ok(bytes) => bytes,
         Err(e) => {
-            notes.push(format!("Shapefile: could not read .cpg ({e}); using the .dbf code page, or UTF-8 if unavailable"));
+            notes.push(format!("could not read the .cpg ({e}); using the .dbf code page, or UTF-8 if unavailable"));
             None
         }
     }
 }
 
+/// Every ASCII case of the `.cpg` extension, the conventional spellings first: tried in turn,
+/// without scanning a potentially large directory, and the first there wins.
+pub(crate) const CPG_SPELLINGS: [&str; 8] = ["cpg", "CPG", "Cpg", "cPg", "cpG", "CPg", "CpG", "cPG"];
+
 fn try_read_cpg(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read;
-    // Check every ASCII case combination without scanning a potentially large directory.
-    // Prefer the conventional spellings if multiple sidecars exist.
-    for ext in ["cpg", "CPG", "Cpg", "cPg", "cpG", "CPg", "CpG", "cPG"] {
-        match std::fs::File::open(path.with_extension(ext)) {
+    for ext in CPG_SPELLINGS {
+        match crate::provenance::open(path.with_extension(ext)) {
             Ok(file) => {
                 let mut bytes = Vec::new();
-                file.take(MAX_CPG_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+                (&file).take(MAX_CPG_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+                if bytes.len() <= MAX_CPG_BYTES {
+                    crate::provenance::buffer(&path.with_extension(ext), &file, &bytes);
+                }
                 return Ok(Some(bytes));
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -191,6 +453,87 @@ fn try_read_cpg(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `.dbf` date is a day, blank or zeros are empty, and anything else isn't a date.
+    #[test]
+    fn dbf_dates() {
+        let day = |y, m, d| Ok(crate::date::Date::from_ymd(y, m, d));
+        assert_eq!(date(b"20260305"), day(2026, 3, 5));
+        assert_eq!(date(b"00010101"), day(1, 1, 1));
+        // GDAL pads the year with spaces (`%4d%02d%02d`).
+        assert_eq!(date(b"   10101"), day(1, 1, 1));
+        assert_eq!(date(b"  990101"), day(99, 1, 1));
+        assert_eq!(date(b" 9991231"), day(999, 12, 31));
+        for empty in [&b""[..], b"        ", b"00000000", b"\0\0\0\0\0\0\0\0"] {
+            assert_eq!(date(empty), Ok(None), "{empty:?}");
+        }
+        for bad in [
+            &b"20260230"[..],
+            b"20261301",
+            b"2026-3-5",
+            b"2026030",
+            b"202603050",
+            b"abcdefgh",
+            b"00000101",
+            b"0000    ",
+            b"  2 0101",
+            b"    0101",
+            b"   1 101",
+        ] {
+            assert_eq!(date(bad), Err(()), "{bad:?}");
+        }
+    }
+
+    /// Date columns are marked as character columns, and their positions given; others are kept.
+    #[test]
+    fn date_columns_read_as_text() {
+        let mut dbf = vec![0u8; 32 + 3 * 32 + 1];
+        dbf[8] = (dbf.len()) as u8;
+        for (k, ty) in b"CDd".iter().copied().enumerate() {
+            dbf[32 + k * 32 + 11] = ty;
+        }
+        dbf[32 + 3 * 32] = 0x0D;
+        assert_eq!(dates_as_text(&mut dbf), [1, 2]);
+        assert_eq!([dbf[43], dbf[75], dbf[107]], [b'C', b'C', b'C']);
+        assert!(dates_as_text(&mut [0u8; 10]).is_empty());
+    }
+
+    /// Float columns are marked as numeric columns; others, and what follows the header, are kept.
+    #[test]
+    fn float_columns_read_as_numeric() {
+        let mut dbf = vec![0u8; 32 + 3 * 32 + 2];
+        dbf[8] = (32 + 3 * 32 + 1) as u8;
+        for (k, ty) in b"FfC".iter().copied().enumerate() {
+            dbf[32 + k * 32 + 11] = ty;
+        }
+        dbf[32 + 3 * 32] = 0x0D;
+        dbf[32 + 3 * 32 + 1] = b'F';
+        floats_as_numeric(&mut dbf);
+        assert_eq!([dbf[43], dbf[75], dbf[107], dbf[129]], [b'N', b'N', b'C', b'F']);
+        floats_as_numeric(&mut [0u8; 10]);
+    }
+
+    /// A header date that isn't one gets a placeholder; a real one, and a header cut too short
+    /// to have one, are left as they are.
+    #[test]
+    fn a_header_date_that_isnt_one_is_made_readable() {
+        for (date, readable) in [
+            ([0, 0, 0], [0, 1, 1]),
+            ([126, 0, 1], [126, 1, 1]),
+            ([126, 11, 0], [126, 1, 1]),
+            ([126, 13, 1], [126, 1, 1]),
+            ([126, 2, 32], [126, 1, 1]),
+            ([126, 11, 1], [126, 11, 1]),
+            ([255, 12, 31], [255, 12, 31]),
+        ] {
+            let mut header = [3, date[0], date[1], date[2], 9];
+            readable_header_date(&mut header);
+            assert_eq!(header, [3, readable[0], readable[1], readable[2], 9], "{date:?}");
+        }
+        let mut short = [3, 0, 0];
+        readable_header_date(&mut short);
+        assert_eq!(short, [3, 0, 0]);
+    }
 
     /// Every language driver dbase's own table names and RustGIS read before keeps its code page:
     /// the table replaced dbase's, and must not lose or change one of its entries.
@@ -245,5 +588,102 @@ mod tests {
         let mut notes = Vec::new();
         encoding(None, 0xFF, &mut notes);
         assert_eq!(notes, ["Shapefile: unsupported .dbf code page 0xFF; using UTF-8"]);
+    }
+
+    /// Text is read as UTF-8 unless another encoding is named, with none named, with UTF-8 named
+    /// and with a code page that can't be decoded; a code page that is decoded is named by it.
+    #[test]
+    fn utf8_is_what_text_is_read_as_unless_another_encoding_is_named() {
+        let read = |cpg: Option<&[u8]>, ldid| encoding(cpg, ldid, &mut Vec::new()).name();
+        for (cpg, ldid) in [(None, 0), (None, 0xF0), (Some(b"UTF-8".as_slice()), 0x03), (Some(b"65001".as_slice()), 0), (None, 0x6C)] {
+            assert_eq!(read(cpg, ldid), "UTF-8");
+        }
+        assert_eq!(read(Some(b"950"), 0), "Big5");
+        assert_eq!(read(None, 0x4F), "Big5");
+        assert_eq!(read(None, 0x13), "Shift_JIS");
+        assert_eq!(read(None, 0x4D), "GBK");
+        assert_eq!(read(None, 0x4E), "EUC-KR");
+        assert_eq!(read(Some(b"1252"), 0xF0), "windows-1252");
+        assert_eq!(read(None, 0x01), "a DOS code page");
+    }
+
+    /// Bytes an encoding can't read are told by its own decoder: a lead byte with nothing after it,
+    /// or before a byte that can't follow it, in the multibyte pages; ASCII and whole characters
+    /// aren't. A DOS page gives every byte a character.
+    #[test]
+    fn bytes_that_cant_be_read_are_those_the_declared_decoder_replaces() {
+        let page = |cpg: &[u8]| encoding(Some(cpg), 0, &mut Vec::new());
+        let (sjis, big5, utf8) = (page(b"932"), page(b"950"), page(b"UTF-8"));
+        assert!(sjis.malformed(b"X\x82") && sjis.malformed(b"\x82 ") && sjis.malformed(b"\xff"));
+        assert!(!sjis.malformed(b"\x93\x8c\x8b\x9e") && !sjis.malformed(b"plain") && !sjis.malformed(b""));
+        assert!(big5.malformed(b"X\xa4") && !big5.malformed(b"\xa4\x40"));
+        // The same bytes are valid in one page and not in another.
+        assert!(utf8.malformed(b"\x93\x8c") && !sjis.malformed(b"\x93\x8c"));
+        assert!(!page(b"437").malformed(b"\xff") && !page(b"1252").malformed(b"\xff"));
+    }
+
+    /// A `.dbf` of these columns (name, type, width) and rows (the deletion flag, then the values).
+    fn table(columns: &[(&[u8], u8, u8)], rows: &[&[u8]]) -> Vec<u8> {
+        let header_len = 32 + 32 * columns.len() + 1;
+        let row_len = 1 + columns.iter().map(|c| usize::from(c.2)).sum::<usize>();
+        assert!(rows.iter().all(|row| row.len() == row_len), "rows of {row_len} bytes");
+        let mut dbf = vec![0u8; header_len];
+        dbf[4..8].copy_from_slice(&(rows.len() as u32).to_le_bytes());
+        dbf[8..10].copy_from_slice(&(header_len as u16).to_le_bytes());
+        for (k, (name, ty, len)) in columns.iter().enumerate() {
+            let at = 32 + 32 * k;
+            dbf[at..at + name.len()].copy_from_slice(name);
+            (dbf[at + 11], dbf[at + 16]) = (*ty, *len);
+        }
+        dbf[header_len - 1] = 0x0D;
+        rows.iter().for_each(|row| dbf.extend_from_slice(row));
+        dbf
+    }
+
+    /// Text that isn't UTF-8 is counted where `dbase` decodes text: the field names, and the
+    /// character values up to a NUL of the rows the header counts that aren't deleted.
+    #[test]
+    fn text_that_isnt_utf8_is_counted_in_names_and_character_values() {
+        let columns: &[(&[u8], u8, u8)] = &[(b"caf\xe9", b'C', 4), (b"day", b'D', 8), (b"n", b'N', 2), ("né".as_bytes(), b'C', 3)];
+        let rows: &[&[u8]] = &[
+            b" \xe9t\xe9 20260305 1abc",
+            // A date or a number that isn't one is said by its own notice.
+            b" abc \xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xe9  ",
+            b"*\xe9t\xe9 20260305 1\xe9bc",
+            // Bytes past a NUL aren't read; UTF-8 is.
+            b" a\0\xe9\xe9          \xc3\xa9 ",
+        ];
+        let mut dbf = table(columns, rows);
+        assert_eq!(not_utf8(&dbf, &DbfEncoding::Utf8), (vec![1], vec![1, 0, 0, 1]));
+        // A row past the header's count isn't read.
+        dbf.extend_from_slice(b" \xe9t\xe9 20260305 1\xe9bc");
+        assert_eq!(not_utf8(&dbf, &DbfEncoding::Utf8), (vec![1], vec![1, 0, 0, 1]));
+        // A file cut short counts the rows that are whole, and one without a header nothing.
+        let cut = dbf.len() - 2 * 18 - 1;
+        assert_eq!(not_utf8(&dbf[..cut], &DbfEncoding::Utf8), (vec![1], vec![1, 0, 0, 1]));
+        assert_eq!(not_utf8(&dbf[..cut - 18], &DbfEncoding::Utf8), (vec![1], vec![1, 0, 0, 0]));
+        assert_eq!(not_utf8(&dbf[..40], &DbfEncoding::Utf8), (Vec::new(), Vec::new()));
+        assert_eq!(not_utf8(&[], &DbfEncoding::Utf8), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn field_names_that_arent_utf8_are_said_with_their_columns() {
+        assert_eq!(not_utf8_names_note(&[], "UTF-8"), None);
+        let one = not_utf8_names_note(&[3], "UTF-8").unwrap();
+        assert!(one.starts_with("Shapefile: 1 field name isn't valid UTF-8 and was read with U+FFFD"), "{one}");
+        assert!(one.contains("in field 3;"), "{one}");
+        let two = not_utf8_names_note(&[3, 7], "UTF-8").unwrap();
+        assert!(two.starts_with("Shapefile: 2 field names aren't valid UTF-8 and were read with U+FFFD"), "{two}");
+        assert!(two.contains("in fields 3, 7;"), "{two}");
+        assert!(two.ends_with(NO_OTHER_ENCODING), "{two}");
+        let many = not_utf8_names_note(&[1, 2, 3, 4, 5, 6, 7], "UTF-8").unwrap();
+        assert!(many.contains("in fields 1, 2, 3, 4, 5 and 2 more;"), "{many}");
+        // A declared code page is named, as what the file declares.
+        assert_eq!(
+            not_utf8_names_note(&[1], "Big5").as_deref(),
+            Some(
+                "Shapefile: 1 field name isn't valid Big5 and was read with U+FFFD in place of the bytes that can't be read, in field 1; the .cpg or the .dbf's language driver declares Big5"
+            )
+        );
     }
 }

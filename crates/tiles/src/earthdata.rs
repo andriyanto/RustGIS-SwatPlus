@@ -9,8 +9,17 @@
 //! never to the login host (`urs.earthdata.nasa.gov`). The native fetcher asks for it at every
 //! hop, so a redirect that leaves those hosts (to a presigned CloudFront or S3 address) goes
 //! without it, and a redirect to the login host means the token was refused ([`is_login`]).
+//!
+//! A token may also be remembered on this computer ([`login`] with `remember`): it goes to the
+//! credential store [`set_secret_store`] gives (the desktop's keychain; the command line's and
+//! Python's when they opt in to saved secrets), at [`ACCOUNT`], and is read back the first time
+//! it is needed ([`restore`]): by a request to a data host, or by the app asking. An expired token
+//! is forgotten, there and in the store, and the user is asked for a new one ([`expired_forgotten`]).
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use rustgis_data::secrets::{Secret, SecretStore};
 
 use serde_json::{Value, json};
 
@@ -44,37 +53,296 @@ pub const PRESETS: &[(&str, &str)] = &[
 ];
 
 fn token_store() -> &'static Mutex<Option<String>> {
-    static T: std::sync::OnceLock<Mutex<Option<String>>> = std::sync::OnceLock::new();
-    T.get_or_init(Mutex::default)
+    static T: Mutex<Option<String>> = Mutex::new(None);
+    &T
 }
 
-/// Keeps an Earthdata Login token for the session (`None` forgets it). A token is one word of
-/// JWT characters; anything else is refused, so it can't break the header it goes in.
-pub fn set_token(token: Option<&str>) -> Result<(), String> {
-    let token = match token.map(str::trim).filter(|t| !t.is_empty()) {
-        None => None,
-        Some(t) => {
-            let t = t.strip_prefix("Bearer ").map(str::trim).unwrap_or(t);
-            if t.len() > MAX_TOKEN || !t.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.~+/=".contains(&b)) {
-                return Err(
-                    "an Earthdata Login token is one word of letters, digits and - _ . ~ + / = (Generate Token on Earthdata Login)".into(),
-                );
-            }
-            Some(t.to_string())
+/// Whether the token kept is the one [`restore`] read and nothing has set, replaced or forgotten
+/// it since. Never holds the token itself. Read and written only while holding the `token_store`
+/// lock, so it never disagrees with the token.
+static RESTORED: AtomicBool = AtomicBool::new(false);
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// An immutable, exact active-runtime token snapshot. It never reads the credential store
+/// or expires/restores a token, and has no formatting, serialization or raw-value accessors.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccountIdentity {
+    relevant: bool,
+    token: Option<String>,
+}
+
+impl AccountIdentity {
+    /// Checks exact active in-memory identity, without restoration or any other I/O.
+    /// An unavailable or poisoned relevant store returns false.
+    pub fn is_current(&self) -> bool {
+        identity_in(token_store(), self.relevant).is_ok_and(|current| *self == current)
+    }
+
+    /// Whether this identity, taken with no token, is stale only because the token remembered on
+    /// this computer was read since ([`restore`]) and nothing was given, forgotten or replaced
+    /// after. For telling a cancelled request why; it never makes a stale identity current.
+    pub fn restored_since(&self) -> bool {
+        if !self.relevant || self.token.is_some() {
+            return false;
         }
+        // Not `is_current`, which locks too: with no token in the snapshot, stale means one is active.
+        let token = lock(token_store());
+        RESTORED.load(Ordering::SeqCst) && token.is_some()
+    }
+}
+
+/// Snapshots the active token only; an unread remembered token remains unread.
+/// An unavailable or poisoned store is an error, never an absent token.
+pub fn account_identity() -> Result<AccountIdentity, String> {
+    identity_in(token_store(), true)
+}
+
+fn identity_in(store: &Mutex<Option<String>>, relevant: bool) -> Result<AccountIdentity, String> {
+    let token = if relevant { store.lock().map_err(|_| "active account store unavailable".to_string())?.clone() } else { None };
+    Ok(AccountIdentity { relevant, token })
+}
+
+/// Snapshots the token for a data host, including its absence. Public/search/login and
+/// unrelated addresses do not acquire a dependency on the active token.
+/// An unavailable or poisoned relevant store is an error, never an absent token.
+pub fn account_identity_for(url: &str) -> Result<AccountIdentity, String> {
+    identity_in(token_store(), is_data_host(url))
+}
+
+/// A token as given (`None` when blank): one word of JWT characters, without `Bearer `; anything
+/// else is refused, so it can't break the header it goes in.
+fn checked(token: &str) -> Result<Option<String>, String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Ok(None);
+    }
+    let t = token.strip_prefix("Bearer ").map(str::trim).unwrap_or(token);
+    if t.is_empty() || t.len() > MAX_TOKEN || !t.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.~+/=".contains(&b)) {
+        return Err("an Earthdata Login token is one word of letters, digits and - _ . ~ + / = (Generate Token on Earthdata Login)".into());
+    }
+    Ok(Some(t.to_string()))
+}
+
+/// Keeps an Earthdata Login token for the session (`None` forgets it), never remembering it on
+/// this computer: [`login`] and [`logout`] do that.
+pub fn set_token(token: Option<&str>) -> Result<(), String> {
+    let token = match token {
+        Some(t) => checked(t)?,
+        None => None,
     };
-    *token_store().lock().unwrap_or_else(|e| e.into_inner()) = token;
+    let mut kept = lock(token_store());
+    RESTORED.store(false, Ordering::SeqCst);
+    *kept = token;
     Ok(())
 }
 
 /// Whether a token is kept.
 pub fn has_token() -> bool {
-    token_store().lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    lock(token_store()).is_some()
+}
+
+/// Whether the token kept has expired, as its JWT says (it is forgotten when next used).
+pub fn token_expired() -> bool {
+    lock(token_store()).as_deref().is_some_and(|t| expired(t, now_secs()))
 }
 
 /// When the token kept expires (Unix seconds), as its JWT `exp` claim says, if it says.
 pub fn token_expiry() -> Option<i64> {
-    token_store().lock().unwrap_or_else(|e| e.into_inner()).as_deref().and_then(jwt_expiry)
+    lock(token_store()).as_deref().and_then(jwt_expiry)
+}
+
+fn now_secs() -> i64 {
+    web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Whether a token has expired at `now`, as its JWT says (a token that doesn't say never has).
+fn expired(token: &str, now: i64) -> bool {
+    jwt_expiry(token).is_some_and(|e| e <= now)
+}
+
+/// The credential store's account of the token remembered on this computer.
+pub const ACCOUNT: &str = "earthdata/token";
+/// [`login`] with `remember` where there is no credential store (the browser; the command line
+/// and Python unless they opt in to saved secrets).
+pub const NO_STORE: &str = "The token is kept for this session only: there is no credential store here to remember it in.";
+/// [`login`] with `remember`, when the credential store didn't keep the token.
+pub const NOT_REMEMBERED: &str = "The token is kept for this session, but the system's credential store didn't remember it.";
+/// The credential store didn't delete the token remembered earlier.
+pub const NOT_FORGOTTEN: &str = "The token remembered on this computer couldn't be deleted from the system's credential store.";
+
+/// The token remembered on this computer: where it is kept, and what this session knows of it.
+struct Remembered {
+    store: Mutex<Option<Arc<dyn SecretStore>>>,
+    /// Whether the store was read, or needn't be (a token was given or forgotten this session).
+    /// Held while the store is used, so one reading serves every request waiting for it.
+    read: Mutex<bool>,
+    /// Whether the store holds a token: the session's, unless a deletion failed.
+    kept: AtomicBool,
+    /// Whether an expired token was forgotten, until another is given or forgotten.
+    expired: AtomicBool,
+}
+
+static REMEMBERED: Remembered =
+    Remembered { store: Mutex::new(None), read: Mutex::new(false), kept: AtomicBool::new(false), expired: AtomicBool::new(false) };
+
+fn secret_store() -> Option<Arc<dyn SecretStore>> {
+    lock(&REMEMBERED.store).clone()
+}
+
+/// Gives the credential store a token is remembered in (the desktop's keychain; the command
+/// line's and Python's when they opt in to saved secrets). The app reads it at launch, the command
+/// line and Python when a command first needs it.
+pub fn set_secret_store(store: Option<Arc<dyn SecretStore>>) {
+    let mut read = lock(&REMEMBERED.read);
+    *lock(&REMEMBERED.store) = store;
+    *read = false;
+    REMEMBERED.kept.store(false, Ordering::SeqCst);
+}
+
+/// What reading the remembered token found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Restored {
+    /// Nothing new: no store, nothing remembered, already read, or a token given this session.
+    Nothing,
+    /// The remembered token is kept for the session.
+    Token,
+    /// The remembered token had expired, and was deleted: the user is to give a new one.
+    Expired,
+}
+
+/// Reads the token remembered on this computer, once per store given. A token given or forgotten
+/// this session first wins: the store then only tells whether it holds that token (another session
+/// of the process may have remembered it). An expired or damaged one is deleted. Reading may ask
+/// the system to unlock its store: the app calls this off the frame (requests to data hosts call
+/// it themselves, and the command line and Python before a command that names one binds its
+/// accounts).
+pub fn restore() -> Restored {
+    let mut read = lock(&REMEMBERED.read);
+    if *read {
+        return Restored::Nothing;
+    }
+    *read = true;
+    let Some(store) = secret_store() else { return Restored::Nothing };
+    let Ok(Some(secret)) = store.load(ACCOUNT) else { return Restored::Nothing };
+    let mut kept = lock(token_store());
+    if let Some(session) = kept.as_deref() {
+        REMEMBERED.kept.store(checked(secret.expose()).ok().flatten().as_deref() == Some(session), Ordering::SeqCst);
+        return Restored::Nothing;
+    }
+    match checked(secret.expose()) {
+        Ok(Some(token)) if !expired(&token, now_secs()) => {
+            RESTORED.store(true, Ordering::SeqCst);
+            *kept = Some(token);
+            REMEMBERED.kept.store(true, Ordering::SeqCst);
+            Restored::Token
+        }
+        Ok(Some(_)) => {
+            drop(kept);
+            REMEMBERED.kept.store(store.delete(ACCOUNT).is_err(), Ordering::SeqCst);
+            REMEMBERED.expired.store(true, Ordering::SeqCst);
+            Restored::Expired
+        }
+        // Damaged: of no use to anyone.
+        _ => {
+            drop(kept);
+            REMEMBERED.kept.store(store.delete(ACCOUNT).is_err(), Ordering::SeqCst);
+            Restored::Nothing
+        }
+    }
+}
+
+/// Forgets the session's token when it has expired, and the remembered one with it; whether it
+/// did. The user is then asked for a new one ([`expired_forgotten`]).
+pub fn forget_if_expired() -> bool {
+    let mut read = lock(&REMEMBERED.read);
+    let gone = {
+        let mut token = lock(token_store());
+        let gone = token.as_deref().is_some_and(|t| expired(t, now_secs()));
+        if gone {
+            RESTORED.store(false, Ordering::SeqCst);
+            *token = None;
+        }
+        gone
+    };
+    if gone {
+        *read = true;
+        REMEMBERED.expired.store(true, Ordering::SeqCst);
+        if REMEMBERED.kept.load(Ordering::SeqCst)
+            && let Some(store) = secret_store()
+        {
+            REMEMBERED.kept.store(store.delete(ACCOUNT).is_err(), Ordering::SeqCst);
+        }
+    }
+    gone
+}
+
+/// Keeps `token` for the session and, with `remember`, on this computer, replacing the one
+/// remembered before; without it, a token remembered before is deleted. Returns a warning when
+/// the token is kept for the session only against the wish to remember it, or the one remembered
+/// before couldn't be deleted.
+pub fn login(token: &str, remember: bool) -> Result<Option<&'static str>, String> {
+    let token = checked(token)?.ok_or("token is required (Earthdata Login › Generate Token)")?;
+    let mut read = lock(&REMEMBERED.read);
+    *read = true;
+    REMEMBERED.expired.store(false, Ordering::SeqCst);
+    {
+        let mut kept = lock(token_store());
+        RESTORED.store(false, Ordering::SeqCst);
+        *kept = Some(token.clone());
+    }
+    let Some(store) = secret_store() else { return Ok(remember.then_some(NO_STORE)) };
+    let kept = REMEMBERED.kept.load(Ordering::SeqCst);
+    if remember && store.save(ACCOUNT, &Secret::new(token)).is_ok() {
+        REMEMBERED.kept.store(true, Ordering::SeqCst);
+        return Ok(None);
+    }
+    // Not to be remembered, or the store didn't take it: the one remembered before goes, here or
+    // in another run, so the next run doesn't bring it back.
+    let deleted = store.delete(ACCOUNT);
+    REMEMBERED.kept.store(kept && deleted.is_err(), Ordering::SeqCst);
+    match deleted {
+        _ if remember => Ok(Some(NOT_REMEMBERED)),
+        Ok(()) => Ok(None),
+        // A system without a credential store had nowhere to keep one.
+        Err(rustgis_data::secrets::SecretError::Unavailable(_)) if !kept => Ok(None),
+        Err(_) => Ok(Some(NOT_FORGOTTEN)),
+    }
+}
+
+/// Forgets the token, for the session and on this computer; `Err` when the credential store
+/// couldn't delete it.
+pub fn logout() -> Result<(), &'static str> {
+    let mut read = lock(&REMEMBERED.read);
+    *read = true;
+    REMEMBERED.expired.store(false, Ordering::SeqCst);
+    {
+        let mut kept = lock(token_store());
+        RESTORED.store(false, Ordering::SeqCst);
+        *kept = None;
+    }
+    // Deleted even when this session didn't read it: forgetting is asked for. A system without
+    // a credential store had nowhere to keep one, unless this session saw it there.
+    match secret_store().map_or(Ok(()), |store| store.delete(ACCOUNT)) {
+        Ok(()) => {
+            REMEMBERED.kept.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+        Err(rustgis_data::secrets::SecretError::Unavailable(_)) if !REMEMBERED.kept.load(Ordering::SeqCst) => Ok(()),
+        Err(_) => Err(NOT_FORGOTTEN),
+    }
+}
+
+/// Whether a token is remembered on this computer.
+pub fn is_remembered() -> bool {
+    REMEMBERED.kept.load(Ordering::SeqCst)
+}
+
+/// Whether an expired token was forgotten, and no other was given since.
+pub fn expired_forgotten() -> bool {
+    REMEMBERED.expired.load(Ordering::SeqCst) && !has_token()
 }
 
 /// A JWT's `exp` claim: its middle part, base64url-decoded, is JSON.
@@ -145,11 +413,15 @@ pub fn is_login(url: &str) -> bool {
 }
 
 /// The `Authorization` header a request to `url` carries: the token kept, for a data host only.
+/// The first such request reads the token remembered on this computer ([`restore`]); an expired
+/// token is forgotten instead of sent ([`forget_if_expired`]).
 pub fn authorization(url: &str) -> Option<String> {
     if !is_data_host(url) {
         return None;
     }
-    token_store().lock().unwrap_or_else(|e| e.into_inner()).as_deref().map(|t| format!("Bearer {t}"))
+    restore();
+    forget_if_expired();
+    lock(token_store()).as_deref().map(|t| format!("Bearer {t}"))
 }
 
 /// The message for a request Earthdata Login turned away.
@@ -158,6 +430,10 @@ pub fn refused_message(url: &str) -> String {
     if has_token() {
         format!(
             "{file}: Earthdata Login didn't accept the token (it may have expired, or the dataset needs its EULA accepted on Earthdata Login)"
+        )
+    } else if expired_forgotten() {
+        format!(
+            "{file}: the Earthdata Login token expired and was forgotten: give a new one in Web Data › NASA Earthaccess (or earthdata.login)"
         )
     } else {
         format!(
@@ -516,25 +792,17 @@ pub fn granule_json(g: &Granule) -> Value {
 /// `YYYY-MM-DD` of a Unix time.
 pub fn date_of(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
-    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
+    let (y, m, d) = rustgis_data::date::civil_from_days(days);
     format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// Today's date and the one `days` before it (`YYYY-MM-DD`).
 pub fn recent(days: i64) -> (String, String) {
-    let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let now = now_secs();
     (date_of(now - days * 86_400), date_of(now))
 }
 
+#[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,28 +846,233 @@ mod tests {
     }
 
     #[test]
-    fn the_token_is_kept_checked_and_given_where_it_may_go() {
-        // One test owns the store, so tests running at once don't race on it.
+    fn the_token_is_kept_checked_remembered_and_given_where_it_may_go() {
+        // One test owns the token and its store, so tests running at once don't race on them.
+        session_tokens();
+        remembered_tokens();
+        set_secret_store(None);
+        set_token(None).unwrap();
+    }
+
+    /// A JWT whose payload is {"exp":4000000000} (2096).
+    const LASTING: &str = "eyJhbGciOiJSUzI1NiJ9.eyJleHAiOjQwMDAwMDAwMDB9.c2ln";
+    /// A JWT whose payload is {"exp":1000000000} (2001).
+    const EXPIRED: &str = "eyJhbGciOiJSUzI1NiJ9.eyJleHAiOjEwMDAwMDAwMDB9.c2ln";
+    const DATA: &str = "https://data.lpdaac.earthdatacloud.nasa.gov/a.tif";
+
+    fn session_tokens() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<AccountIdentity>();
+        let irrelevant = account_identity_for(CMR).unwrap();
+        let absent = account_identity_for(DATA).unwrap();
         assert!(set_token(Some("bad token with spaces")).is_err());
         assert!(set_token(Some("a\r\nX-Evil: 1")).is_err());
-        // A JWT whose payload is {"exp":1800000000}.
-        let jwt = "eyJhbGciOiJSUzI1NiJ9.eyJleHAiOjE4MDAwMDAwMDB9.c2ln";
-        set_token(Some(&format!("Bearer {jwt}"))).unwrap();
+        set_token(Some(&format!("Bearer {LASTING}"))).unwrap();
+        assert!(!absent.is_current());
+        let identity = account_identity_for(DATA).unwrap();
+        assert!(identity.is_current() && identity == account_identity().unwrap());
+        set_token(Some("synthetic-replacement")).unwrap();
+        assert!(!identity.is_current() && irrelevant.is_current());
+        assert!(account_identity_for(DATA).unwrap().is_current());
+        set_token(Some(LASTING)).unwrap();
         assert!(has_token());
-        assert_eq!(token_expiry(), Some(1_800_000_000));
-        assert_eq!(authorization("https://data.lpdaac.earthdatacloud.nasa.gov/a.tif").as_deref(), Some(format!("Bearer {jwt}").as_str()));
+        assert_eq!(token_expiry(), Some(4_000_000_000));
+        assert!(!token_expired());
+        assert_eq!(authorization(DATA).as_deref(), Some(format!("Bearer {LASTING}").as_str()));
         assert_eq!(authorization("https://urs.earthdata.nasa.gov/a"), None);
         assert_eq!(authorization("https://d1.cloudfront.net/a.tif"), None);
         assert!(refused_message("https://x.earthdata.nasa.gov/a/b.tif?x=1").starts_with("b.tif: Earthdata Login didn't accept"));
         set_token(None).unwrap();
         assert!(!has_token());
-        assert_eq!(authorization("https://data.lpdaac.earthdatacloud.nasa.gov/a.tif"), None);
+        assert_eq!(authorization(DATA), None);
         assert!(refused_message("https://x/b.tif").contains("asks for an Earthdata Login token"));
         // Not a JWT: kept, with no expiry.
         set_token(Some("abc")).unwrap();
         assert_eq!(token_expiry(), None);
+        assert!(!token_expired());
+        // An expired token is kept until it is next used; the ribbon's key shows it isn't usable.
+        set_token(Some(EXPIRED)).unwrap();
+        assert!(has_token() && token_expired());
         set_token(Some("  ")).unwrap();
         assert!(!has_token());
+    }
+
+    #[test]
+    fn permission_transport_earthdata_capture_fails_closed() {
+        let store = Arc::new(Mutex::new(None));
+        let worker = store.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _locked = worker.lock().unwrap();
+                panic!("synthetic poison");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(identity_in(&store, true).is_err());
+        assert!(identity_in(&store, false).is_ok(), "unrelated URLs don't depend on this store");
+    }
+
+    /// A new run of the app: nothing typed yet, the store not read.
+    fn relaunch(store: &Arc<rustgis_data::secrets::MemorySecrets>) {
+        set_token(None).unwrap();
+        set_secret_store(Some(store.clone()));
+    }
+
+    fn stored(store: &rustgis_data::secrets::MemorySecrets) -> Option<String> {
+        store.load(ACCOUNT).unwrap().map(|s| s.expose().to_string())
+    }
+
+    fn remembered_tokens() {
+        use rustgis_data::secrets::{MemorySecrets, SecretError};
+        let store = Arc::new(MemorySecrets::new());
+
+        // Reading the remembered token is told apart from a login, a replacement or a logout.
+        relaunch(&store);
+        login(LASTING, true).unwrap();
+        relaunch(&store);
+        let before = account_identity().unwrap();
+        assert!(!before.restored_since());
+        assert_eq!(restore(), Restored::Token);
+        assert!(!before.is_current() && before.restored_since());
+        assert!(account_identity().unwrap().is_current(), "a snapshot taken after the read is current");
+        for change in [|| drop(login("synthetic-typed", false)), || set_token(Some("synthetic-typed")).unwrap()] {
+            relaunch(&store);
+            login(LASTING, true).unwrap();
+            relaunch(&store);
+            let before = account_identity().unwrap();
+            assert_eq!(restore(), Restored::Token);
+            change();
+            assert!(!before.is_current() && !before.restored_since());
+        }
+        // A logout puts the identity back as it was: current, with nothing to say.
+        relaunch(&store);
+        login(LASTING, true).unwrap();
+        relaunch(&store);
+        let before = account_identity().unwrap();
+        assert_eq!(restore(), Restored::Token);
+        logout().unwrap();
+        assert!(before.is_current() && !before.restored_since());
+        // Login or logout first leaves nothing to restore.
+        relaunch(&store);
+        let before = account_identity().unwrap();
+        login(LASTING, true).unwrap();
+        assert_eq!(restore(), Restored::Nothing);
+        assert!(!before.is_current() && !before.restored_since());
+        relaunch(&store);
+
+        // Remembered, then read back by the next run's first request to a data host only.
+        relaunch(&store);
+        assert_eq!(login(LASTING, true), Ok(None));
+        assert_eq!(stored(&store).as_deref(), Some(LASTING));
+        assert!(is_remembered());
+        relaunch(&store);
+        assert!(!has_token() && !is_remembered());
+        let unread = account_identity_for(DATA).unwrap();
+        assert!(unread.is_current() && !has_token(), "snapshotting never restores the remembered token");
+        assert_eq!(authorization("https://cmr.earthdata.nasa.gov/search"), None);
+        assert!(!has_token(), "a public host doesn't read the store");
+        assert_eq!(authorization(DATA).as_deref(), Some(format!("Bearer {LASTING}").as_str()));
+        assert!(!unread.is_current(), "restoration changes active identity just like replacement");
+        assert!(is_remembered());
+        assert_eq!(restore(), Restored::Nothing, "read once");
+
+        // The store given again (another Python session opting in) still knows the token is
+        // remembered; a token the store doesn't hold isn't.
+        set_secret_store(Some(store.clone()));
+        assert!(!is_remembered());
+        assert_eq!(restore(), Restored::Nothing);
+        assert!(is_remembered() && has_token());
+        set_token(Some("typed")).unwrap();
+        set_secret_store(Some(store.clone()));
+        restore();
+        assert!(!is_remembered());
+        assert_eq!(stored(&store).as_deref(), Some(LASTING), "nothing is deleted");
+        set_token(Some(LASTING)).unwrap();
+
+        // A token given without Remember replaces the remembered one, which is deleted.
+        assert_eq!(login("other", false), Ok(None));
+        assert_eq!(stored(&store), None);
+        assert!(!is_remembered());
+        assert_eq!(authorization(DATA).as_deref(), Some("Bearer other"));
+
+        // So does one given in a run that hasn't read the store yet (the command line, say).
+        store.save(ACCOUNT, &Secret::new(LASTING)).unwrap();
+        relaunch(&store);
+        assert_eq!(login("other", false), Ok(None));
+        assert_eq!(stored(&store), None);
+        relaunch(&store);
+        assert_eq!(restore(), Restored::Nothing);
+        assert!(!has_token(), "the next run doesn't bring the old token back");
+
+        // A token typed before the store is read wins over the remembered one.
+        store.save(ACCOUNT, &Secret::new(LASTING)).unwrap();
+        relaunch(&store);
+        set_token(Some("typed")).unwrap();
+        assert_eq!(restore(), Restored::Nothing);
+        assert_eq!(authorization(DATA).as_deref(), Some("Bearer typed"));
+
+        // Logging out deletes the remembered token, even unread.
+        relaunch(&store);
+        assert_eq!(logout(), Ok(()));
+        assert_eq!(stored(&store), None);
+        assert!(!has_token() && !is_remembered());
+
+        // An expired remembered token is deleted at reading, and the user asked for a new one.
+        store.save(ACCOUNT, &Secret::new(EXPIRED)).unwrap();
+        relaunch(&store);
+        assert_eq!(restore(), Restored::Expired);
+        assert_eq!(stored(&store), None);
+        assert!(!has_token() && expired_forgotten());
+        assert!(refused_message(DATA).contains("expired and was forgotten"), "{}", refused_message(DATA));
+        login(LASTING, false).unwrap();
+        assert!(!expired_forgotten());
+
+        // One that expires during the session is forgotten instead of sent.
+        assert_eq!(login(EXPIRED, true), Ok(None));
+        assert_eq!(authorization(DATA), None);
+        assert_eq!(stored(&store), None);
+        assert!(!has_token() && !is_remembered() && expired_forgotten());
+
+        // A damaged value is deleted, never sent.
+        store.save(ACCOUNT, &Secret::new("not a\r\ntoken")).unwrap();
+        relaunch(&store);
+        assert_eq!(restore(), Restored::Nothing);
+        assert_eq!(stored(&store), None);
+        assert!(!has_token());
+
+        // A store that won't take a new token doesn't keep the old one either: the next run
+        // doesn't bring back the token this one replaced.
+        struct RefusesSaves(Arc<MemorySecrets>);
+        impl SecretStore for RefusesSaves {
+            fn load(&self, account: &str) -> Result<Option<Secret>, SecretError> {
+                self.0.load(account)
+            }
+            fn save(&self, _: &str, _: &Secret) -> Result<(), SecretError> {
+                Err(SecretError::Denied)
+            }
+            fn delete(&self, account: &str) -> Result<(), SecretError> {
+                self.0.delete(account)
+            }
+        }
+        relaunch(&store);
+        assert_eq!(login(LASTING, true), Ok(None));
+        set_secret_store(Some(Arc::new(RefusesSaves(store.clone()))));
+        assert_eq!(login("other", true), Ok(Some(NOT_REMEMBERED)));
+        assert_eq!(stored(&store), None);
+        assert!(!is_remembered());
+
+        // Without a store, or with one that refuses, the token is kept for the session and says so.
+        set_secret_store(None);
+        assert_eq!(login(LASTING, true), Ok(Some(NO_STORE)));
+        assert!(has_token() && !is_remembered());
+        assert_eq!(logout(), Ok(()));
+        set_secret_store(Some(Arc::new(MemorySecrets::failing(SecretError::Denied))));
+        assert_eq!(login(LASTING, true), Ok(Some(NOT_REMEMBERED)));
+        assert!(has_token() && !is_remembered());
+        assert_eq!(logout(), Err(NOT_FORGOTTEN));
+        assert!(!has_token());
+        assert!(login("", true).is_err() && login("two words", true).is_err());
     }
 
     #[test]

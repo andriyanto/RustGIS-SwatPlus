@@ -54,13 +54,13 @@ fn colours_for(n: usize) -> Vec<Rgba> {
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("rain.style", "Rain Intensity Classes", WHERE, style).when(super::raster::need_raster).params(
+        C::new("rain.style", "Rain Intensity Classes", WHERE, style).roles(&[]).effects(crate::policy::Effects::NONE).when(super::raster::need_raster).params(
             r#"{"layer"?, "scale"?: "hourly" (mm/h, default for a rain rate) | "daily" (mm a day, default for 24 h or more) | "custom", "breaks"?: [numbers] (custom: the lightest class's lower bound, then each class's upper bound), "band"?: 1..} — draws a rain grid in BMKG's intensity classes: hourly ringan 1–5, sedang 5–10, lebat 10–20, sangat lebat over 20 mm/h; daily ringan 0.5–20, sedang 20–50, lebat 50–100, sangat lebat 100–150, ekstrem over 150 mm; less is not drawn"#,
         ),
-        C::new("rain.accumulate", "Accumulate Rain", WHERE, accumulate).params(
+        C::new("rain.accumulate", "Accumulate Rain", WHERE, accumulate).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"layers": [rain rate layers (mm/h) on one grid], "hours"?: number (each grid's share when the names don't give times; default 1), "ignoreMissing"?: bool (a cell missing in one grid counts as no rain there, default false: missing), "name"?: text} — adds up hourly rain grids into the rain over the period (mm), as a new layer drawn in rain classes"#,
         ),
-        C::new("rain.zonal", "Rain per Zone", WHERE, zonal).params(
+        C::new("rain.zonal", "Rain per Zone", WHERE, zonal).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"layers": [rain layers], "zones": polygon layer (e.g. subbasins), "field"?: the zones' id field (default: their row number), "name"?: output table} — each zone's mean rain from each layer, weighted by the share of each cell the zone covers, as a table (zone, layer, time, mean, coverage)"#,
         ),
     ]
@@ -282,7 +282,7 @@ fn accumulate(s: &mut Session, p: &Value) -> CmdResult {
         (Some(a), Some(b)) => format!("{} {}–{} UTC ({} h)", product(&grids[0].0), civil(a), &civil(b)[11..], fmt_hours(hours)),
         _ => format!("Rain ({} h)", fmt_hours(hours)),
     };
-    let name = super::imagery::name(p, label);
+    let name = super::imagery::name(p, label)?;
     let mut out = rustgis_analysis::rasterops::derive(&first, &name, vec![sum])?;
     if let Some(b) = out.bands.first_mut() {
         b.name = format!("Rain (mm, {} h)", fmt_hours(hours));
@@ -379,9 +379,9 @@ fn zonal(s: &mut Session, p: &Value) -> CmdResult {
     let zones: Vec<(String, Vec<Vec<Vec<rustgis_data::Coord>>>)> = zl
         .dataset
         .features
-        .iter()
+        .rows()
         .enumerate()
-        .filter_map(|(row, ft)| match &ft.geometry {
+        .filter_map(|(row, ft)| match ft.geometry() {
             Some(Geometry::Polygon(p)) => {
                 let id = field.map(|fi| zl.dataset.value(row, fi).to_string()).unwrap_or_else(|| (row + 1).to_string());
                 Some((id, p.clone()))
@@ -393,7 +393,7 @@ fn zonal(s: &mut Session, p: &Value) -> CmdResult {
         return Err(format!("{zname} has no polygons"));
     }
     let mut ds = Dataset::new(
-        super::imagery::name(p, format!("Rain per zone ({zname})")),
+        super::imagery::name(p, format!("Rain per zone ({zname})"))?,
         GeometryType::None,
         vec![
             Field::new("zone", FieldType::Text),
@@ -440,7 +440,6 @@ fn zonal(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use rustgis_data::Coord;

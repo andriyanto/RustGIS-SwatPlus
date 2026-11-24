@@ -9,8 +9,10 @@
 //! and BYBLOCK resolved), linetype, text and elevation.
 //!
 //! A drawing doesn't say its coordinate system: one given converts the coordinates to
-//! longitude/latitude; without one they're kept as they are and the report says so. Binary DXF and
-//! DWG aren't read here.
+//! longitude/latitude; without one they're kept as they are and the report says so. Its text is
+//! UTF-8 (2007 and later), else the ANSI code page its header names (`$DWGCODEPAGE`), else Latin-1,
+//! which a report names. Whether the contents of its blocks (图块) are drawn is the caller's
+//! choice ([`Options::blocks`]). Binary DXF and DWG aren't read here.
 //!
 //! The file is hostile: counts are bounded, block nesting is cut off (and cycles refused), and an
 //! entity that can't be read is skipped and counted.
@@ -56,13 +58,24 @@ const MAX_TOTAL_VERTICES: usize = if cfg!(test) {
 /// Segments of a full circle.
 const CIRCLE: f64 = 72.0;
 
-/// What to read: the coordinate system of a drawing (which never says), one DXF layer only, and
-/// whether the layouts' entities (paper space) are drawn with the model's.
-#[derive(Clone, Copy, Debug, Default)]
+/// What to read: the coordinate system of a drawing (which never says), one DXF layer only,
+/// whether the layouts' entities (paper space) are drawn with the model's, and whether the
+/// contents of inserted blocks (图块) are drawn.
+#[derive(Clone, Copy, Debug)]
 pub struct Options<'a> {
     pub crs: Option<Crs>,
     pub layer: Option<&'a str>,
     pub paper_space: bool,
+    /// Whether INSERTs and DIMENSIONs draw the contents of the blocks they place. `false` leaves
+    /// them out, counted in the report; what the drawing draws without blocks is kept.
+    pub blocks: bool,
+}
+
+impl Default for Options<'_> {
+    fn default() -> Self {
+        // A drawing's blocks are part of what it draws: drawn unless asked otherwise.
+        Options { crs: None, layer: None, paper_space: false, blocks: true }
+    }
 }
 
 pub fn is_dxf_name(name: &str) -> bool {
@@ -75,13 +88,107 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes.starts_with(b"AutoCAD Binary DXF")
 }
 
-/// The text of a drawing: UTF-8 (AutoCAD 2007 and later), else one byte per character (the ANSI
-/// code pages of older drawings, read as Latin-1).
-fn decode(bytes: &[u8]) -> Cow<'_, str> {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(bytes.iter().map(|&b| char::from(b)).collect()),
+/// The text of a drawing and what had to be assumed to read it: UTF-8 (AutoCAD 2007 and later),
+/// else the ANSI code page its header names ([`code_page`], the `$DWGCODEPAGE` of older drawings),
+/// else Latin-1.
+fn decode(bytes: &[u8]) -> (Cow<'_, str>, Option<String>) {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return (Cow::Borrowed(s), None);
     }
+    let page = code_page(bytes);
+    let Some(encoding) = page.as_deref().and_then(encoding_of) else {
+        let said = match page.as_deref() {
+            Some(p) => format!(
+                "the drawing's text isn't UTF-8 and its code page '{p}' isn't one RustGIS knows: it is read as Latin-1, so non-ASCII text (such as layer names) may be wrong"
+            ),
+            None => "the drawing's text isn't UTF-8 and it names no code page ($DWGCODEPAGE): it is read as Latin-1, so non-ASCII text (such as layer names) may be wrong".to_string(),
+        };
+        return (Cow::Owned(bytes.iter().map(|&b| char::from(b)).collect()), Some(said));
+    };
+    let (text, _) = encoding.decode_without_bom_handling(bytes);
+    let lost = text.matches('\u{fffd}').count();
+    let said = (lost > 0).then(|| {
+        format!(
+            "{lost} characters of the drawing's text couldn't be read as {} (its code page): they are drawn as a replacement character",
+            encoding.name()
+        )
+    });
+    (text, said)
+}
+
+/// The code page a drawing's header gives (`$DWGCODEPAGE`, such as `ANSI_936`), read from the
+/// first megabyte: a header is small, and a file that isn't a drawing isn't searched further.
+/// Blank code lines are skipped without consuming a value, as in [`records`].
+fn code_page(bytes: &[u8]) -> Option<String> {
+    let head = bytes.get(..bytes.len().min(1 << 20)).unwrap_or(bytes);
+    let mut lines = head.split(|&b| b == b'\n');
+    let (mut section, mut header, mut page) = (false, false, false);
+    while let Some(code) = lines.next() {
+        let code = trim_ascii(code);
+        if code.is_empty() {
+            continue;
+        }
+        let value = trim_ascii(lines.next()?);
+        let code = std::str::from_utf8(code).ok().and_then(|s| s.parse::<u16>().ok());
+        match code {
+            Some(999) => continue, // Comments never name a section or header variable.
+            Some(0) => {
+                section = value.eq_ignore_ascii_case(b"SECTION");
+                header = false;
+                page = false;
+            }
+            Some(2) if section => {
+                header = value.eq_ignore_ascii_case(b"HEADER");
+                section = false;
+            }
+            Some(9) if header => page = value.eq_ignore_ascii_case(b"$DWGCODEPAGE"),
+            Some(3) if header && page => return Some(String::from_utf8_lossy(value).into_owned()),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// ASCII whitespace off both ends of a line of raw bytes.
+fn trim_ascii(mut b: &[u8]) -> &[u8] {
+    while let Some((first, rest)) = b.split_first() {
+        if !first.is_ascii_whitespace() {
+            break;
+        }
+        b = rest;
+    }
+    while let Some((last, rest)) = b.split_last() {
+        if !last.is_ascii_whitespace() {
+            break;
+        }
+        b = rest;
+    }
+    b
+}
+
+/// The encoding a DXF code page names (`ANSI_936` is GBK, `ANSI_950` Big5, …): the ANSI and DOS
+/// code pages AutoCAD writes in `$DWGCODEPAGE`.
+fn encoding_of(page: &str) -> Option<&'static encoding_rs::Encoding> {
+    use encoding_rs::*;
+    Some(match page.trim().to_ascii_uppercase().as_str() {
+        "ANSI_874" => WINDOWS_874,
+        "ANSI_932" => SHIFT_JIS,
+        "ANSI_936" => GBK,
+        "ANSI_949" => EUC_KR,
+        "ANSI_950" => BIG5,
+        "ANSI_1250" => WINDOWS_1250,
+        "ANSI_1251" => WINDOWS_1251,
+        "ANSI_1252" => WINDOWS_1252,
+        "ANSI_1253" => WINDOWS_1253,
+        "ANSI_1254" => WINDOWS_1254,
+        "ANSI_1255" => WINDOWS_1255,
+        "ANSI_1256" => WINDOWS_1256,
+        "ANSI_1257" => WINDOWS_1257,
+        "ANSI_1258" => WINDOWS_1258,
+        "ANSI_65001" => UTF_8,
+        "ANSI_866" | "DOS866" => IBM866,
+        _ => return None,
+    })
 }
 
 type Pair<'a> = (i32, &'a str);
@@ -94,11 +201,12 @@ struct Record<'a> {
 
 /// The records of a drawing, in order, up to a line that isn't a group code (a stray line, or a
 /// pairing shifted by a missing one): what came before is kept, and the line is said.
-fn records(text: &str) -> (Vec<Record<'_>>, Option<String>) {
+fn records(text: &str) -> Result<(Vec<Record<'_>>, Option<String>)> {
     let mut lines = text.lines();
     let mut out: Vec<Record> = Vec::new();
     let mut line = 0usize;
     while let Some(code) = lines.next() {
+        crate::progress::step(code.len() + 1)?;
         line += 1;
         let code = code.trim();
         if code.is_empty() {
@@ -106,10 +214,11 @@ fn records(text: &str) -> (Vec<Record<'_>>, Option<String>) {
         }
         let Some(value) = lines.next() else { break };
         line += 1;
+        crate::progress::step(value.len() + 1)?;
         let value = value.trim_end_matches('\r');
         let Ok(code) = code.parse::<i32>() else {
             let said = format!("line {}: '{}' isn't a DXF group code: the drawing is read up to it", line - 1, crate::io::cut(code, 40));
-            return (out, Some(said));
+            return Ok((out, Some(said)));
         };
         if code == 0 {
             let kind = value.trim();
@@ -121,7 +230,7 @@ fn records(text: &str) -> (Vec<Record<'_>>, Option<String>) {
             r.groups.push((code, value));
         }
     }
-    (out, None)
+    Ok((out, None))
 }
 
 /// A point in three dimensions.
@@ -221,8 +330,16 @@ impl Xf {
         Xf([[1.0, 0.0, 0.0, t[0]], [0.0, 1.0, 0.0, t[1]], [0.0, 0.0, 1.0, t[2]]])
     }
 
+    /// Quadrantal angles have exact axes; tiny trigonometric residuals would invent Z variation
+    /// when an insert tilts the rotated plane. Other angles retain their original calculation.
     fn rotate_z(degrees: f64) -> Xf {
-        let (s, c) = degrees.to_radians().sin_cos();
+        let (s, c) = match degrees.rem_euclid(360.0) {
+            0.0 => (0.0, 1.0),
+            90.0 => (1.0, 0.0),
+            180.0 => (0.0, -1.0),
+            270.0 => (-1.0, 0.0),
+            _ => degrees.to_radians().sin_cos(),
+        };
         Xf([[c, -s, 0.0, 0.0], [s, c, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]])
     }
 
@@ -235,11 +352,25 @@ impl Xf {
 #[derive(Clone, Debug)]
 enum Shape {
     Point(P3),
-    Line(Vec<P3>),
+    /// `constant_z` records a construction proof, not a comparison of rounded samples.
+    Line {
+        points: Vec<P3>,
+        constant_z: bool,
+    },
     Polygon(Vec<P3>),
-    /// A hatch's boundary paths: rings, holes found by nesting.
-    Rings(Vec<Vec<P3>>),
+    /// A hatch's boundary paths or polyface faces. The flag proves constant source height.
+    Rings {
+        rings: Vec<Vec<P3>>,
+        constant_z: bool,
+    },
     Insert(Insert),
+}
+
+impl Shape {
+    /// A line without a sampled-curve construction proof; compare its heights exactly.
+    fn line(points: Vec<P3>) -> Self {
+        Self::Line { points, constant_z: false }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -275,6 +406,27 @@ struct Ent {
     /// In paper space (a layout), not the model (group 67).
     paper: bool,
     shape: Shape,
+    loss: PathLoss,
+}
+
+/// Items omitted while recovering an entity; charged only to surviving placements.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PathLoss {
+    unreadable_vertices: u64,
+    capped: u64,
+    missing_y: u64,
+    invalid_z: u64,
+    short_rings: u64,
+}
+
+impl PathLoss {
+    fn add(&mut self, other: Self) {
+        self.unreadable_vertices = self.unreadable_vertices.saturating_add(other.unreadable_vertices);
+        self.capped = self.capped.saturating_add(other.capped);
+        self.missing_y = self.missing_y.saturating_add(other.missing_y);
+        self.invalid_z = self.invalid_z.saturating_add(other.invalid_z);
+        self.short_rings = self.short_rings.saturating_add(other.short_rings);
+    }
 }
 
 /// The entity kinds drawn, by name (the strings features keep).
@@ -312,10 +464,15 @@ fn sweep(s: f64, e: f64, full: f64) -> f64 {
     if d.is_finite() && d > 1e-12 { d } else { full }
 }
 
+/// The sampled segments of an arc, shared by drawing and omitted-coordinate counts.
+fn arc_steps(sweep: f64) -> usize {
+    ((sweep.abs() / TAU) * CIRCLE).ceil().clamp(2.0, CIRCLE) as usize
+}
+
 /// Points of an arc around `c` of radius `r` from angle `a0` sweeping `sweep` (radians), in the
 /// plane z = `z`.
 fn arc(c: [f64; 2], r: f64, a0: f64, sweep: f64, z: f64) -> Vec<P3> {
-    let n = ((sweep.abs() / TAU) * CIRCLE).ceil().clamp(2.0, CIRCLE) as usize;
+    let n = arc_steps(sweep);
     (0..=n)
         .map(|k| {
             let a = a0 + sweep * k as f64 / n as f64;
@@ -324,15 +481,24 @@ fn arc(c: [f64; 2], r: f64, a0: f64, sweep: f64, z: f64) -> Vec<P3> {
         .collect()
 }
 
+/// The sweep of a bulge, or no arc for the reader's straight and degenerate cases.
+fn bulge_sweep(chord: f64, b: f64) -> Option<f64> {
+    if b.abs() < 1e-9 || chord <= 0.0 || !b.is_finite() || b.abs() > 1e6 { None } else { Some(4.0 * b.atan()) }
+}
+
+/// The number of coordinates after a segment's start, without allocating its sampled points.
+fn bulge_steps(p1: P3, p2: P3, b: f64) -> usize {
+    let (dx, dy) = (p2[0] - p1[0], p2[1] - p1[1]);
+    let chord = (dx * dx + dy * dy).sqrt();
+    bulge_sweep(chord, b).map_or(1, arc_steps)
+}
+
 /// The points of a bulged segment after `p1`, up to `p2` (a bulge is the tangent of a quarter of
 /// the arc's angle; positive turns counter-clockwise).
 fn bulge(p1: P3, p2: P3, b: f64) -> Vec<P3> {
     let (dx, dy) = (p2[0] - p1[0], p2[1] - p1[1]);
     let chord = (dx * dx + dy * dy).sqrt();
-    if b.abs() < 1e-9 || chord <= 0.0 || !b.is_finite() || b.abs() > 1e6 {
-        return vec![p2];
-    }
-    let theta = 4.0 * b.atan();
+    let Some(theta) = bulge_sweep(chord, b) else { return vec![p2] };
     let r = chord / (2.0 * (theta / 2.0).sin()).abs();
     let h = (chord / 2.0) * (1.0 - b * b) / (2.0 * b);
     let (ux, uy) = (dx / chord, dy / chord);
@@ -346,22 +512,26 @@ fn bulge(p1: P3, p2: P3, b: f64) -> Vec<P3> {
     pts
 }
 
-/// Vertices with their bulges as a path: each bulged segment drawn as an arc; closed back to the
-/// first vertex when `closed`.
-fn bulged(vs: &[(P3, f64)], closed: bool) -> Vec<P3> {
+/// Vertices with their bulges as a path, closed back to the first vertex when `closed`.
+/// Preserve the existing sampled prefix and count every coordinate in unvisited segments.
+fn bulged(vs: &[(P3, f64)], closed: bool, omitted: &mut u64) -> Option<Vec<P3>> {
     let mut out: Vec<P3> = Vec::new();
-    let Some(first) = vs.first() else { return out };
+    let Some(first) = vs.first() else { return Some(out) };
     out.push(first.0);
     let n = vs.len();
     let segs = if closed { n } else { n.saturating_sub(1) };
     for i in 0..segs {
+        if i % 1024 == 0 {
+            crate::progress::check().ok()?;
+        }
         let (Some(a), Some(b)) = (vs.get(i), vs.get((i + 1) % n)) else { break };
-        out.extend(bulge(a.0, b.0, a.1));
         if out.len() > MAX_VERTICES {
-            break;
+            *omitted += bulge_steps(a.0, b.0, a.1) as u64;
+        } else {
+            out.extend(bulge(a.0, b.0, a.1));
         }
     }
-    out
+    Some(out)
 }
 
 /// A B-spline's points (de Boor), rational when `weights` are given: `samples` along it.
@@ -478,20 +648,30 @@ fn plain_text(s: &str) -> String {
 }
 
 /// Reads one record as an entity (POLYLINE with its VERTEX records). `None` when it can't be read.
-fn entity(kind: &'static str, g: &G, vertices: &[Record]) -> Option<Shape> {
+/// Cancellation also stops the Option-based builders; the caller checks and propagates it.
+fn entity(kind: &'static str, g: &G, vertices: &[Record], loss: &mut PathLoss) -> Option<Shape> {
     let ocs = Xf::ocs(g.extrusion());
     Some(match kind {
         "POINT" => Shape::Point(g.pt(10)?),
-        "LINE" => Shape::Line(vec![g.pt(10)?, g.pt(11)?]),
+        "LINE" => Shape::line(vec![g.pt(10)?, g.pt(11)?]),
         "LWPOLYLINE" => {
             let z = g.f(38).unwrap_or(0.0);
             let mut vs: Vec<(P3, f64)> = Vec::new();
-            for (c, v) in g.p {
+            let mut tail = false;
+            for (index, (c, v)) in g.p.iter().enumerate() {
+                if index % 1024 == 0 {
+                    crate::progress::check().ok()?;
+                }
+                if vs.len() >= MAX_VERTICES && (*c == 10 || tail) {
+                    if *c == 10 {
+                        // Count source vertices at the cap, including ones whose coordinates cannot be read.
+                        loss.capped += 1;
+                        tail = true;
+                    }
+                    continue;
+                }
                 match c {
                     10 => {
-                        if vs.len() >= MAX_VERTICES {
-                            break;
-                        }
                         vs.push(([num(v)?, f64::NAN, z], 0.0));
                     }
                     20 => vs.last_mut()?.0[1] = num(v)?,
@@ -503,8 +683,8 @@ fn entity(kind: &'static str, g: &G, vertices: &[Record]) -> Option<Shape> {
                 return None;
             }
             let closed = g.i(70).unwrap_or(0) & 1 == 1;
-            let pts: Vec<P3> = bulged(&vs, closed).into_iter().map(|p| ocs.apply(p)).collect();
-            Shape::Line(pts)
+            let pts: Vec<P3> = bulged(&vs, closed, &mut loss.capped)?.into_iter().map(|p| ocs.apply(p)).collect();
+            Shape::line(pts)
         }
         "POLYLINE" => {
             let flags = g.i(70).unwrap_or(0);
@@ -518,34 +698,46 @@ fn entity(kind: &'static str, g: &G, vertices: &[Record]) -> Option<Shape> {
             let three_d = flags & 8 != 0;
             let z = g.pt(10).map(|p| p[2]).unwrap_or(0.0);
             let curved = flags & 6 != 0;
-            let vs: Vec<(P3, f64)> = vertices
-                .iter()
-                .take(MAX_VERTICES)
-                .filter_map(|v| {
-                    let vg = G { p: &v.groups };
-                    let vf = vg.i(70).unwrap_or(0);
-                    // A smoothed polyline's frame (control) points aren't on the curve.
-                    if curved && vf & 16 != 0 {
-                        return None;
-                    }
-                    let mut p = vg.pt(10)?;
-                    if !three_d {
-                        p[2] = z;
-                    }
-                    Some((p, vg.f(42).unwrap_or(0.0)))
-                })
-                .collect();
-            let pts = bulged(&vs, flags & 1 == 1);
-            Shape::Line(if three_d { pts } else { pts.into_iter().map(|p| ocs.apply(p)).collect() })
+            let mut vs = Vec::new();
+            for (index, v) in vertices.iter().enumerate() {
+                if index % 1024 == 0 {
+                    crate::progress::check().ok()?;
+                }
+                let vg = G { p: &v.groups };
+                let vf = vg.i(70).unwrap_or(0);
+                // A smoothed polyline's frame (control) points aren't on the curve.
+                if curved && vf & 16 != 0 {
+                    continue;
+                }
+                if index >= MAX_VERTICES {
+                    loss.capped += 1;
+                    continue;
+                }
+                let Some(mut p) = vg.pt(10) else {
+                    loss.unreadable_vertices += 1;
+                    continue;
+                };
+                let invalid_z = three_d && vg.s(30).is_some() && vg.f(30).is_none();
+                if invalid_z {
+                    loss.invalid_z += 1;
+                    continue;
+                }
+                if !three_d {
+                    p[2] = z;
+                }
+                vs.push((p, vg.f(42).unwrap_or(0.0)));
+            }
+            let pts = bulged(&vs, flags & 1 == 1, &mut loss.capped)?;
+            Shape::line(if three_d { pts } else { pts.into_iter().map(|p| ocs.apply(p)).collect() })
         }
         "CIRCLE" => {
             let (c, r) = (g.pt(10)?, g.f(40)?);
-            Shape::Line(arc([c[0], c[1]], r, 0.0, TAU, c[2]).into_iter().map(|p| ocs.apply(p)).collect())
+            Shape::line(arc([c[0], c[1]], r, 0.0, TAU, c[2]).into_iter().map(|p| ocs.apply(p)).collect())
         }
         "ARC" => {
             let (c, r) = (g.pt(10)?, g.f(40)?);
             let (s, e) = (g.f(50).unwrap_or(0.0), g.f(51).unwrap_or(360.0));
-            Shape::Line(
+            Shape::line(
                 arc([c[0], c[1]], r, s.rem_euclid(360.0).to_radians(), sweep(s, e, 360.0).to_radians(), c[2])
                     .into_iter()
                     .map(|p| ocs.apply(p))
@@ -559,7 +751,7 @@ fn entity(kind: &'static str, g: &G, vertices: &[Record]) -> Option<Shape> {
             let s = g.f(41).unwrap_or(0.0).rem_euclid(TAU);
             let e = s + sweep(s, g.f(42).unwrap_or(TAU).rem_euclid(TAU), TAU);
             let n = (((e - s) / TAU) * CIRCLE).ceil().clamp(2.0, CIRCLE) as usize;
-            Shape::Line(
+            Shape::line(
                 (0..=n)
                     .map(|k| {
                         let t = s + (e - s) * k as f64 / n as f64;
@@ -591,13 +783,32 @@ fn entity(kind: &'static str, g: &G, vertices: &[Record]) -> Option<Shape> {
                 }
                 last = Some(*c);
             }
-            ctrl.retain(|p| p[1].is_finite());
-            fit.retain(|p| p[1].is_finite());
+            let mut missing_ctrl = 0u64;
+            let mut missing_fit = 0u64;
+            ctrl.retain(|p| {
+                let keep = p[1].is_finite();
+                missing_ctrl += u64::from(!keep);
+                keep
+            });
+            fit.retain(|p| {
+                let keep = p[1].is_finite();
+                missing_fit += u64::from(!keep);
+                keep
+            });
             let samples = (ctrl.len() * 8).clamp(16, 4000);
             match spline(degree, &knots, &ctrl, &weights, samples) {
-                Some(pts) => Shape::Line(pts),
-                None if fit.len() >= 2 => Shape::Line(fit),
-                None if ctrl.len() >= 2 => Shape::Line(ctrl),
+                Some(points) => {
+                    loss.missing_y += missing_ctrl;
+                    Shape::Line { points, constant_z: ctrl.first().is_some_and(|first| ctrl.iter().all(|p| p[2] == first[2])) }
+                }
+                None if fit.len() >= 2 => {
+                    loss.missing_y += missing_fit;
+                    Shape::line(fit)
+                }
+                None if ctrl.len() >= 2 => {
+                    loss.missing_y += missing_ctrl;
+                    Shape::line(ctrl)
+                }
                 None => return None,
             }
         }
@@ -614,7 +825,7 @@ fn entity(kind: &'static str, g: &G, vertices: &[Record]) -> Option<Shape> {
                     pts.push([x, y, 0.0]);
                 }
             }
-            Shape::Line(pts)
+            Shape::line(pts)
         }
         "TEXT" | "ATTRIB" | "ATTDEF" => {
             // The second alignment point when the text is justified, else the first.
@@ -646,9 +857,10 @@ fn entity(kind: &'static str, g: &G, vertices: &[Record]) -> Option<Shape> {
             ring.push(a);
             Shape::Polygon(ring)
         }
-        "HATCH" => {
-            hatch(g).map(|rings| Shape::Rings(rings.into_iter().map(|r| r.into_iter().map(|p| ocs.apply(p)).collect()).collect()))?
-        }
+        "HATCH" => Shape::Rings {
+            rings: hatch(g, loss)?.into_iter().map(|r| r.into_iter().map(|p| ocs.apply(p)).collect()).collect(),
+            constant_z: ocs.0[2][0] == 0.0 && ocs.0[2][1] == 0.0,
+        },
         "INSERT" => Shape::Insert(Insert {
             block: g.s(2)?.trim().to_string(),
             at: g.pt(10).unwrap_or([0.0; 3]),
@@ -698,7 +910,7 @@ fn entity(kind: &'static str, g: &G, vertices: &[Record]) -> Option<Shape> {
             {
                 pts.push(f);
             }
-            Shape::Line(pts)
+            Shape::line(pts)
         }
         _ => return None,
     })
@@ -736,7 +948,7 @@ fn dimension(g: &G) -> (Vec<Shape>, Option<String>) {
         Some(t) if !t.is_empty() && t != "<>" => plain_text(&t.replace("<>", &measure(length))),
         _ => measure(length),
     };
-    let mut shapes = vec![Shape::Line(vec![a, b]), Shape::Line(vec![p13, a]), Shape::Line(vec![p14, b])];
+    let mut shapes = vec![Shape::line(vec![a, b]), Shape::line(vec![p13, a]), Shape::line(vec![p14, b])];
     if let Some(t) = g.pt(11) {
         shapes.push(Shape::Point(t));
     }
@@ -775,7 +987,7 @@ fn polyface(vertices: &[Record]) -> Option<Shape> {
             }
         }
     }
-    (!faces.is_empty()).then_some(Shape::Rings(faces))
+    (!faces.is_empty()).then_some(Shape::Rings { rings: faces, constant_z: false })
 }
 
 /// A cursor over a record's groups, read in order (HATCH boundary paths).
@@ -816,7 +1028,7 @@ impl Cursor<'_, '_> {
 
 /// A HATCH's boundary paths as rings (polyline paths with bulges, or edges: lines, arcs, elliptic
 /// arcs and splines), in its object coordinates at its elevation.
-fn hatch(g: &G) -> Option<Vec<Vec<P3>>> {
+fn hatch(g: &G, loss: &mut PathLoss) -> Option<Vec<Vec<P3>>> {
     let z = g.pt(10).map(|p| p[2]).unwrap_or(0.0);
     let mut cur = Cursor { p: g.p, at: 0 };
     let paths = cur.count(91)?;
@@ -834,7 +1046,7 @@ fn hatch(g: &G) -> Option<Vec<Vec<P3>>> {
                 let b = if has_bulge { peek_bulge(&mut cur) } else { 0.0 };
                 vs.push(([p[0], p[1], z], b));
             }
-            ring = bulged(&vs, true);
+            ring = bulged(&vs, true, &mut loss.capped)?;
         } else {
             let edges = cur.count(93)?;
             for _ in 0..edges {
@@ -902,6 +1114,8 @@ fn hatch(g: &G) -> Option<Vec<Vec<P3>>> {
         }
         if ring.len() >= 3 {
             rings.push(ring);
+        } else {
+            loss.short_rings += 1;
         }
     }
     (!rings.is_empty()).then_some(rings)
@@ -946,14 +1160,23 @@ struct Drawing {
     bad: usize,
 }
 
+/// The magnitude of an ACI color index (negative means its layer is off). The one signed
+/// integer without a positive counterpart is malformed and must not overflow while reading.
+/// When encountered in a layer definition or drawn entity it refuses the drawing rather than
+/// substituting a color. Skipped paper-space entities and unused blocks are not color-validated.
+fn color_magnitude(color: i64) -> Result<i64> {
+    color.checked_abs().ok_or_else(|| DataError::Format("DXF color index has no representable positive value".into()))
+}
+
 /// Reads the records of each section.
-fn drawing(records: &[Record]) -> Drawing {
+fn drawing(records: &[Record]) -> Result<Drawing> {
     let mut d = Drawing { layers: HashMap::new(), blocks: HashMap::new(), entities: Vec::new(), unread: BTreeMap::new(), bad: 0 };
     let mut section = "";
     // The block being read: name, base point, entities.
     let mut block: Option<(String, P3, Vec<Ent>)> = None;
     let mut i = 0usize;
     while let Some(r) = records.get(i) {
+        crate::progress::check()?;
         i += 1;
         let g = G { p: &r.groups };
         match r.kind {
@@ -971,7 +1194,7 @@ fn drawing(records: &[Record]) -> Drawing {
         match section {
             "TABLES" if r.kind == "LAYER" => {
                 if let Some(name) = g.s(2).map(str::trim) {
-                    let color = g.i(62).map(|c| c.abs()).unwrap_or(7);
+                    let color = g.i(62).map(color_magnitude).transpose()?.unwrap_or(7);
                     d.layers.insert(name.to_ascii_lowercase(), (name.to_string(), color, g.s(6).map(str::trim).unwrap_or("").to_string()));
                 }
             }
@@ -1012,7 +1235,11 @@ fn drawing(records: &[Record]) -> Drawing {
                     *d.unread.entry(r.kind.to_string()).or_insert(0) += 1;
                     continue;
                 };
-                let Some(shape) = entity(kind, &g, vertices) else {
+                let mut loss = PathLoss::default();
+                let shape = entity(kind, &g, vertices, &mut loss);
+                // Entity builders use Option for malformed data; cancellation must escape as an error.
+                crate::progress::check()?;
+                let Some(shape) = shape else {
                     d.bad += 1;
                     continue;
                 };
@@ -1036,6 +1263,7 @@ fn drawing(records: &[Record]) -> Drawing {
                     height: if matches!(kind, "TEXT" | "MTEXT" | "ATTRIB" | "ATTDEF") { g.f(40) } else { None },
                     rotation: if matches!(kind, "TEXT" | "MTEXT" | "ATTRIB" | "ATTDEF") { g.f(50) } else { None },
                     shape,
+                    loss,
                 };
                 match &mut block {
                     Some((_, _, ents)) if section == "BLOCKS" => ents.push(e),
@@ -1046,7 +1274,7 @@ fn drawing(records: &[Record]) -> Drawing {
             _ => {}
         }
     }
-    d
+    Ok(d)
 }
 
 /// What an inserted entity takes from the INSERT placing it.
@@ -1066,6 +1294,10 @@ struct Out {
     lines: Dataset,
     polygons: Dataset,
     count: usize,
+    /// One flag per emitted feature, by geometry layer; counted only after CRS filtering.
+    varying_z: [Vec<bool>; 3],
+    /// Sparse recovery metadata, indexed before CRS filtering in each geometry layer.
+    losses: [Vec<(usize, PathLoss)>; 3],
     capped: bool,
     cut: usize,
     /// Entity placements visited so far ([`MAX_STEPS`]), and whether the budget ran out.
@@ -1075,6 +1307,8 @@ struct Out {
     trimmed: bool,
     /// Paper-space entities left out.
     paper: usize,
+    /// Inserted blocks (and dimensions) left out because `blocks` was false.
+    blocked: usize,
     /// Coordinates placed so far ([`MAX_TOTAL_VERTICES`]), and whether the budget ran out.
     vertices: usize,
     vertex_capped: bool,
@@ -1105,22 +1339,44 @@ fn finite(ps: &[P3]) -> bool {
     ps.iter().all(|p| p.iter().all(|v| v.is_finite()))
 }
 
+/// Whether retained, placed vertices have heights the single elevation attribute cannot hold.
+/// Compare computed heights exactly after entity and block transforms, which may flatten source Z.
+/// Tilted entity axes or rotated/nested block placements can introduce sub-resolution roundoff;
+/// report those computed differences conservatively. A tolerance can hide exact source-height loss.
+/// Only a construction and placement proof rules out sampled variation without such a tolerance.
+fn has_varying_z<'a>(mut points: impl Iterator<Item = &'a P3>, first: Option<P3>, constant_z: bool) -> bool {
+    let Some(first) = first else { return false };
+    // Only a source construction and placement proof can dismiss sampled roundoff. A numeric
+    // tolerance could instead hide real, exactly representable height differences.
+    !constant_z && points.any(|p| p[2] != first[2])
+}
+
 /// Draws entities through `xf` (a block's placement), into `out`.
-fn emit(d: &Drawing, ents: &[Ent], xf: &Xf, from: Inherit, depth: usize, stack: &mut Vec<String>, opts: &Options, out: &mut Out) {
+fn emit(
+    d: &Drawing,
+    ents: &[Ent],
+    xf: &Xf,
+    from: Inherit,
+    depth: usize,
+    stack: &mut Vec<String>,
+    opts: &Options,
+    out: &mut Out,
+) -> Result<()> {
     for e in ents {
+        crate::progress::check()?;
         if out.vertex_capped {
-            return;
+            return Ok(());
         }
         if out.count >= MAX_FEATURES {
             out.capped = true;
-            return;
+            return Ok(());
         }
         // Every placement costs a step, drawn or not: nested arrays of empty or filtered blocks
         // can't make the walk run on.
         out.steps += 1;
         if out.steps > MAX_STEPS {
             out.overworked = true;
-            return;
+            return Ok(());
         }
         // A layout's entities (paper space) aren't the model's: drawn only when asked for.
         if depth == 0 && e.paper && !opts.paper_space {
@@ -1145,9 +1401,15 @@ fn emit(d: &Drawing, ents: &[Ent], xf: &Xf, from: Inherit, depth: usize, stack: 
         let color = match e.color {
             0 => from.color.unwrap_or(7),
             256 => table.map(|(_, c, _)| *c).unwrap_or(7),
-            c => c.abs(),
+            c => color_magnitude(c)?,
         };
         if let Shape::Insert(ins) = &e.shape {
+            // The contents of blocks (图块) are drawn only when asked for: left out, they are
+            // counted, not walked.
+            if !opts.blocks && (ins.fallback.is_empty() || d.blocks.contains_key(&ins.block.to_ascii_lowercase())) {
+                out.blocked += 1;
+                continue;
+            }
             // Block names are case-insensitive, in the cycle check too.
             let key = ins.block.to_ascii_lowercase();
             if depth >= MAX_DEPTH || stack.contains(&key) {
@@ -1171,9 +1433,10 @@ fn emit(d: &Drawing, ents: &[Ent], xf: &Xf, from: Inherit, depth: usize, stack: 
                             rotation: None,
                             paper: e.paper,
                             shape: s.clone(),
+                            loss: PathLoss::default(),
                         })
                         .collect();
-                    emit(d, &drawn, xf, from, depth + 1, stack, opts, out);
+                    emit(d, &drawn, xf, from, depth + 1, stack, opts, out)?;
                     continue;
                 }
                 out.cut += 1;
@@ -1206,11 +1469,11 @@ fn emit(d: &Drawing, ents: &[Ent], xf: &Xf, from: Inherit, depth: usize, stack: 
                         block: Some(ins.block.as_str()),
                         paper: from.paper || e.paper,
                     };
-                    emit(d, inner, &xf.then(&local), inner_from, depth + 1, stack, opts, out);
+                    emit(d, inner, &xf.then(&local), inner_from, depth + 1, stack, opts, out)?;
                     if out.capped || out.overworked || out.vertex_capped {
                         stack.pop();
                         out.copies = outer;
-                        return;
+                        return Ok(());
                     }
                 }
             }
@@ -1227,34 +1490,52 @@ fn emit(d: &Drawing, ents: &[Ent], xf: &Xf, from: Inherit, depth: usize, stack: 
         // inserted many times can't fill the memory.
         let n = match &e.shape {
             Shape::Point(_) => 1,
-            Shape::Line(ps) | Shape::Polygon(ps) => ps.len(),
-            Shape::Rings(rs) => rs.iter().map(Vec::len).sum(),
+            Shape::Line { points: ps, .. } | Shape::Polygon(ps) => ps.len(),
+            Shape::Rings { rings: rs, .. } => rs.iter().map(Vec::len).sum(),
             Shape::Insert(_) => 0,
         };
         if out.vertices.saturating_add(n) > MAX_TOTAL_VERTICES {
             out.vertex_capped = true;
-            return;
+            return Ok(());
         }
         out.vertices += n;
+        let preserves_z = xf.0[2][0] == 0.0 && xf.0[2][1] == 0.0;
         let tr = |ps: &[P3]| -> Vec<P3> { ps.iter().map(|p| xf.apply(*p)).collect() };
-        let (geometry, first, target) = match &e.shape {
+        let mut loss = e.loss;
+        let (geometry, first, target, varying_z) = match &e.shape {
             Shape::Point(p) => {
                 let p = xf.apply(*p);
-                (finite(&[p]).then(|| Geometry::Point(xy(p))), Some(p), 0)
+                (finite(&[p]).then(|| Geometry::Point(xy(p))), Some(p), 0, false)
             }
-            Shape::Line(ps) => {
+            Shape::Line { points: ps, constant_z } => {
                 let ps = tr(ps);
                 let ok = ps.len() >= 2 && finite(&ps);
-                (ok.then(|| Geometry::Line(vec![ps.iter().map(|p| xy(*p)).collect()])), ps.first().copied(), 1)
+                (
+                    ok.then(|| Geometry::Line(vec![ps.iter().map(|p| xy(*p)).collect()])),
+                    ps.first().copied(),
+                    1,
+                    has_varying_z(ps.iter(), ps.first().copied(), *constant_z && preserves_z),
+                )
             }
             Shape::Polygon(ps) => {
                 let ps = tr(ps);
                 let ok = ps.len() >= 4 && finite(&ps);
-                (ok.then(|| Geometry::Polygon(vec![vec![ps.iter().map(|p| xy(*p)).collect()]])), ps.first().copied(), 2)
+                (
+                    ok.then(|| Geometry::Polygon(vec![vec![ps.iter().map(|p| xy(*p)).collect()]])),
+                    ps.first().copied(),
+                    2,
+                    has_varying_z(ps.iter(), ps.first().copied(), false),
+                )
             }
-            Shape::Rings(rings) => {
+            Shape::Rings { rings, constant_z } => {
                 let rings: Vec<Vec<P3>> = rings.iter().map(|r| tr(r)).filter(|r| finite(r)).collect();
                 let first = rings.first().and_then(|r| r.first()).copied();
+                if e.kind == "HATCH" {
+                    loss.short_rings += rings
+                        .iter()
+                        .filter(|r| r.len() < 4 && (r.len() < 3 || r.first().map(|p| xy(*p)) == r.last().map(|p| xy(*p))))
+                        .count() as u64;
+                }
                 let g = if e.kind == "POLYLINE" {
                     // A polyface mesh: a polygon per face.
                     let polys: Vec<Vec<Vec<Coord>>> =
@@ -1263,7 +1544,14 @@ fn emit(d: &Drawing, ents: &[Ent], xf: &Xf, from: Inherit, depth: usize, stack: 
                 } else {
                     crate::mapinfo::region(rings.iter().map(|r| r.iter().map(|p| xy(*p)).collect()).collect())
                 };
-                (g, first, 2)
+                // Count only rings the geometry builder keeps: polyfaces need four vertices;
+                // region() also closes open rings, then requires four. Keep the original first
+                // point above: its Z is the elevation attribute even if its ring was omitted.
+                let kept = rings.iter().filter(|r| {
+                    r.len() >= 4 || (e.kind != "POLYLINE" && r.len() == 3 && r.first().map(|p| xy(*p)) != r.last().map(|p| xy(*p)))
+                });
+                let varying = has_varying_z(kept.flatten(), first, *constant_z && preserves_z);
+                (g, first, 2, varying)
             }
             Shape::Insert(_) => continue,
         };
@@ -1288,9 +1576,18 @@ fn emit(d: &Drawing, ents: &[Ent], xf: &Xf, from: Inherit, depth: usize, stack: 
             1 => &mut out.lines,
             _ => &mut out.polygons,
         };
+        if loss != PathLoss::default()
+            && let Some(losses) = out.losses.get_mut(target)
+        {
+            losses.push((ds.features.len(), loss));
+        }
         ds.push_next(Some(geometry), attrs);
+        if let Some(flags) = out.varying_z.get_mut(target) {
+            flags.push(varying_z);
+        }
         out.count += 1;
     }
+    Ok(())
 }
 
 /// Reads a DXF drawing into its points, lines and polygons layers (those with features).
@@ -1299,41 +1596,49 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     if is_binary(bytes) {
         return Err(DataError::Unsupported(format!("{file_name}: a binary DXF (save it as an ASCII DXF to read it here)")));
     }
-    let text = decode(bytes);
-    let (recs, cut_short) = records(text.trim_start_matches('\u{feff}'));
+    crate::progress::check()?;
+    let (text, encoding_note) = decode(bytes);
+    crate::progress::begin(text.len());
+    let (recs, cut_short) = records(text.trim_start_matches('\u{feff}'))?;
     if !recs.iter().any(|r| r.kind == "SECTION") {
         return Err(DataError::Format(match cut_short {
             Some(why) => format!("{file_name}: not a DXF drawing ({why})"),
             None => format!("{file_name}: not a DXF drawing"),
         }));
     }
-    let d = drawing(&recs);
+    let d = drawing(&recs)?;
     let mut out = Out {
         points: Dataset::new(format!("{name} points"), GeometryType::Point, fields()),
         lines: Dataset::new(format!("{name} lines"), GeometryType::Polyline, fields()),
         polygons: Dataset::new(format!("{name} polygons"), GeometryType::Polygon, fields()),
         count: 0,
+        varying_z: Default::default(),
+        losses: Default::default(),
         capped: false,
         cut: 0,
         steps: 0,
         overworked: false,
         trimmed: false,
         paper: 0,
+        blocked: 0,
         vertices: 0,
         vertex_capped: false,
         copies: 1,
     };
     let none = Inherit { layer: None, layer_key: None, color: None, linetype: None, block: None, paper: false };
-    emit(&d, &d.entities, &Xf::ID, none, 0, &mut Vec::new(), opts, &mut out);
+    emit(&d, &d.entities, &Xf::ID, none, 0, &mut Vec::new(), opts, &mut out)?;
 
     let mut report = ReadReport::default();
+    if let Some(why) = encoding_note {
+        report.messages.push(why);
+    }
     if let Some(why) = cut_short {
         report.messages.push(why);
     }
     if opts.crs.is_none() {
-        report.messages.push(
-            "a DXF drawing doesn't say its coordinate system (give \"crs\", such as EPSG:2263): coordinates are kept as they are".into(),
-        );
+        report
+            .messages
+            .push("a DXF drawing doesn't say its coordinate system (give \"crs\", such as EPSG:2263): coordinates are kept as they are");
     }
     if out.capped {
         report.messages.push(format!("the drawing makes more than {MAX_FEATURES} features: the rest are left out"));
@@ -1345,6 +1650,12 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         report.messages.push(format!(
             "{} entities of the drawing's layouts (paper space) were left out; add the drawing with \"paperSpace\" to draw them",
             out.paper
+        ));
+    }
+    if out.blocked > 0 {
+        report.messages.push(format!(
+            "{} inserted blocks (图块) were left out; add the drawing with \"blocks\": true to draw their contents",
+            out.blocked
         ));
     }
     if out.trimmed {
@@ -1373,24 +1684,34 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         None => None,
     };
     let mut layers: Vec<(Dataset, ReadReport)> = Vec::new();
-    for mut ds in [out.points, out.lines, out.polygons] {
+    let mut varying_count = 0usize;
+    let mut recovered = PathLoss::default();
+    for ((mut ds, flags), losses) in [out.points, out.lines, out.polygons].into_iter().zip(out.varying_z).zip(out.losses) {
         if ds.features.is_empty() {
             continue;
         }
         // What the drawing as a whole said goes with its first layer only.
         let mut rep = if layers.is_empty() { report.clone() } else { ReadReport::default() };
         if let Some((t, c)) = &transformer {
+            // Kept as the drawing holds them, in its system, where they have a place in
+            // longitude/latitude.
+            ds.held_in = *c;
             let mut lost = 0usize;
-            for f in &mut ds.features {
+            for (f, varying) in ds.features.iter_mut().zip(&flags) {
+                crate::progress::check()?;
                 if let Some(g) = f.geometry.take() {
-                    let moved = g.map_coords(&|p| t.to_lonlat(p).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
-                    let mut ok = true;
-                    moved.for_each_coord(|p| ok &= p.is_finite());
-                    if ok {
-                        f.geometry = Some(moved);
+                    if crate::io::places_in_lonlat(&g, t) {
+                        f.geometry = Some(g);
+                        ds.zm_dropped |= *varying;
+                        varying_count += usize::from(*varying);
                     } else {
                         lost += 1;
                     }
+                }
+            }
+            for (index, loss) in &losses {
+                if ds.features.get(*index).is_some_and(|f| f.geometry.is_some()) {
+                    recovered.add(*loss);
                 }
             }
             ds.features.retain(|f| f.geometry.is_some());
@@ -1398,11 +1719,57 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
                 rep.messages.push(format!("{lost} features couldn't be converted from {}", c.label()));
             }
         }
+        if transformer.is_none() {
+            for (_, loss) in losses {
+                recovered.add(loss);
+            }
+            let count = flags.iter().filter(|&&varying| varying).count();
+            ds.zm_dropped = count > 0;
+            varying_count += count;
+        }
         layers.push((ds, rep));
+    }
+    if let Some((_, report)) = layers.first_mut() {
+        for (count, single, plural, reason) in [
+            (recovered.capped, "polyline path coordinate was", "polyline path coordinates were", "left out at the per-entity vertex limit"),
+            (recovered.missing_y, "vertex without Y was", "vertices without Y were", "left out of spline paths"),
+            (
+                recovered.invalid_z,
+                "POLYLINE vertex with unreadable supplied Z was",
+                "POLYLINE vertices with unreadable supplied Z were",
+                "left out",
+            ),
+            (recovered.short_rings, "short HATCH boundary ring was", "short HATCH boundary rings were", "left out of polygons"),
+        ] {
+            if count > 0 {
+                let subject = if count == 1 { single } else { plural };
+                report.messages.push(format!("{count} {subject} {reason}"));
+            }
+        }
+    }
+    if varying_count > 0
+        && let Some((_, report)) = layers.first_mut()
+    {
+        let subject = if varying_count == 1 { "feature" } else { "features" };
+        report.messages.push(format!("{varying_count} {subject} lost varying Z coordinates; only the elevation attribute is kept"));
+    }
+    if recovered.unreadable_vertices > 0
+        && let Some((_, report)) = layers.first_mut()
+    {
+        let (subject, action) = if recovered.unreadable_vertices == 1 {
+            ("vertex", "was left out of its line")
+        } else {
+            ("vertices", "were left out of their lines")
+        };
+        report.messages.push(format!("{} unreadable POLYLINE {subject} {action}", recovered.unreadable_vertices));
     }
     if layers.is_empty() {
         return Err(DataError::Format(match opts.layer {
             Some(l) => format!("{file_name}: nothing drawn on layer '{l}'"),
+            // Everything the drawing draws is in inserted blocks, and blocks were left out.
+            None if out.blocked > 0 => format!(
+                "{file_name}: everything it draws is in its inserted blocks (图块), which were left out; add it with \"blocks\": true to draw them"
+            ),
             None => format!("{file_name}: nothing RustGIS draws"),
         }));
     }
@@ -1414,14 +1781,14 @@ pub fn layers(file_name: &str, bytes: &[u8]) -> Result<Vec<String>> {
     if is_binary(bytes) {
         return Err(DataError::Unsupported(format!("{file_name}: a binary DXF (save it as an ASCII DXF to read it here)")));
     }
-    let text = decode(bytes);
-    let (recs, _) = records(text.trim_start_matches('\u{feff}'));
+    let (text, _) = decode(bytes);
+    let (recs, _) = records(text.trim_start_matches('\u{feff}'))?;
     if !recs.iter().any(|r| r.kind == "SECTION") {
         return Err(DataError::Format(format!("{file_name}: not a DXF drawing")));
     }
     // The table's layers and those entities (paper space and blocks' too) are on, without
     // drawing anything. Layer 0 in a block takes its INSERT's, so it isn't one of its own there.
-    let d = drawing(&recs);
+    let d = drawing(&recs)?;
     let mut names: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut add = |name: &str, key: &str| {
@@ -1451,6 +1818,267 @@ mod tests {
     /// A DXF from (code, value) pairs.
     fn dxf(pairs: &[(i32, &str)]) -> Vec<u8> {
         pairs.iter().map(|(c, v)| format!("{c:>3}\n{v}\n")).collect::<String>().into_bytes()
+    }
+
+    /// A bulged HATCH boundary preserves its capped prefix and counts the unvisited arc samples.
+    #[test]
+    fn hatch_bulge_tail_is_counted_at_the_vertex_limit() {
+        use std::fmt::Write as _;
+        // Every semicircle contributes 36 sampled coordinates after its starting point.
+        let kept_segments = (MAX_VERTICES - 1).div_ceil(36);
+        let vertices = (kept_segments + 2).div_ceil(2) * 2;
+        let mut text = format!("0\nSECTION\n2\nENTITIES\n0\nHATCH\n91\n1\n92\n2\n72\n1\n73\n1\n93\n{vertices}\n");
+        for i in 0..vertices {
+            writeln!(text, "10\n{}\n20\n0\n42\n1", i % 2).unwrap();
+        }
+        text.push_str("0\nENDSEC\n0\nEOF\n");
+        let layers = read("hatch.dxf", text.as_bytes(), &Options { crs: Some(Crs::LonLat), ..Options::default() }).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].0.features.len(), 1);
+        let Some(Geometry::Polygon(parts)) = &layers[0].0.features[0].geometry else { panic!("HATCH polygon") };
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].len(), 1);
+        assert_eq!(parts[0][0].len(), 1 + kept_segments * 36 + kept_segments % 2);
+        assert_eq!(parts[0][0].first(), Some(&Coord::new(0., 0.)));
+        assert_eq!(layers[0].1.skipped, 0);
+        assert_eq!(
+            layers[0].1.messages,
+            [format!("{} polyline path coordinates were left out at the per-entity vertex limit", (vertices - kept_segments) * 36,)]
+        );
+    }
+
+    /// Each witness retains useful geometry; only losses in its chosen representation count.
+    #[test]
+    fn spline_vertices_without_y_are_counted_in_the_path_drawn() {
+        for kind in ["SPLINE", "HELIX"] {
+            for (x, y) in [(10, 20), (11, 21)] {
+                let bytes = dxf(&[
+                    (0, "SECTION"),
+                    (2, "ENTITIES"),
+                    (0, kind),
+                    (71, "3"),
+                    (x, "0"),
+                    (y, "0"),
+                    (x, "1"),
+                    (x, "2"),
+                    (y, "2"),
+                    (0, "ENDSEC"),
+                    (0, "EOF"),
+                ]);
+                let layers = read("a.dxf", &bytes, &Options { crs: Some(Crs::LonLat), ..Options::default() }).unwrap();
+                assert_eq!(layers[0].0.features[0].geometry, Some(Geometry::Line(vec![vec![Coord::new(0., 0.), Coord::new(2., 2.)]])));
+                assert_eq!(layers[0].1.messages, ["1 vertex without Y was left out of spline paths"]);
+                assert_eq!(layers[0].1.skipped, 0);
+            }
+        }
+    }
+
+    /// Invalid supplied Z is unreadable only on the 3D path; omission still means zero.
+    #[test]
+    fn supplied_invalid_3d_vertex_z_is_omitted_but_optional_z_stays_zero() {
+        for (flags, z, lost) in [("8", Some("bad"), true), ("8", None, false), ("0", Some("bad"), false)] {
+            let mut pairs = vec![(0, "SECTION"), (2, "ENTITIES"), (0, "POLYLINE"), (70, flags), (0, "VERTEX"), (10, "0"), (20, "0")];
+            if let Some(z) = z {
+                pairs.push((30, z));
+            }
+            pairs.extend([
+                (0, "VERTEX"),
+                (10, "1"),
+                (20, "1"),
+                (0, "VERTEX"),
+                (10, "2"),
+                (20, "2"),
+                (0, "SEQEND"),
+                (0, "ENDSEC"),
+                (0, "EOF"),
+            ]);
+            let layers = read("a.dxf", &dxf(&pairs), &Options { crs: Some(Crs::LonLat), ..Options::default() }).unwrap();
+            let Some(Geometry::Line(parts)) = &layers[0].0.features[0].geometry else { panic!("line") };
+            assert_eq!(parts[0].len(), if lost { 2 } else { 3 });
+            assert_eq!(layers[0].0.value(0, 8), &Value::Float(0.));
+            assert_eq!(layers[0].1.messages, if lost { vec!["1 POLYLINE vertex with unreadable supplied Z was left out"] } else { vec![] });
+            assert_eq!(layers[0].1.skipped, 0);
+        }
+    }
+
+    /// Both builder-rejected and closed two-point boundaries disappear beside a valid triangle.
+    #[test]
+    fn short_hatch_boundary_rings_are_counted() {
+        for short in [vec!["1"], vec!["2"], vec!["1", "2"]] {
+            let count = short.len();
+            let paths = (count + 1).to_string();
+            let mut p = vec![(0, "SECTION"), (2, "ENTITIES"), (0, "HATCH"), (91, paths.as_str())];
+            for n in std::iter::once("3").chain(short) {
+                p.extend([(92, "2"), (72, "0"), (73, "1"), (93, n), (10, "0"), (20, "0")]);
+                if n != "1" {
+                    p.extend([(10, "2"), (20, "0")]);
+                }
+                if n == "3" {
+                    p.extend([(10, "0"), (20, "2")]);
+                }
+            }
+            p.extend([(0, "ENDSEC"), (0, "EOF")]);
+            let layers = read("a.dxf", &dxf(&p), &Options { crs: Some(Crs::LonLat), ..Options::default() }).unwrap();
+            assert_eq!(
+                layers[0].0.features[0].geometry,
+                Some(Geometry::Polygon(vec![vec![vec![Coord::new(0., 0.), Coord::new(2., 0.), Coord::new(0., 2.), Coord::new(0., 0.)]]]))
+            );
+            let subject = if count == 1 { "ring was" } else { "rings were" };
+            assert_eq!(layers[0].1.messages, [format!("{count} short HATCH boundary {subject} left out of polygons")]);
+            assert_eq!(layers[0].1.skipped, 0);
+        }
+    }
+
+    /// Counting an expansion tail must still stop after its output prefix has hit the cap.
+    #[test]
+    fn counting_the_bulge_tail_stops_when_cancelled() {
+        let vs = vec![([0., 0., 0.], 0.); MAX_VERTICES + 2048];
+        let probe = std::sync::Arc::new(crate::progress::tests::Counted {
+            after_checks: Some((MAX_VERTICES / 1024 + 1) as u64),
+            ..Default::default()
+        });
+        let _guard = crate::progress::install(Some(probe));
+        let mut omitted = 0;
+        assert!(bulged(&vs, false, &mut omitted).is_none());
+        assert!(omitted > 0, "cancellation reached the counting tail");
+    }
+
+    /// Generate over-limit sources transiently rather than keeping million-vertex fixtures.
+    #[test]
+    fn polyline_vertex_limits_count_omitted_coordinates() {
+        use std::fmt::Write as _;
+        for kind in ["LWPOLYLINE", "POLYLINE"] {
+            for bulge in [false, true] {
+                for unreadable_tail in [false, true] {
+                    let mut text = format!("0\nSECTION\n2\nENTITIES\n0\n{kind}\n");
+                    if kind == "POLYLINE" && unreadable_tail {
+                        text.push_str("70\n10\n");
+                    }
+                    for _ in 0..MAX_VERTICES {
+                        if kind == "POLYLINE" {
+                            text.push_str("0\nVERTEX\n");
+                        }
+                        text.push_str("10\n0\n20\n0\n");
+                    }
+                    let tail: &[&str] = if !unreadable_tail {
+                        &["10\n0\n20\n0\n"]
+                    } else if kind == "POLYLINE" {
+                        &["10\nbad\n20\n0\n", "10\n0\n20\nbad\n", "10\n0\n20\n0\n30\nbad\n"]
+                    } else {
+                        &["10\nbad\n20\n0\n", "10\n0\n20\nbad\n", "10\n0\n"]
+                    };
+                    for vertex in tail {
+                        if kind == "POLYLINE" {
+                            text.push_str("0\nVERTEX\n");
+                        }
+                        text.push_str(vertex);
+                    }
+                    if kind == "POLYLINE" && unreadable_tail {
+                        // A smoothed frame point is not an on-curve vertex, even beyond the limit.
+                        text.push_str("0\nVERTEX\n70\n16\n10\nbad\n");
+                    }
+                    // Distinct endpoints let the first segment expand beyond one vertex.
+                    if bulge {
+                        let start = if kind == "POLYLINE" { "0\nVERTEX\n10\n0\n20\n0\n" } else { "10\n0\n20\n0\n" };
+                        let at = text.find(start).unwrap() + start.len();
+                        text.insert_str(at, "42\n1\n");
+                        let at = at + "42\n1\n".len();
+                        let tail = &text[at..];
+                        let offset = tail.find("10\n0\n").unwrap();
+                        text.replace_range(at + offset..at + offset + 5, "10\n1\n");
+                    }
+                    if kind == "POLYLINE" {
+                        text.push_str("0\nSEQEND\n");
+                    }
+                    writeln!(text, "0\nENDSEC\n0\nEOF").unwrap();
+                    let layers = read("a.dxf", text.as_bytes(), &Options { crs: Some(Crs::LonLat), ..Options::default() }).unwrap();
+                    let Some(Geometry::Line(parts)) = &layers[0].0.features[0].geometry else { panic!("line") };
+                    let held = parts[0].len();
+                    let total = MAX_VERTICES + tail.len() + if bulge { 35 } else { 0 };
+                    assert_eq!(
+                        layers[0].1.messages,
+                        [format!(
+                            "{} polyline path {} left out at the per-entity vertex limit",
+                            total - held,
+                            if total - held == 1 { "coordinate was" } else { "coordinates were" }
+                        )]
+                    );
+                    assert_eq!(layers[0].1.skipped, 0);
+                }
+            }
+        }
+    }
+
+    /// Unused fit/control arrays, hidden entities and wholly unusable shapes have no partial loss.
+    #[test]
+    fn path_losses_follow_only_the_drawn_representation_and_retained_placements() {
+        let opts = Options { crs: Some(Crs::LonLat), ..Options::default() };
+        // A valid linear spline ignores incomplete fit data. A fit fallback ignores incomplete controls.
+        for body in ["0 SPLINE 71 1 40 0 40 0 40 1 40 1 10 0 20 0 10 2 20 2 11 1", "0 SPLINE 71 3 10 1 11 0 21 0 11 2 21 2"] {
+            let text = format!("0 SECTION 2 ENTITIES {body} 0 ENDSEC 0 EOF").split_whitespace().collect::<Vec<_>>().join("\n");
+            let layers = read("a.dxf", text.as_bytes(), &opts).unwrap();
+            assert!(layers[0].1.messages.is_empty(), "{:?}", layers[0].1.messages);
+            assert_eq!(layers[0].1.skipped, 0);
+        }
+        for body in [
+            "0 SPLINE 71 3 11 0 21 0 11 1",
+            "0 POLYLINE 70 8 0 VERTEX 10 0 20 0 30 bad 0 VERTEX 10 1 20 1 0 SEQEND",
+            "0 HATCH 91 1 92 2 72 0 73 1 93 2 10 0 20 0 10 1 20 1",
+        ] {
+            let text =
+                format!("0 SECTION 2 ENTITIES 0 POINT 10 0 20 0 {body} 0 ENDSEC 0 EOF").split_whitespace().collect::<Vec<_>>().join("\n");
+            let layers = read("a.dxf", text.as_bytes(), &opts).unwrap();
+            assert_eq!(layers.iter().map(|(d, _)| d.features.len()).sum::<usize>(), 1);
+            assert_eq!(layers[0].1.skipped, 1);
+            assert_eq!(
+                layers[0].1.messages,
+                ["1 entities couldn't be read or placed (missing blocks, blocks nested too deep or in a cycle) and were left out"]
+            );
+        }
+        // Losses follow the two surviving block copies; the paper-space and filtered copy stay quiet.
+        let text = "0 SECTION 2 BLOCKS 0 BLOCK 2 B 0 SPLINE 71 3 11 0 21 0 11 1 11 2 21 2 0 ENDBLK 0 ENDSEC
+            0 SECTION 2 ENTITIES 0 INSERT 2 B 8 keep 70 2 44 5 0 INSERT 2 B 8 omit 0 INSERT 2 B 8 keep 67 1 0 ENDSEC 0 EOF"
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let layers = read("a.dxf", text.as_bytes(), &Options { layer: Some("keep"), ..opts }).unwrap();
+        assert_eq!(layers[0].0.features.len(), 2);
+        assert_eq!(
+            layers[0].1.messages,
+            [
+                "1 entities of the drawing's layouts (paper space) were left out; add the drawing with \"paperSpace\" to draw them",
+                "2 vertices without Y were left out of spline paths",
+            ]
+        );
+        // A CRS-rejected placement contributes no partial counters.
+        let text = "0 SECTION 2 ENTITIES 0 POINT 10 0 20 0 0 SPLINE 71 3 11 0 21 100 11 1 11 2 21 101 0 ENDSEC 0 EOF"
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let layers = read("a.dxf", text.as_bytes(), &Options { crs: Some(Crs::from_epsg(4269).unwrap()), ..Options::default() }).unwrap();
+        let messages: Vec<&str> = layers.iter().flat_map(|(_, report)| &report.messages).map(|m| m.as_str()).collect();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].starts_with("1 features couldn't be converted from "));
+        assert!(!messages[0].contains("without Y"));
+    }
+
+    #[test]
+    fn minimum_integer_color_is_refused_without_panicking() {
+        for (section, kind) in [("TABLES", "LAYER"), ("ENTITIES", "POINT")] {
+            let bytes = dxf(&[
+                (0, "SECTION"),
+                (2, section),
+                (0, kind),
+                (2, "Survey"),
+                (62, "-9223372036854775808"),
+                (10, "1"),
+                (20, "2"),
+                (0, "ENDSEC"),
+                (0, "EOF"),
+            ]);
+            let error = read("color.dxf", &bytes, &Options::default()).unwrap_err().to_string();
+            assert!(error.contains("color index"), "{section}: {error}");
+        }
     }
 
     fn sample() -> Vec<u8> {
@@ -1653,6 +2281,8 @@ mod tests {
             let maxx = parts[0].iter().map(|c| c.x).fold(f64::MIN, f64::max);
             assert!((maxx - 3.0).abs() < 1e-6, "{maxx}");
             assert_eq!(parts[0].first(), parts[0].last(), "closed");
+        } else {
+            panic!("a polyline is a line");
         }
         // Text, cleaned of its codes.
         let texts: Vec<Value> = points.features.iter().map(|f| f.attrs[4].clone()).filter(|v| !v.is_null()).collect();
@@ -1665,6 +2295,8 @@ mod tests {
                 p[0][0],
                 vec![Coord::new(0.0, 0.0), Coord::new(1.0, 0.0), Coord::new(1.0, 1.0), Coord::new(0.0, 1.0), Coord::new(0.0, 0.0)]
             );
+        } else {
+            panic!("a solid is a polygon");
         }
         if let Some(Geometry::Polygon(p)) = &polys.features[1].geometry {
             assert_eq!((p.len(), p[0].len()), (1, 2), "one polygon with a hole");
@@ -1677,17 +2309,20 @@ mod tests {
     fn layers_filter_and_crs() {
         // The table's layers and the entities' (layer 0: an INSERT without a layer group).
         assert_eq!(layers("a.dxf", &sample()).unwrap(), ["0", "Fill", "Labels", "Roads", "Trees"]);
-        let only = read("a.dxf", &sample(), &Options { crs: None, layer: Some("roads"), paper_space: false }).unwrap();
+        let only = read("a.dxf", &sample(), &Options { layer: Some("roads"), ..Options::default() }).unwrap();
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].0.features.len(), 2);
-        assert!(read("a.dxf", &sample(), &Options { crs: None, layer: Some("nope"), paper_space: false }).is_err());
+        assert!(read("a.dxf", &sample(), &Options { layer: Some("nope"), ..Options::default() }).is_err());
         // Converted from a projected system: UTM 33N near its central meridian.
         let crs = Crs::parse("EPSG:32633").unwrap();
         let utm = dxf(&[(0, "SECTION"), (2, "ENTITIES"), (0, "POINT"), (10, "500000"), (20, "4649776"), (0, "ENDSEC"), (0, "EOF")]);
-        let l = read("u.dxf", &utm, &Options { crs: Some(crs), layer: None, paper_space: false }).unwrap();
+        let l = read("u.dxf", &utm, &Options { crs: Some(crs), ..Options::default() }).unwrap();
         assert!(l[0].1.messages.is_empty(), "{:?}", l[0].1.messages);
-        if let Some(Geometry::Point(c)) = &l[0].0.features[0].geometry {
+        assert_eq!(l[0].0.held_in, crs, "held in the drawing's system");
+        if let Some(Geometry::Point(c)) = &l[0].0.in_lonlat().unwrap().features[0].geometry {
             assert!((c.x - 15.0).abs() < 1e-6 && (c.y - 42.0).abs() < 0.01, "{c:?}");
+        } else {
+            panic!("a point is a point");
         }
     }
 
@@ -1795,13 +2430,15 @@ mod tests {
         assert_eq!(l[1].0.geometry_type, GeometryType::Polygon);
         if let Some(Geometry::Polygon(p)) = &l[1].0.features[0].geometry {
             assert_eq!(p.len(), 1, "the face with an index past the vertices is left out");
+        } else {
+            panic!("a face is a polygon");
         }
     }
 
     /// Every drawing in `RUSTGIS_DXF_DIR`: features per layer and their extent (compared by hand
     /// against GDAL's reading of the same files).
     #[test]
-    #[ignore]
+    #[ignore = "needs external DXF samples in RUSTGIS_DXF_DIR"]
     fn dxf_samples() {
         let Ok(dir) = std::env::var("RUSTGIS_DXF_DIR") else { return };
         let mut paths: Vec<_> = std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).collect();
@@ -1824,7 +2461,14 @@ mod tests {
                         e.max_y,
                         kinds.join(" "),
                         t.elapsed(),
-                        layers[0].1.messages.iter().filter(|m| !m.contains("coordinate system")).cloned().collect::<Vec<_>>().join(" | ")
+                        layers[0]
+                            .1
+                            .messages
+                            .iter()
+                            .filter(|m| !m.contains("coordinate system"))
+                            .map(|m| m.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" | ")
                     );
                 }
                 Err(e) => println!("{name}\tERR\t{e}"),
@@ -1869,7 +2513,7 @@ mod tests {
         p.extend([(0, "ENDSEC".into()), (0, "EOF".into())]);
         let text: String = p.iter().map(|(c, v)| format!("{c:>3}\n{v}\n")).collect();
         let t = std::time::Instant::now();
-        let r = read("arrays.dxf", text.as_bytes(), &Options { crs: None, layer: Some("y"), paper_space: false });
+        let r = read("arrays.dxf", text.as_bytes(), &Options { layer: Some("y"), ..Options::default() });
         assert!(t.elapsed() < std::time::Duration::from_secs(60), "{:?}", t.elapsed());
         assert!(r.is_err(), "nothing on layer y");
         // Drawn: a cap stops the walk and says so, and the arrays cut short are said.
@@ -1979,13 +2623,13 @@ mod tests {
         assert_eq!(all[0].0.value(0, i), &Value::Bool(false));
     }
 
-    /// A large polyline in a block inserted as a 100 × 100 array: coordinates are bounded in total,
-    /// not only per entity.
+    /// A tilted polyline in a block inserted as a 100 × 100 array: coordinates are bounded in total,
+    /// not only per entity, and height losses count only copies that were kept.
     #[test]
     fn total_coordinates_are_bounded() {
-        let mut text = String::from("  0\nSECTION\n  2\nBLOCKS\n  0\nBLOCK\n  2\nBIG\n  0\nLWPOLYLINE\n");
+        let mut text = String::from("  0\nSECTION\n  2\nBLOCKS\n  0\nBLOCK\n  2\nBIG\n  0\nLWPOLYLINE\n210\n1\n220\n0\n230\n1\n");
         for i in 0..200_000 {
-            text.push_str(&format!(" 10\n{i}\n 20\n0\n"));
+            text.push_str(&format!(" 10\n0\n 20\n{i}\n"));
         }
         text.push_str(
             "  0\nENDBLK\n  0\nENDSEC\n  0\nSECTION\n  2\nENTITIES\n  0\nINSERT\n  2\nBIG\n 70\n100\n 71\n100\n  0\nENDSEC\n  0\nEOF\n",
@@ -2004,6 +2648,11 @@ mod tests {
             .sum();
         assert!(held <= MAX_TOTAL_VERTICES, "{held}");
         assert_eq!(l[0].0.features.len(), MAX_TOTAL_VERTICES / 200_000);
+        assert!(l[0].0.zm_dropped);
+        assert_eq!(
+            l[0].1.messages.iter().filter(|m| m.contains("varying Z")).collect::<Vec<_>>(),
+            [&format!("{} features lost varying Z coordinates; only the elevation attribute is kept", l[0].0.features.len())]
+        );
         assert!(l[0].1.messages.iter().any(|m| m.contains("coordinates")), "{:?}", l[0].1.messages);
     }
 
@@ -2107,6 +2756,559 @@ mod tests {
             (0, "EOF"),
         ]);
         assert_eq!(layers("l.dxf", &d).unwrap(), ["Empty", "InBlock", "Layout", "Trees"]);
+    }
+
+    /// A drawing's text in the code page its header names (AutoCAD 2004 and earlier): its Chinese
+    /// layer names and text are read as they were written, not as Latin-1 mojibake. Comments naming
+    /// a different code page, outside and inside HEADER, must not override the real variable.
+    #[test]
+    fn an_ansi_code_page_is_decoded() {
+        let mut d =
+            b"999\n$DWGCODEPAGE\n999\nANSI_1252\n  0\nSECTION\n  2\nHEADER\n999\n$DWGCODEPAGE\n999\nANSI_1252\n  9\n$DWGCODEPAGE\n999\nignored comment\n  3\nANSI_936\n  0\nENDSEC\n  0\nSECTION\n  2\nTABLES\n  0\nLAYER\n  2\n"
+                .to_vec();
+        let (gbk, _, _) = encoding_rs::GBK.encode("道路");
+        d.extend_from_slice(&gbk);
+        d.extend_from_slice(b"\n  0\nENDSEC\n  0\nSECTION\n  2\nENTITIES\n  0\nTEXT\n  8\n");
+        d.extend_from_slice(&gbk);
+        d.extend_from_slice(b"\n 10\n5\n 20\n5\n 40\n2.5\n  1\n");
+        let (text, _, _) = encoding_rs::GBK.encode("中文");
+        d.extend_from_slice(&text);
+        d.extend_from_slice(b"\n  0\nENDSEC\n  0\nEOF\n");
+        // Code-line whitespace is accepted by records(); empty comment values stay paired.
+        for prefix in ["", "\n", " \r\n\t\n999\n\n"] {
+            let d = [prefix.as_bytes(), d.as_slice()].concat();
+            assert_eq!(layers("gbk.dxf", &d).unwrap(), ["道路"]);
+            let l = read("gbk.dxf", &d, &Options::default()).unwrap();
+            let points = &l[0].0;
+            assert_eq!(points.value(0, 0), &Value::Text("道路".into()), "the layer's name");
+            assert_eq!(points.value(0, 4), &Value::Text("中文".into()), "its text");
+            // Nothing beyond the coordinate system had to be assumed.
+            assert!(!l[0].1.messages.iter().any(|m| m.contains("code page") || m.contains("Latin-1")), "{:?}", l[0].1.messages);
+        }
+    }
+
+    /// UTF-8 (2007 and later) needs no code page, and its Chinese text is kept as it is.
+    #[test]
+    fn utf8_chinese_text_is_read_as_it_is() {
+        let d = dxf(&[(0, "SECTION"), (2, "ENTITIES"), (0, "POINT"), (8, "水系"), (10, "1"), (20, "2"), (0, "ENDSEC"), (0, "EOF")]);
+        let l = read("utf8.dxf", &d, &Options::default()).unwrap();
+        assert_eq!(l[0].0.value(0, 0), &Value::Text("水系".into()));
+        assert!(!l[0].1.messages.iter().any(|m| m.contains("code page") || m.contains("Latin-1")), "{:?}", l[0].1.messages);
+    }
+
+    /// A code page RustGIS doesn't know falls back to Latin-1, and says so: a reader never guesses
+    /// silently.
+    #[test]
+    fn an_unknown_code_page_is_said() {
+        let mut d =
+            b"  0\nSECTION\n  2\nHEADER\n  9\n$DWGCODEPAGE\n  3\nANSI_9999\n  0\nENDSEC\n  0\nSECTION\n  2\nENTITIES\n  0\nPOINT\n  8\n"
+                .to_vec();
+        d.push(0xE9);
+        d.extend_from_slice(b"\n 10\n1\n 20\n2\n  0\nENDSEC\n  0\nEOF\n");
+        let l = read("old.dxf", &d, &Options::default()).unwrap();
+        assert_eq!(l[0].0.value(0, 0), &Value::Text("é".into()), "Latin-1");
+        assert!(l[0].1.messages.iter().any(|m| m.contains("ANSI_9999") && m.contains("Latin-1")), "{:?}", l[0].1.messages);
+    }
+
+    /// Cancellation during record parsing returns an error rather than a partial drawing.
+    #[test]
+    fn reading_stops_when_cancelled() {
+        let probe = std::sync::Arc::new(crate::progress::tests::Counted { after: Some(10), ..Default::default() });
+        let _guard = crate::progress::install(Some(probe));
+        assert!(matches!(read("site.dxf", &sample(), &Options::default()), Err(DataError::Cancelled)));
+    }
+
+    /// Disabling blocks keeps standalone entities and DIMENSION fallback geometry.
+    #[test]
+    fn blocks_can_be_left_out() {
+        let l = read("site.dxf", &sample(), &Options { blocks: false, ..Options::default() }).unwrap();
+        let names: Vec<&str> = l.iter().map(|(d, _)| d.name.as_str()).collect();
+        assert_eq!(names, ["site points", "site lines", "site polygons"]);
+        // The two texts only: the trees' point and circle are gone.
+        assert_eq!(l[0].0.features.len(), 2);
+        assert!(l.iter().all(|(d, _)| d.features.iter().all(|f| f.attrs[1] != Value::Text("CIRCLE".into()))));
+        assert_eq!(l[0].1.skipped, 0, "{:?}", l[0].1.messages);
+        assert!(l[0].1.messages.iter().any(|m| m.contains("3 inserted blocks") && m.contains("\"blocks\": true")), "{:?}", l[0].1.messages);
+        // A DIMENSION without a block keeps the lines and text it describes itself.
+        let dimension = dxf(&[
+            (0, "SECTION"),
+            (2, "ENTITIES"),
+            (0, "DIMENSION"),
+            (2, "missing"),
+            (70, "0"),
+            (10, "0"),
+            (20, "2"),
+            (13, "0"),
+            (23, "0"),
+            (14, "5"),
+            (24, "0"),
+            (0, "ENDSEC"),
+            (0, "EOF"),
+        ]);
+        let kept = read("dimension.dxf", &dimension, &Options { blocks: false, ..Options::default() }).unwrap();
+        let all_dimension = read("dimension.dxf", &dimension, &Options::default()).unwrap();
+        assert_eq!(
+            kept.iter().map(|(ds, _)| ds.features.len()).sum::<usize>(),
+            all_dimension.iter().map(|(ds, _)| ds.features.len()).sum::<usize>()
+        );
+        assert!(kept.iter().any(|(ds, _)| ds.geometry_type == GeometryType::Polyline));
+        assert!(kept.iter().all(|(_, r)| r.skipped == 0 && !r.messages.iter().any(|m| m.contains("left out"))));
+        // Asked for, they are drawn as before.
+        let all = read("site.dxf", &sample(), &Options::default()).unwrap();
+        assert_eq!(all[0].0.features.len(), 2 + 2, "the block adds its point for each of two copies");
+        // A drawing that is nothing but its blocks says why it came out empty.
+        let only_block = dxf(&[
+            (0, "SECTION"),
+            (2, "BLOCKS"),
+            (0, "BLOCK"),
+            (2, "B"),
+            (0, "POINT"),
+            (10, "1"),
+            (20, "1"),
+            (0, "ENDBLK"),
+            (0, "ENDSEC"),
+            (0, "SECTION"),
+            (2, "ENTITIES"),
+            (0, "INSERT"),
+            (2, "B"),
+            (10, "5"),
+            (20, "5"),
+            (0, "ENDSEC"),
+            (0, "EOF"),
+        ]);
+        let e = read("blocks.dxf", &only_block, &Options { blocks: false, ..Options::default() }).unwrap_err().to_string();
+        assert!(e.contains("\"blocks\": true"), "{e}");
+        assert_eq!(read("blocks.dxf", &only_block, &Options::default()).unwrap()[0].0.features.len(), 1);
+    }
+
+    /// Unused, filtered, paper-space and CRS-rejected copies do not inflate the vertex count.
+    #[test]
+    fn unreadable_vertices_follow_retained_placements() {
+        let polyline = "0 POLYLINE 8 0 70 2 10 0 20 0 30 5
+            0 VERTEX 10 0 20 0 0 VERTEX 10 1 0 VERTEX 10 bad 20 1
+            0 VERTEX 70 16 10 bad 0 VERTEX 10 2 20 2 0 SEQEND";
+        let text = format!(
+            "0 SECTION 2 BLOCKS 0 BLOCK 2 B {polyline} 0 ENDBLK
+            0 BLOCK 2 Unused {polyline} 0 ENDBLK 0 ENDSEC 0 SECTION 2 ENTITIES
+            0 INSERT 8 Keep 2 B 10 10 20 20 70 2 44 4
+            0 INSERT 8 Other 2 B 10 10 20 20
+            0 INSERT 8 Keep 67 1 2 B 10 10 20 20
+            0 INSERT 8 Keep 2 B 10 10 20 100
+            0 POINT 8 Keep 10 0 20 0 0 ENDSEC 0 EOF"
+        )
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("\n");
+        let opts = Options { layer: Some("Keep"), crs: Some(Crs::from_epsg(4269).unwrap()), ..Options::default() };
+        let layers = read("placed.dxf", text.as_bytes(), &opts).unwrap();
+        assert_eq!(layers.len(), 2);
+        let lines = &layers[1].0;
+        assert_eq!(lines.features.len(), 2);
+        assert_eq!(lines.held_in, opts.crs.unwrap());
+        assert!(!lines.zm_dropped);
+        for (i, x) in [10.0, 14.0].into_iter().enumerate() {
+            assert_eq!(lines.features[i].geometry, Some(Geometry::Line(vec![vec![Coord::new(x, 20.0), Coord::new(x + 2.0, 22.0)]])));
+            assert_eq!(
+                lines.features[i].attrs,
+                [
+                    Value::Text("Keep".into()),
+                    Value::Text("POLYLINE".into()),
+                    Value::Int(7),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Text("B".into()),
+                    Value::Float(5.0),
+                    Value::Bool(false)
+                ]
+            );
+        }
+        let notes: Vec<&str> =
+            layers.iter().flat_map(|(_, r)| &r.messages).filter(|m| m.contains("POLYLINE")).map(|m| m.as_str()).collect();
+        assert_eq!(notes, ["4 unreadable POLYLINE vertices were left out of their lines"]);
+        let no_blocks = read("placed.dxf", text.as_bytes(), &Options { blocks: false, ..opts }).unwrap();
+        assert_eq!(no_blocks.len(), 1);
+        assert!(no_blocks.iter().all(|(_, r)| r.messages.iter().all(|m| !m.contains("POLYLINE"))));
+    }
+
+    /// The coordinate budget counts losses only for the array copies it actually emits.
+    #[test]
+    fn unreadable_vertices_exclude_size_rejected_copies() {
+        let mut text = String::from("0 SECTION 2 BLOCKS 0 BLOCK 2 B 0 POLYLINE 70 0 ");
+        for i in 0..300 {
+            text.push_str(&format!("0 VERTEX 10 {i} 20 0 "));
+        }
+        text.push_str(
+            "0 VERTEX 10 bad 20 0 0 SEQEND 0 ENDBLK 0 ENDSEC
+            0 SECTION 2 ENTITIES 0 INSERT 2 B 10 0 20 0 70 100 71 100 0 ENDSEC 0 EOF",
+        );
+        let text = text.split_whitespace().collect::<Vec<_>>().join("\n");
+        let layers = read("size.dxf", text.as_bytes(), &Options { crs: Some(Crs::LonLat), ..Options::default() }).unwrap();
+        assert_eq!(layers.len(), 1);
+        let kept = layers[0].0.features.len();
+        assert_eq!(kept, MAX_TOTAL_VERTICES / 300);
+        assert_eq!(
+            layers[0].1.messages,
+            [
+                format!("the drawing's features hold more than {MAX_TOTAL_VERTICES} coordinates: the rest are left out"),
+                format!("{kept} unreadable POLYLINE vertices were left out of their lines"),
+            ]
+        );
+    }
+
+    /// Counts placements after their transforms and filters, leaving constant elevations quiet.
+    #[test]
+    fn varying_heights_follow_retained_placements() {
+        let text = "0 SECTION 2 BLOCKS
+            0 BLOCK 2 B 0 LINE 8 0 10 0 20 0 30 5 11 1 21 1 31 9 0 ENDBLK
+            0 ENDSEC 0 SECTION 2 ENTITIES
+            0 INSERT 8 Keep 2 B 10 10 20 20 30 3 43 2 70 2 44 4
+            0 INSERT 8 Keep 2 B 10 20 20 30 30 3 43 0
+            0 LINE 8 Other 10 0 20 0 30 5 11 1 21 1 31 9
+            0 LINE 8 Keep 67 1 10 0 20 0 30 5 11 1 21 1 31 9
+            0 POINT 8 Keep 10 1 20 2 30 5
+            0 ENDSEC 0 EOF"
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let opts = Options { layer: Some("Keep"), ..Options::default() };
+        let layers = read("placed.dxf", text.as_bytes(), &opts).unwrap();
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].0.features.len(), 1);
+        assert!(!layers[0].0.zm_dropped);
+        let lines = &layers[1].0;
+        assert_eq!(lines.features.len(), 3);
+        assert!(lines.zm_dropped);
+        for (i, (x, y, z)) in [(10.0, 20.0, 13.0), (14.0, 20.0, 13.0), (20.0, 30.0, 3.0)].into_iter().enumerate() {
+            assert_eq!(lines.features[i].geometry, Some(Geometry::Line(vec![vec![Coord::new(x, y), Coord::new(x + 1.0, y + 1.0)]])));
+            assert_eq!(lines.value(i, 0), &Value::Text("Keep".into()));
+            assert_eq!(lines.value(i, 7), &Value::Text("B".into()));
+            assert_eq!(lines.value(i, 8), &Value::Float(z));
+        }
+        let notes: Vec<&str> =
+            layers.iter().flat_map(|(_, r)| &r.messages).filter(|m| m.contains("varying Z")).map(|m| m.as_str()).collect();
+        assert_eq!(notes, ["2 features lost varying Z coordinates; only the elevation attribute is kept"]);
+        let no_blocks = read("placed.dxf", text.as_bytes(), &Options { blocks: false, ..opts }).unwrap();
+        assert_eq!(no_blocks.len(), 1);
+        assert!(no_blocks.iter().all(|(ds, r)| !ds.zm_dropped && r.messages.iter().all(|m| !m.contains("varying Z"))));
+    }
+
+    /// Rational spline noise stays quiet even when a block's offsets cancel its height.
+    #[test]
+    fn constant_spline_height_stays_quiet() {
+        for (height, changed, base, offset, elevation, tilted) in [
+            ("0.1", "0.1000000001", "0", "0", 0.1, false),
+            ("500.1", "500.1000000001", "500", "-0.1", 0.0, false),
+            ("1125899906842624", "1125899906842625", "0", "-1125899906842624", 0.0, false),
+            ("0.1", "0.1000000001", "0", "0", 0.0, true),
+        ] {
+            for varying in [false, true] {
+                let end = if varying { changed } else { height };
+                let bytes = dxf(&[
+                    (0, "SECTION"),
+                    (2, "BLOCKS"),
+                    (0, "BLOCK"),
+                    (2, "B"),
+                    (10, "0"),
+                    (20, "0"),
+                    (30, base),
+                    (0, "SPLINE"),
+                    (71, "3"),
+                    (40, "0"),
+                    (40, "0"),
+                    (40, "0"),
+                    (40, "0"),
+                    (40, "1"),
+                    (40, "1"),
+                    (40, "1"),
+                    (40, "1"),
+                    (41, "1"),
+                    (41, "0.5"),
+                    (41, "2"),
+                    (41, "1"),
+                    (10, "0"),
+                    (20, "0"),
+                    (30, height),
+                    (10, "1"),
+                    (20, "1"),
+                    (30, height),
+                    (10, "2"),
+                    (20, "1"),
+                    (30, height),
+                    (10, "3"),
+                    (20, "0"),
+                    (30, end),
+                    (0, "ENDBLK"),
+                    (0, "ENDSEC"),
+                    (0, "SECTION"),
+                    (2, "ENTITIES"),
+                    (0, "INSERT"),
+                    (2, "B"),
+                    (10, "0"),
+                    (20, "0"),
+                    (30, offset),
+                    (210, if tilted { "1" } else { "0" }),
+                    (220, "0"),
+                    (230, if tilted { "0" } else { "1" }),
+                    (0, "ENDSEC"),
+                    (0, "EOF"),
+                ]);
+                let layers = read("spline.dxf", &bytes, &Options { crs: Some(Crs::LonLat), ..Options::default() }).unwrap();
+                assert_eq!(layers.len(), 1);
+                let (ds, report) = &layers[0];
+                assert_eq!(ds.features.len(), 1);
+                assert_eq!(ds.value(0, 8), &Value::Float(elevation));
+                assert_eq!(ds.zm_dropped, varying || tilted, "height={height}, offset={offset}: {:?}", report.messages);
+                assert_eq!(report.skipped, 0);
+                let expected = if varying || tilted {
+                    vec!["1 feature lost varying Z coordinates; only the elevation attribute is kept"]
+                } else {
+                    vec![]
+                };
+                assert_eq!(report.messages, expected);
+                let Some(Geometry::Line(parts)) = &ds.features[0].geometry else { panic!("spline line") };
+                let (start_xy, end_xy) = if tilted {
+                    (Coord::new(0.1, 0.0), Coord::new(end.parse().unwrap(), 3.0))
+                } else {
+                    (Coord::new(0.0, 0.0), Coord::new(3.0, 0.0))
+                };
+                assert_eq!(parts[0].first(), Some(&start_xy));
+                assert_eq!(parts[0].last(), Some(&end_xy));
+            }
+        }
+    }
+
+    /// HATCH spline edges also sample a proven constant source height.
+    #[test]
+    fn constant_hatch_spline_height_stays_quiet() {
+        for tilted in [false, true] {
+            let bytes = dxf(&[
+                (0, "SECTION"),
+                (2, "ENTITIES"),
+                (0, "HATCH"),
+                (10, "0"),
+                (20, "0"),
+                (30, "0.1"),
+                (210, if tilted { "1" } else { "0" }),
+                (220, "0"),
+                (230, "1"),
+                (91, "1"),
+                (92, "0"),
+                (93, "1"),
+                (72, "4"),
+                (94, "3"),
+                (73, "1"),
+                (74, "0"),
+                (95, "8"),
+                (96, "4"),
+                (40, "0"),
+                (40, "0"),
+                (40, "0"),
+                (40, "0"),
+                (40, "1"),
+                (40, "1"),
+                (40, "1"),
+                (40, "1"),
+                (10, "0"),
+                (20, "0"),
+                (42, "1"),
+                (10, "1"),
+                (20, "0"),
+                (42, "0.5"),
+                (10, "1"),
+                (20, "1"),
+                (42, "2"),
+                (10, "0"),
+                (20, "0"),
+                (42, "1"),
+                (0, "ENDSEC"),
+                (0, "EOF"),
+            ]);
+            let layers = read("hatch.dxf", &bytes, &Options { crs: Some(Crs::LonLat), ..Options::default() }).unwrap();
+            assert_eq!(layers.len(), 1);
+            let (ds, report) = &layers[0];
+            assert_eq!(ds.geometry_type, GeometryType::Polygon);
+            assert_eq!(ds.features.len(), 1);
+            if tilted {
+                let Value::Float(z) = ds.value(0, 8) else { panic!("hatch elevation") };
+                assert!((z - 0.1 / 2.0_f64.sqrt()).abs() < 1e-14);
+            } else {
+                assert_eq!(ds.value(0, 8), &Value::Float(0.1));
+            }
+            assert_eq!(ds.zm_dropped, tilted);
+            assert_eq!(report.skipped, 0);
+            let expected = if tilted { vec!["1 feature lost varying Z coordinates; only the elevation attribute is kept"] } else { vec![] };
+            assert_eq!(report.messages, expected);
+        }
+    }
+
+    /// Cardinal block rotations have exact axes; a nearby angle still creates real Z variation.
+    #[test]
+    fn cardinal_insert_rotations_do_not_invent_height_variation() {
+        for (rotation, x, y, end_y, varying) in [
+            ("0", "1", "0", 1.0, false),
+            ("90", "0", "1", -1.0, false),
+            ("180", "1", "0", -1.0, false),
+            ("270", "0", "1", 1.0, false),
+            ("360", "1", "0", 1.0, false),
+            ("89.999999", "0", "1", -1.0, true),
+        ] {
+            let bytes = dxf(&[
+                (0, "SECTION"),
+                (2, "BLOCKS"),
+                (0, "BLOCK"),
+                (2, "B"),
+                (0, "LINE"),
+                (10, "0"),
+                (20, "0"),
+                (30, "0"),
+                (11, x),
+                (21, y),
+                (31, "0"),
+                (0, "ENDBLK"),
+                (0, "ENDSEC"),
+                (0, "SECTION"),
+                (2, "ENTITIES"),
+                (0, "INSERT"),
+                (2, "B"),
+                (10, "0"),
+                (20, "0"),
+                (30, "0"),
+                (50, rotation),
+                (210, "1"),
+                (220, "0"),
+                (230, "0"),
+                (0, "ENDSEC"),
+                (0, "EOF"),
+            ]);
+            let layers = read("rotated.dxf", &bytes, &Options { crs: Some(Crs::LonLat), ..Options::default() }).unwrap();
+            assert_eq!(layers.len(), 1);
+            let (ds, report) = &layers[0];
+            assert_eq!(ds.features.len(), 1);
+            assert_eq!(ds.value(0, 8), &Value::Float(0.0));
+            assert_eq!(ds.zm_dropped, varying, "rotation={rotation}: {:?}", report.messages);
+            let expected =
+                if varying { vec!["1 feature lost varying Z coordinates; only the elevation attribute is kept"] } else { vec![] };
+            assert_eq!(report.messages, expected);
+            assert_eq!(report.skipped, 0);
+            let Some(Geometry::Line(parts)) = &ds.features[0].geometry else { panic!("rotated line") };
+            assert_eq!(parts[0].first(), Some(&Coord::new(0.0, 0.0)));
+            let end = parts[0].last().unwrap();
+            assert_eq!(end.x, 0.0);
+            if varying {
+                assert!((end.y - end_y).abs() < 1e-12);
+            } else {
+                assert_eq!(end.y, end_y);
+            }
+        }
+    }
+
+    /// Exact height differences survive a large block offset, as they do without placement.
+    #[test]
+    fn exact_line_heights_are_reported_after_large_offsets() {
+        for (start, end, offset) in [("0", "1", "0"), ("1125899906842624", "1125899906842625", "-1125899906842624")] {
+            let bytes = dxf(&[
+                (0, "SECTION"),
+                (2, "BLOCKS"),
+                (0, "BLOCK"),
+                (2, "B"),
+                (0, "LINE"),
+                (10, "0"),
+                (20, "0"),
+                (30, start),
+                (11, "1"),
+                (21, "1"),
+                (31, end),
+                (0, "ENDBLK"),
+                (0, "ENDSEC"),
+                (0, "SECTION"),
+                (2, "ENTITIES"),
+                (0, "INSERT"),
+                (2, "B"),
+                (10, "0"),
+                (20, "0"),
+                (30, offset),
+                (0, "ENDSEC"),
+                (0, "EOF"),
+            ]);
+            let layers = read("line.dxf", &bytes, &Options { crs: Some(Crs::LonLat), ..Options::default() }).unwrap();
+            assert_eq!(layers.len(), 1);
+            let (ds, report) = &layers[0];
+            assert_eq!(ds.features.len(), 1);
+            assert_eq!(ds.features[0].geometry, Some(Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(1.0, 1.0)]])));
+            assert_eq!(ds.value(0, 8), &Value::Float(0.0));
+            assert!(ds.zm_dropped, "start={start}, offset={offset}");
+            assert_eq!(report.skipped, 0);
+            assert_eq!(report.messages, ["1 feature lost varying Z coordinates; only the elevation attribute is kept"]);
+        }
+    }
+
+    /// The corpus pair retains all XY/attributes, but the second height cannot fit in elevation.
+    #[test]
+    fn varying_line_height_is_reported() {
+        for end in ["5", "9"] {
+            let d = dxf(&[
+                (0, "SECTION"),
+                (2, "ENTITIES"),
+                (0, "LINE"),
+                (8, "0"),
+                (10, "0"),
+                (20, "0"),
+                (30, "5"),
+                (11, "1"),
+                (21, "1"),
+                (31, end),
+                (0, "ENDSEC"),
+                (0, "EOF"),
+            ]);
+            let layers = read("a.dxf", &d, &Options::default()).unwrap();
+            assert_eq!(layers.len(), 1);
+            let (ds, report) = &layers[0];
+            assert_eq!(ds.features.len(), 1);
+            assert_eq!(ds.features[0].geometry, Some(Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(1.0, 1.0)]])));
+            assert_eq!(
+                ds.features[0].attrs,
+                [
+                    Value::Text("0".into()),
+                    Value::Text("LINE".into()),
+                    Value::Int(7),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Float(5.0),
+                    Value::Bool(false)
+                ]
+            );
+            assert_eq!(report.skipped, 0);
+            assert_eq!(
+                report.messages[0],
+                "a DXF drawing doesn't say its coordinate system (give \"crs\", such as EPSG:2263): coordinates are kept as they are"
+            );
+            assert_eq!(report.messages.len(), if end == "9" { 2 } else { 1 });
+            if end == "9" {
+                assert_eq!(report.messages[1], "1 feature lost varying Z coordinates; only the elevation attribute is kept");
+            }
+        }
+    }
+
+    /// A wholly rejected feature loses its geometry, not just heights in retained output.
+    #[test]
+    fn varying_heights_exclude_crs_rejected_features() {
+        let text = "0 SECTION 2 ENTITIES 0 POINT 10 0 20 0 30 5
+            0 LINE 10 0 20 100 30 5 11 1 21 100 31 9 0 ENDSEC 0 EOF"
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let layers = read("crs.dxf", text.as_bytes(), &Options { crs: Some(Crs::from_epsg(4269).unwrap()), ..Options::default() }).unwrap();
+        assert_eq!(layers.iter().map(|(ds, _)| ds.features.len()).sum::<usize>(), 1);
+        assert_eq!(layers[0].0.features[0].geometry, Some(Geometry::Point(Coord::new(0.0, 0.0))));
+        assert!(layers.iter().all(|(ds, r)| !ds.zm_dropped && r.messages.iter().all(|m| !m.contains("varying Z"))));
+        let messages: Vec<&str> = layers.iter().flat_map(|(_, r)| &r.messages).map(|m| m.as_str()).collect();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].starts_with("1 features couldn't be converted from "), "{messages:?}");
     }
 
     #[test]

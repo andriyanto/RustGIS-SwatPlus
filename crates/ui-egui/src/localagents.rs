@@ -82,16 +82,7 @@ fn owns_child(child: &mut Child) -> bool {
 fn stamp() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let (days, rest) = ((secs / 86_400) as i64, secs % 86_400);
-    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
+    let (year, month, day) = rustgis_engine::data::date::civil_from_days(days);
     format!("{year:04}-{month:02}-{day:02}-{:02}{:02}{:02}", rest / 3600, rest / 60 % 60, rest % 60)
 }
 
@@ -167,110 +158,147 @@ impl Run {
             pid,
             _grant: grant,
         };
+        // A thread the system refuses returns the refusal; dropping `run` stops the program.
+        let refused = |e: std::io::Error| {
+            crate::i18n::fmt(
+                "{agent}: the system refused a thread to talk to it on ({error})",
+                &[("agent", spec.label), ("error", &e.to_string())],
+            )
+        };
         let (events, session, writer_ctx) = (run.events.clone(), run.session.clone(), ctx.clone());
-        std::thread::spawn(move || {
-            let Some(mut pipe) = stdin else { return };
-            for line in lines {
-                if pipe.write_all(line.as_bytes()).and_then(|()| pipe.write_all(b"\n")).and_then(|()| pipe.flush()).is_err() {
-                    let new = session.lock().map(|mut s| s.exited(false, crate::tl!("Agent input pipe closed."))).unwrap_or_default();
-                    if let Ok(mut events) = events.lock() {
-                        events.extend(new);
+        std::thread::Builder::new()
+            .name("rustgis-agent-input".into())
+            .spawn(move || {
+                let Some(mut pipe) = stdin else { return };
+                for line in lines {
+                    if pipe.write_all(line.as_bytes()).and_then(|()| pipe.write_all(b"\n")).and_then(|()| pipe.flush()).is_err() {
+                        let new = session.lock().map(|mut s| s.exited(false, crate::tl!("Agent input pipe closed."))).unwrap_or_default();
+                        if let Ok(mut events) = events.lock() {
+                            events.extend(new);
+                        }
+                        writer_ctx.request_repaint();
+                        break;
                     }
-                    writer_ctx.request_repaint();
-                    break;
                 }
-            }
-        });
+            })
+            .map_err(refused)?;
         send(&run.stdin, &init)?;
         // Its last bytes of errors, decoded once it ends (a character split across reads stays whole).
         let errors: Arc<Mutex<Vec<u8>>> = Arc::default();
         if let Some(mut stderr) = stderr {
             let errors = errors.clone();
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 1024];
-                while let Ok(n) = stderr.read(&mut buf) {
-                    let Some(piece) = buf.get(..n).filter(|p| !p.is_empty()) else { break };
-                    if let Ok(mut e) = errors.lock() {
-                        e.extend_from_slice(piece);
-                        let over = e.len().saturating_sub(MAX_STDERR);
-                        if over > 0 {
-                            // Cut at the start of a character, not inside one.
-                            let cut = (over..e.len()).find(|i| e.get(*i).is_some_and(|b| b & 0xC0 != 0x80)).unwrap_or(e.len());
-                            e.drain(..cut);
+            std::thread::Builder::new()
+                .name("rustgis-agent-errors".into())
+                .spawn(move || {
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = stderr.read(&mut buf) {
+                        let Some(piece) = buf.get(..n).filter(|p| !p.is_empty()) else { break };
+                        if let Ok(mut e) = errors.lock() {
+                            e.extend_from_slice(piece);
+                            let over = e.len().saturating_sub(MAX_STDERR);
+                            if over > 0 {
+                                // Cut at the start of a character, not inside one.
+                                let cut = (over..e.len()).find(|i| e.get(*i).is_some_and(|b| b & 0xC0 != 0x80)).unwrap_or(e.len());
+                                e.drain(..cut);
+                            }
                         }
                     }
-                }
-            });
+                })
+                .map_err(refused)?;
         }
         let (events, session, stdin, child) = (run.events.clone(), run.session.clone(), run.stdin.clone(), run.child.clone());
-        std::thread::spawn(move || {
-            let push = |new: Vec<acp::Event>| {
-                if !new.is_empty() {
-                    if let Ok(mut e) = events.lock() {
-                        e.extend(new);
-                    }
-                    ctx.request_repaint();
-                }
-            };
-            if let Some(stdout) = stdout {
-                // Its lines, each at most the relay's limit: an oversized or unreadable one is
-                // skipped, not buffered whole.
-                let mut reader = BufReader::new(stdout);
-                'reading: loop {
-                    let line = match read_message_max(&mut reader, MAX_LINE, Oversize::Skip) {
-                        Ok(Some(line)) => line,
-                        Ok(None) | Err(FramingError::Io(_)) => break,
-                        Err(_) => continue,
-                    };
-                    let (out, new) = match session.lock() {
-                        Ok(mut s) => s.line(&line),
-                        Err(_) => break,
-                    };
-                    for l in out {
-                        if let Err(why) = send(&stdin, &l) {
-                            push(session.lock().map(|mut s| s.exited(false, &why)).unwrap_or_default());
-                            break 'reading;
+        std::thread::Builder::new()
+            .name("rustgis-agent-output".into())
+            .spawn(move || {
+                let push = |new: Vec<acp::Event>| {
+                    if !new.is_empty() {
+                        if let Ok(mut e) = events.lock() {
+                            e.extend(new);
                         }
+                        ctx.request_repaint();
                     }
-                    push(new);
+                };
+                if let Some(stdout) = stdout {
+                    // Its lines, each at most the relay's limit: an oversized or unreadable one is
+                    // skipped, not buffered whole.
+                    let mut reader = BufReader::new(stdout);
+                    'reading: loop {
+                        let line = match read_message_max(&mut reader, MAX_LINE, Oversize::Skip) {
+                            Ok(Some(line)) => line,
+                            Ok(None) | Err(FramingError::Io(_)) => break,
+                            Err(_) => continue,
+                        };
+                        let new = match session.lock() {
+                            Ok(mut s) => {
+                                let (out, new) = s.line(&line);
+                                // Queue writes under the state lock: auto-off cannot overtake a
+                                // prompt that passed readiness, nor can that prompt follow cancel.
+                                for l in out {
+                                    if let Err(why) = send(&stdin, &l) {
+                                        push(s.exited(false, &why));
+                                        break 'reading;
+                                    }
+                                }
+                                new
+                            }
+                            Err(_) => break,
+                        };
+                        push(new);
+                    }
                 }
-            }
-            // Its output ended: wait for it to exit without holding the lock (Stop must not wait).
-            let ok = loop {
-                let status = child.lock().ok().and_then(|mut c| c.as_mut().map(child_status));
-                match status {
-                    Some(Ok(Some(ok))) => break ok,
-                    Some(Ok(None)) => std::thread::sleep(Duration::from_millis(50)),
-                    _ => break false,
-                }
-            };
-            let why = errors.lock().map(|e| String::from_utf8_lossy(&e).into_owned()).unwrap_or_default();
-            let new = session.lock().map(|mut s| s.exited(ok, &why)).unwrap_or_default();
-            push(new);
-        });
+                // Its output ended: wait for it to exit without holding the lock (Stop must not wait).
+                let ok = loop {
+                    let status = child.lock().ok().and_then(|mut c| c.as_mut().map(child_status));
+                    match status {
+                        Some(Ok(Some(ok))) => break ok,
+                        Some(Ok(None)) => std::thread::sleep(Duration::from_millis(50)),
+                        _ => break false,
+                    }
+                };
+                let why = errors.lock().map(|e| String::from_utf8_lossy(&e).into_owned()).unwrap_or_default();
+                let new = session.lock().map(|mut s| s.exited(ok, &why)).unwrap_or_default();
+                push(new);
+            })
+            .map_err(refused)?;
         Ok(run)
     }
 
-    /// What it did and asked since last asked.
+    /// What it did and asked since last asked, including an unanswered mode-change timeout.
     pub fn events(&self) -> Vec<acp::Event> {
-        self.events.lock().map(|mut e| std::mem::take(&mut *e)).unwrap_or_default()
+        let mut new = self.session.lock().map(|mut s| s.poll()).unwrap_or_default();
+        let mut events = self.events.lock().map(|mut e| std::mem::take(&mut *e)).unwrap_or_default();
+        events.append(&mut new);
+        events
     }
 
-    /// A follow-up task, once it has finished the last one; false when it can't take one.
-    pub fn follow_up(&self, task: &str) -> bool {
-        let lines = self.session.lock().ok().and_then(|mut s| s.follow_up(task));
-        match lines {
-            Some(lines) => {
-                for line in lines {
-                    if let Err(why) = send(&self.stdin, &line) {
-                        self.input_failed(&why);
-                        return false;
-                    }
+    /// Apply the current shared setting and start a follow-up under one session lock, then
+    /// queue their lines in order. A reply cannot release work between those two decisions.
+    pub fn follow_up(&self, task: &str, auto: bool) -> bool {
+        self._grant.set_auto(auto);
+        let Ok(mut s) = self.session.lock() else { return false };
+        let (mut lines, mut new) = s.set_auto(auto);
+        let accepted = if let Some((follow, events)) = s.follow_up(task) {
+            lines.extend(follow);
+            new.extend(events);
+            true
+        } else {
+            false
+        };
+        for line in lines {
+            if let Err(why) = send(&self.stdin, &line) {
+                new.extend(s.exited(false, &why));
+                if let Ok(mut events) = self.events.lock() {
+                    events.extend(new);
                 }
-                true
+                return false;
             }
-            None => false,
         }
+        if let Ok(mut events) = self.events.lock() {
+            events.extend(new);
+        }
+        // Even an immediate readiness refusal was accepted as a turn: its Done event tells
+        // the caller why. Returning false would instead claim the thread had ended.
+        accepted
     }
 
     fn input_failed(&self, why: &str) {
@@ -280,11 +308,21 @@ impl Run {
         }
     }
 
-    /// Whether the user lets it act without asking (its full-access mode), from its next task on.
+    /// Apply the shared approval setting immediately, forwarding cancellation and mode changes
+    /// in session order. A turn already running unsafely is stopped with a visible report.
     pub fn set_auto(&self, auto: bool) {
         self._grant.set_auto(auto);
         if let Ok(mut s) = self.session.lock() {
-            s.set_auto(auto);
+            let (lines, mut new) = s.set_auto(auto);
+            for line in lines {
+                if let Err(why) = send(&self.stdin, &line) {
+                    new.extend(s.exited(false, &why));
+                    break;
+                }
+            }
+            if let Ok(mut events) = self.events.lock() {
+                events.extend(new);
+            }
         }
     }
 
@@ -400,6 +438,7 @@ mod tests {
 
     /// The argument that makes this binary the fake agent (also a test filter matching nothing).
     const CHILD_MARK: &str = "rustgis-acp-child-mode";
+    const HELD_MODES: &str = "rustgis-acp-held-modes";
 
     /// The fake agent: ACP over standard input and output. A task with ASK asks for permission
     /// first; one with HANG works until it's cancelled; any other is done at once.
@@ -408,6 +447,9 @@ mod tests {
         if !std::env::args().any(|a| a == CHILD_MARK) {
             return;
         }
+        let held_modes = std::env::args().any(|a| a == HELD_MODES);
+        let mut mode_reply: Option<(Value, String)> = None;
+        let mut prompts = 0;
         let mut out = std::io::stdout();
         let _ = writeln!(out);
         let send = |out: &mut std::io::Stdout, v: Value| {
@@ -416,6 +458,7 @@ mod tests {
         };
         let update = |u: Value| json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "fake", "update": u}});
         let say = |t: &str| update(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": t}}));
+        let mark = |title: &str| update(json!({"sessionUpdate": "tool_call", "toolCallId": "fixture", "title": title}));
         let mut lines = std::io::stdin().lock().lines().map_while(Result::ok);
         let mut hanging: Option<Value> = None;
         while let Some(line) = lines.next() {
@@ -426,20 +469,49 @@ mod tests {
                     &mut out,
                     json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": 1, "agentCapabilities": {}, "authMethods": []}}),
                 ),
-                Some("session/new") => send(&mut out, json!({"jsonrpc": "2.0", "id": id, "result": {"sessionId": "fake"}})),
+                Some("session/new") => {
+                    let mut modes = vec![json!({"id": "agent"})];
+                    if held_modes {
+                        modes.push(json!({"id": "agent-full-access"}));
+                    }
+                    send(
+                        &mut out,
+                        json!({"jsonrpc": "2.0", "id": id, "result": {"sessionId": "fake", "modes": {"currentModeId": "agent", "availableModes": modes}}}),
+                    );
+                }
+                Some("session/set_mode") if held_modes => {
+                    let mode = msg["params"]["modeId"].as_str().unwrap().to_string();
+                    send(&mut out, mark(&format!("held:{mode}")));
+                    assert!(mode_reply.replace((id, mode)).is_none(), "mode changes must stay serialized");
+                }
+                Some("test/release_mode") if held_modes => {
+                    let (id, mode) = mode_reply.take().unwrap();
+                    send(&mut out, json!({"jsonrpc": "2.0", "id": id, "result": {}}));
+                    send(&mut out, mark(&format!("released:{mode}")));
+                }
+                Some("test/full_mode") if held_modes => {
+                    send(&mut out, update(json!({"sessionUpdate": "current_mode_update", "currentModeId": "agent-full-access"})))
+                }
+                Some("test/barrier") if held_modes => {
+                    send(&mut out, mark(&format!("{}:{prompts}", msg["params"]["name"].as_str().unwrap())))
+                }
                 Some("session/cancel") => {
                     if let Some(pid) = hanging.take() {
                         send(&mut out, json!({"jsonrpc": "2.0", "id": pid, "result": {"stopReason": "cancelled"}}));
                     }
                 }
                 Some("session/prompt") => {
+                    if held_modes {
+                        prompts += 1;
+                        send(&mut out, mark("prompt"));
+                    }
                     let task = msg["params"]["prompt"][0]["text"].as_str().unwrap_or("").to_string();
                     if task.contains("BLOCK") {
                         send(
                             &mut out,
                             update(json!({"sessionUpdate":"tool_call","toolCallId":"blocked","title":"Blocked","status":"in_progress"})),
                         );
-                        std::thread::sleep(Duration::from_secs(30));
+                        std::thread::sleep(Duration::from_secs(30)); // test-wait: simulate an agent that blocks instead of consuming stdin
                         continue;
                     }
                     if task.contains("HANG") {
@@ -490,7 +562,7 @@ mod tests {
             if done {
                 return all;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(20)); // test-wait: legacy polling for agent events
         }
         all
     }
@@ -500,6 +572,145 @@ mod tests {
             Event::Done { report, error } => Some((report.clone(), *error)),
             _ => None,
         })
+    }
+
+    /// The actual checkbox must reach a held ACP upgrade before the next thread poll. The
+    /// child's FIFO barrier counts every prompt, including events a later app poll consumes.
+    #[test]
+    fn local_agents_checkbox_contains_held_upgrade_and_queued_follow_up() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_assistant::agent::{Agent, Step};
+        use rustgis_assistant::provider::Config;
+        use std::sync::{Arc, Mutex};
+
+        /// Read the real process events without draining them before the app's next poll.
+        fn wait_mark(events: &Arc<Mutex<Vec<Event>>>, prefix: &str) -> String {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(title) = events.lock().unwrap().iter().find_map(|e| match e {
+                    Event::Tool(title) if title == prefix || (prefix.ends_with(':') && title.starts_with(prefix)) => Some(title.clone()),
+                    _ => None,
+                }) {
+                    return title;
+                }
+                assert!(Instant::now() < deadline, "fake ACP barrier timed out: {prefix}");
+                std::thread::sleep(Duration::from_millis(5)); // test-wait: legacy polling for the fake agent barrier
+            }
+        }
+        /// Inject a provider reply through Agent's normal delegation queue, with no HTTP.
+        fn delegate(a: &mut Agent, s: &mut rustgis_engine::Session, thread: Option<&str>) {
+            let mut args = json!({"agent": "goose", "task": "Map the cities"});
+            if let Some(thread) = thread {
+                args["thread"] = json!(thread);
+            }
+            let body = json!({"choices": [{"message": {"role": "assistant", "content": null,
+                "tool_calls": [{"id": "d", "type": "function", "function": {"name": "delegate", "arguments": args.to_string()}}]},
+                "finish_reason": "tool_calls"}]})
+            .to_string()
+            .into_bytes();
+            assert!(matches!(
+                a.receive(a.generation(), Ok(rustgis_assistant::HttpResponse { status: 200, body, headers: vec![] }), s),
+                Step::Send(_)
+            ));
+        }
+
+        let relay = rustgis_assistant::relay::Relay::start(0).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let command = vec![
+            exe.display().to_string(),
+            "localagents::tests::fake_acp_agent".into(),
+            CHILD_MARK.into(),
+            HELD_MODES.into(),
+            "--exact".into(),
+            "--nocapture".into(),
+            "--test-threads=1".into(),
+        ];
+        let ctx = egui::Context::default();
+        let run = Run::start(
+            AgentSpec::from_id("goose").unwrap(),
+            &command,
+            "Map the cities",
+            &relay,
+            &exe,
+            work.path().to_path_buf(),
+            true,
+            ctx.clone(),
+        )
+        .unwrap();
+        let (events, input) = (run.events.clone(), run.stdin.clone());
+        let mut app = crate::RustGisApp::with_sample();
+        let prefs = Arc::new(Mutex::new(Vec::new()));
+        let saved = prefs.clone();
+        app.services.save_pref = Some(Box::new(move |key, value| saved.lock().unwrap().push((key.to_string(), value.to_string()))));
+        crate::agentthreads::insert_test_run(&mut app, run);
+        let mut h = crate::assistantpane::tests::local_agents_harness(app);
+        h.run_steps(3);
+        wait_mark(&events, "held:agent-full-access");
+        h.get_by_label("Approve agents' actions without asking").click();
+        h.step();
+        assert!(!h.state().assistant.agents_auto);
+        assert!(prefs.lock().unwrap().contains(&("assistant_agents_auto".into(), "off".into())));
+        // No agentthreads poll occurs between the real checkbox callback and this reply.
+        let control =
+            |method: &str, name: &str| super::send(&input, &json!({"method": method, "params": {"name": name}}).to_string()).unwrap();
+        control("test/release_mode", "");
+        wait_mark(&events, "released:agent-full-access");
+        control("test/barrier", "after-upgrade");
+        assert_eq!(wait_mark(&events, "after-upgrade:"), "after-upgrade:0");
+        assert_eq!(wait_mark(&events, "held:agent"), "held:agent");
+        control("test/release_mode", "");
+        wait_mark(&events, "released:agent");
+        control("test/barrier", "after-asking");
+        assert_eq!(wait_mark(&events, "after-asking:"), "after-asking:1");
+        assert!(events.lock().unwrap().iter().any(|e| matches!(e, Event::Done { error: false, .. })));
+        crate::agentthreads::poll(h.state_mut(), &ctx);
+
+        // Queue a real parent-Agent follow-up while auto is on, then change the checkbox
+        // before poll consumes that queue. The Run must use the current shared flag.
+        h.get_by_label("Approve agents' actions without asking").click();
+        h.step();
+        assert!(h.state().assistant.agents_auto);
+        control("test/full_mode", "");
+        control("test/barrier", "full-between-turns");
+        assert_eq!(wait_mark(&events, "full-between-turns:"), "full-between-turns:1");
+        let config = Config {
+            provider: "openai".into(),
+            base_url: "https://model.invalid/v1".into(),
+            model: "fixture".into(),
+            key: "synthetic-test".into(),
+            account: String::new(),
+            client_id: String::new(),
+            session: String::new(),
+            reasoning: None,
+            tool_output_token_limit: rustgis_assistant::tools::DEFAULT_OUTPUT_TOKENS,
+        };
+        let app = h.state_mut();
+        let mut a = Agent::new(config, &app.session);
+        a.set_harnesses(vec![AgentSpec::from_id("goose").unwrap()]);
+        a.set_agents_auto(true);
+        assert!(matches!(a.ask("Map it", &app.session), Step::Send(_)));
+        delegate(&mut a, &mut app.session, None);
+        let first = a.take_delegations();
+        assert_eq!(first[0].thread, "goose-1");
+        a.thread_report("goose-1", "Done".into(), false);
+        delegate(&mut a, &mut app.session, Some("goose-1"));
+        app.assistant.agent = Some(a);
+        h.get_by_label("Approve agents' actions without asking").click();
+        h.step();
+        assert!(!h.state().assistant.agents_auto);
+        crate::agentthreads::poll(h.state_mut(), &ctx);
+        control("test/barrier", "queued-follow-up");
+        assert_eq!(wait_mark(&events, "queued-follow-up:"), "queued-follow-up:1", "a queued follow-up waits for asking mode");
+        control("test/release_mode", "");
+        // The response marker follows Session processing, so its generated prompt is
+        // already queued before this final FIFO barrier.
+        wait_mark(&events, "released:agent");
+        control("test/barrier", "follow-up-done");
+        assert_eq!(wait_mark(&events, "follow-up-done:"), "follow-up-done:2");
+        drop(input);
+        drop(h);
+        super::finish_stops();
     }
 
     /// Two tasks of one agent within the same second get folders of their own.
@@ -538,8 +749,8 @@ mod tests {
         assert_eq!(report(&ev), Some(("Did the task.".into(), false)));
         assert!(!run.finished());
         // A follow-up that asks for permission: allowed.
-        assert!(run.follow_up("ASK to fetch"));
-        assert!(!run.follow_up("one at a time"), "a working thread takes no second task");
+        assert!(run.follow_up("ASK to fetch", false));
+        assert!(!run.follow_up("one at a time", false), "a working thread takes no second task");
         let ev = until_done(&run);
         assert!(ev.contains(&Event::Tool("Fetch the gauges".into())), "{ev:?}");
         let Some(Event::Permission(p)) = ev.iter().find(|e| matches!(e, Event::Permission(_))).cloned() else {
@@ -549,15 +760,15 @@ mod tests {
         run.answer(&p, Choice::Allow);
         assert_eq!(report(&until_done(&run)), Some(("Allowed: fetched 3 gauges.".into(), false)));
         // Declined.
-        assert!(run.follow_up("ASK again"));
+        assert!(run.follow_up("ASK again", false));
         let Some(Event::Permission(p)) = until_done(&run).into_iter().find(|e| matches!(e, Event::Permission(_))) else {
             panic!("no request")
         };
         run.answer(&p, Choice::Reject);
         assert_eq!(report(&until_done(&run)), Some(("Declined.".into(), false)));
         // Its relay token is its own, revoked with it; Stop ends a task that never would.
-        assert!(run.follow_up("HANG"));
-        std::thread::sleep(Duration::from_millis(300));
+        assert!(run.follow_up("HANG", false));
+        std::thread::sleep(Duration::from_millis(300)); // test-wait: legacy delay before stopping the hung agent
         let pid = run.pid;
         let grant_file = run._grant.token_file().to_path_buf();
         assert!(grant_file.exists());
@@ -567,7 +778,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         while alive(pid) {
             assert!(Instant::now() < deadline, "the agent's process outlived Stop");
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(50)); // test-wait: legacy polling for agent process exit
         }
         relay.stop();
         let _ = std::fs::remove_dir_all(&work);
@@ -644,7 +855,7 @@ mod tests {
                 break;
             }
             assert!(Instant::now() < deadline, "fake agent never blocked");
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(20)); // test-wait: legacy polling for the blocked-stdin marker
         }
         // Fill the writer pipe and its bounded queue while the fake agent refuses reads.
         for _ in 0..16 {
@@ -664,7 +875,7 @@ mod tests {
         let until = Instant::now() + Duration::from_secs(5);
         while child.lock().unwrap().as_mut().unwrap().try_wait().unwrap().is_none() {
             assert!(Instant::now() < until, "agent survived Stop");
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(20)); // test-wait: legacy polling for the stopped child to exit
         }
         relay.stop();
         let _ = std::fs::remove_dir_all(work);
@@ -695,7 +906,7 @@ mod tests {
                 break;
             }
             assert!(Instant::now() < until);
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(20)); // test-wait: legacy polling for the descendant marker
         }
         let descendant: u32 = std::fs::read_to_string(work.join("descendant.pid")).unwrap().trim().parse().unwrap();
         assert!(alive(descendant));
@@ -704,7 +915,7 @@ mod tests {
         let until = Instant::now() + Duration::from_secs(5);
         while alive(descendant) {
             assert!(Instant::now() < until, "descendant survived Stop");
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(20)); // test-wait: legacy polling for descendant process exit
         }
         relay.stop();
         let _ = std::fs::remove_dir_all(base);

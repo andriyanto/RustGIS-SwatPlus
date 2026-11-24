@@ -1,8 +1,8 @@
 //! The attribute table's geometry calculator: stores each feature's area, perimeter, length or
 //! X/Y coordinate, calculated from its WGS84 geometry, in a field.
 use crate::{CmdResult, Session};
-use rustgis_data::{FieldType, Geometry, GeometryType, Value, raster::Crs};
-use rustgis_geom::{geodesic_length_m, geodesic_ring_area_m2, spherical_centre};
+use rustgis_data::{FieldType, Geometry, GeometryType, Measure, Value, raster::Crs};
+use rustgis_geom::spherical_centre;
 use serde_json::{Value as Json, json};
 
 /// The properties a layer of `kind` can calculate, as `(key, label)` pairs.
@@ -32,29 +32,6 @@ pub fn units(property: &str) -> &'static [(&'static str, &'static str)] {
     }
 }
 
-fn measure(g: &Geometry, property: &str) -> Option<f64> {
-    match (g, property) {
-        (Geometry::Polygon(polys), "area") => Some(
-            polys
-                .iter()
-                .map(|rings| rings.iter().enumerate().map(|(i, r)| geodesic_ring_area_m2(r) * if i == 0 { 1.0 } else { -1.0 }).sum::<f64>())
-                .sum(),
-        ),
-        (Geometry::Polygon(polys), "perimeter") => Some(
-            polys
-                .iter()
-                .flatten()
-                .map(|r| {
-                    let closing = r.first().zip(r.last()).filter(|(a, b)| a != b).map(|(a, b)| geodesic_length_m(&[*b, *a])).unwrap_or(0.0);
-                    geodesic_length_m(r) + closing
-                })
-                .sum(),
-        ),
-        (Geometry::Line(parts), "length") => Some(parts.iter().map(|r| geodesic_length_m(r)).sum()),
-        _ => None,
-    }
-}
-
 /// Runs `edit.calculateGeometry`: fills `field` (new or existing numeric) of the chosen features
 /// with `property` in `unit`, as one undo step; on any error nothing changes.
 pub fn run(s: &mut Session, p: &Json) -> CmdResult {
@@ -65,8 +42,10 @@ pub fn run(s: &mut Session, p: &Json) -> CmdResult {
     if !properties(l.geometry_type()).iter().any(|(k, _)| *k == property) {
         return Err("property does not match the layer geometry".into());
     }
-    if !units(property).iter().any(|(k, _)| *k == unit) {
-        return Err("unit does not match the property".into());
+    let accepted = units(property);
+    if !accepted.iter().any(|(k, _)| *k == unit) {
+        let valid = accepted.iter().map(|(key, _)| *key).collect::<Vec<_>>().join(", ");
+        return Err(format!("unit does not match the property; valid units: {valid}"));
     }
     let transformer = if unit == "projected" {
         let code = p.get("epsg").and_then(Json::as_u64).and_then(|n| u32::try_from(n).ok()).ok_or("EPSG code is required")?;
@@ -104,25 +83,34 @@ pub fn run(s: &mut Session, p: &Json) -> CmdResult {
     if rows.is_empty() {
         return Err("no features to calculate".into());
     }
-    let divisor = match unit {
-        "km" => 1e3,
-        "ft" => rustgis_geom::METRES_PER_FOOT,
-        "mi" => rustgis_geom::METRES_PER_MILE,
-        "km2" => 1e6,
-        "ft2" => rustgis_geom::SQUARE_METRES_PER_SQUARE_FOOT,
-        "mi2" => rustgis_geom::SQUARE_METRES_PER_SQUARE_MILE,
-        "ha" => 1e4,
-        "ac" => rustgis_geom::SQUARE_METRES_PER_ACRE,
-        _ => 1.0,
+    if property == "area"
+        && let Some(message) = l.dataset.ambiguous_area_message(rows.iter().filter_map(|&r| l.dataset.features.get(r)?.geometry.as_ref()))
+    {
+        return Err(format!("{}: {message}", l.dataset.name));
+    }
+    let measure = Measure::from_key(property);
+    let divisor = match measure {
+        Some(m) => m.unit(unit).ok_or("unit does not match the property")?,
+        None => 1.0,
     };
     let mut values = Vec::with_capacity(rows.len());
     let mut nulls = 0;
+    // Made at the first feature with a geometry, once for the layer.
+    let mut conversion = None;
     for row in &rows {
         let f = l.dataset.features.get(*row).ok_or("selection contains a missing feature")?;
         let value = if let Some(g) = &f.geometry {
             if g.kind() != l.geometry_type() {
                 return Err("feature geometry does not match the layer".into());
             }
+            // Measured and placed in longitude/latitude, from the layer's own coordinates through
+            // WGS 84, whatever map it is shown on.
+            let to = match &mut conversion {
+                Some(to) => &*to,
+                slot @ None => slot.insert(l.dataset.lonlat_conversion().map_err(|e| format!("feature {}: {e}", f.id))?),
+            };
+            let g = rustgis_data::Dataset::geometry_to_lonlat_by(to, g).map_err(|e| format!("feature {}: {e}", f.id))?;
+            let g = g.as_ref();
             // Lengths and areas use longitude differences, so a shape drawn or buffered across the
             // antimeridian may run past ±180°; a coordinate has to be a real longitude.
             let max_x = if matches!(property, "x" | "y") { 180.0 } else { 360.0 };
@@ -147,7 +135,7 @@ pub fn run(s: &mut Session, p: &Json) -> CmdResult {
                 };
                 c.map(|c| if property == "x" { c.x } else { c.y })
             } else {
-                measure(g, property).map(|v| v / divisor)
+                measure.and_then(|m| g.wgs84_measure(m)).map(|v| v / divisor)
             }
         } else {
             None

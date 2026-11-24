@@ -6,11 +6,11 @@
 //! beyond the project (files, the network, the user's own automation) need the user's approval
 //! first ([`gate`]).
 
-use rustgis_engine::cmd::plugins::{Reach, reaches, user_only};
+use rustgis_engine::policy::{Call, Outcome, Permit, Scope};
 use rustgis_engine::{Session, analysis, project};
 use serde_json::{Value, json};
 
-use crate::provider::{ToolCall, ToolDef};
+use crate::provider::{ToolCall, ToolDef, ToolImage};
 
 /// Default per-tool token estimate, matching Codex's default output budget.
 pub const DEFAULT_OUTPUT_TOKENS: usize = 10_000;
@@ -39,6 +39,22 @@ pub fn defs() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "view_map",
+            description: "The map as it looks now, as a PNG image: look after changing it. The current view, at a size of your choosing (default 1024 x 640), or a layout's page; region draws part of either at full detail, to read small text.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "width": {"type": "integer", "description": "Pixels (64 to 2048)"},
+                    "height": {"type": "integer", "description": "Pixels (64 to 2048); with a layout or a region, the picture fits width (and height when given) in their shape"},
+                    "layout": {"type": "string", "description": "A layout's name: its page (a map series' current page) instead of the map view"},
+                    "region": {
+                        "type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4,
+                        "description": "A closer look, drawn at full detail (up to 600 dpi on a page): [x, y, w, h] in mm from the page's top left with a layout, else [west, south, east, north] in degrees on the map (with a small margin)"
+                    }
+                }
+            }),
+        },
+        ToolDef {
             name: "search_commands",
             description: "Search RustGIS commands (map navigation, layers, symbology, labels, selection, editing, layouts, export…) by words. Returns each command's id, label, ribbon location and parameters.",
             schema: json!({
@@ -52,7 +68,7 @@ pub fn defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "run_command",
-            description: "Run a RustGIS command by id with JSON parameters (see search_commands for ids and parameters). Each run is one undo step. Commands that read or write files, use the network or replace the project ask the user first.",
+            description: "Run a RustGIS command by id with JSON parameters (see search_commands for ids and parameters). Project edits are undoable. Source publication and other external file writes cannot be undone. Commands that read or write files, use the network or replace the project ask the user first. A notice that reports lost data with a loss code is also in the result's losses, as {code, kind, text, action}; for an assumed.* code, ask the user rather than guess.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -85,7 +101,7 @@ pub fn defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "run_tool",
-            description: "Run a geoprocessing tool. Its output is added to the map as a new layer, or to the project as a standalone table (for example Summary Statistics), whose name the result gives (use it as the input of a next step; read a table with read_features). One undo step.",
+            description: "Run a geoprocessing tool. Its output is added to the map as a new layer, or to the project as a standalone table (for example Summary Statistics), whose name the result gives (use it as the input of a next step; read a table with read_features). One undo step. As for run_command, a notice that reports lost data with a loss code is also in the result's losses, as {code, kind, text, action}.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -142,99 +158,75 @@ pub fn defs() -> Vec<ToolDef> {
 }
 
 /// The command a call runs and its parameters (`gp.run` for a tool), if it runs one.
+/// Use execution's strict envelope parser for policy too: malformed input has no runnable target.
 pub fn target(call: &ToolCall) -> Option<(String, Value)> {
     match call.name.as_str() {
-        "run_command" => Some((str_arg(&call.args, "command").unwrap_or_default(), obj_arg(&call.args, "params"))),
+        "run_command" => Some((str_arg(&call.args, "command").unwrap_or_default(), params_arg(&call.args).ok()?)),
         "run_tool" => Some((
             "gp.run".to_string(),
-            json!({"tool": str_arg(&call.args, "tool").unwrap_or_default(), "params": obj_arg(&call.args, "params")}),
+            json!({"tool": str_arg(&call.args, "tool").unwrap_or_default(), "params": params_arg(&call.args).ok()?}),
         )),
         _ => None,
     }
 }
 
-/// Whether a call needs the user's approval, and why.
-pub fn gate(s: &Session, call: &ToolCall) -> Option<String> {
-    // MCP's snapshot, saved to a file.
-    if call.name == "snapshot" {
-        return call
-            .args
-            .get("save_path")
-            .and_then(Value::as_str)
-            .filter(|p| !p.trim().is_empty())
-            .map(|_| "it writes a file on this computer".into());
-    }
-    // A script asks once, for every line that needs it, each named.
-    if call.name == "run" {
-        let script = call.args.get("script").and_then(Value::as_str).unwrap_or("");
-        let reasons: Vec<String> = rustgis_engine::cmd::workflows::script_commands(script)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|(n, id, params)| {
-                let line = ToolCall { id: String::new(), name: "run_command".into(), args: json!({"command": id, "params": params}) };
-                gate(s, &line).map(|why| format!("line {n} ({id}): {why}"))
-            })
-            .collect();
-        return (!reasons.is_empty()).then(|| reasons.join("; "));
-    }
-    let (id, params) = target(call)?;
-    if id.starts_with(rustgis_engine::plugins::PREFIX) {
-        return Some("it runs a plugin's command".into());
-    }
-    if id == "ui.addUrl" && ["geolibreProject", "geolibreLayer", "geolibreZarr"].iter().any(|key| params.get(key).is_some()) {
-        return Some("it adds the files and web addresses a GeoLibre project names".into());
-    }
-    if user_only(&id) && !matches!(id.as_str(), "edit.undo" | "edit.redo") {
-        return Some(match id.as_str() {
-            "project.new" | "project.open" | "project.openText" | "project.sample" | "project.fromTemplate" => {
-                "it replaces the open project".into()
-            }
-            // Whether given a path, text or data: the project names the files and web addresses
-            // its layers are added from.
-            "layer.addDownload" => "it completes a download that may import a project and its referenced sources".into(),
-            "project.importGeolibre" => "it adds the files and web addresses a GeoLibre project names".into(),
-            "project.importQgis" => "it adds the files and web addresses a QGIS project names".into(),
-            _ => "it is reserved to you (plugins, scripts, tasks, models and the GeoLibre runner)".into(),
-        });
-    }
-    let spec = s.registry.get(&id)?;
-    if id == rustgis_engine::cmd::plugins::SQL || id == "sql.query" {
-        let why = "it runs an SQL query, which can read files on this computer and addresses on the internet";
-        // Views in a database the query opens run too, though the query doesn't show them.
-        return Some(match params.get("database").and_then(Value::as_str).filter(|d| !d.trim().is_empty()) {
-            Some(d) => format!("{why} (as can views in the database {d})"),
-            None => why.into(),
-        });
-    }
-    match reaches(spec, &params) {
-        Some(Reach::Files) => Some("it reads or writes files on this computer".into()),
-        Some(Reach::Network) => Some("it connects to an address on the internet".into()),
-        None => None,
+/// Whether a successfully executed tool explicitly chose a layer, even if it was already active.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn selects_layer(name: &str, args: &Value) -> bool {
+    match name {
+        "run_command" => args.get("command").and_then(Value::as_str).map(str::trim) == Some("layer.select"),
+        "run" => args.get("script").and_then(Value::as_str).is_some_and(|script| {
+            rustgis_engine::cmd::workflows::script_commands(script).is_ok_and(|lines| lines.iter().any(|(_, id, _)| id == "layer.select"))
+        }),
+        _ => false,
     }
 }
 
-/// What "allow for this conversation" remembers for a call: its command (a tool's id for
-/// `gp.run`) with its exact parameters, so allowing one file or address allows no other. Only file
-/// and network access can be allowed for good: plugin commands, the user's own automation and
-/// replacing the project are asked about every time.
-pub fn approval_key(s: &Session, call: &ToolCall) -> Option<String> {
-    let (command, key) = match call.name.as_str() {
-        "run_command" => {
-            let id = str_arg(&call.args, "command")?;
-            (id.clone(), id)
+/// The executor's strict envelope is the only input to engine planning.
+pub fn policy_call(call: &ToolCall) -> Result<Option<Call>, String> {
+    let c = match call.name.as_str() {
+        "run_command" => Some(Call::command(&str_arg(&call.args, "command").ok_or("command is required")?, params_arg(&call.args)?)),
+        "run_tool" => Some(Call::tool(&str_arg(&call.args, "tool").ok_or("tool is required")?, params_arg(&call.args)?)),
+        "run" => Some(Call::script(call.args.get("script").and_then(Value::as_str).ok_or("script is required")?)),
+        "snapshot" | "view_map" => {
+            let files = call.name == "snapshot" && call.args.get("save_path").and_then(Value::as_str).is_some_and(|p| !p.trim().is_empty());
+            let effects = if files {
+                rustgis_engine::policy::Effects::NONE.with(rustgis_engine::policy::Effect::Files)
+            } else {
+                rustgis_engine::policy::Effects::NONE
+            };
+            Some(Call::adapter(if call.name == "snapshot" { "snapshot" } else { "view_map" }, effects, call.args.clone()))
         }
-        "run_tool" => ("gp.run".to_string(), format!("gp.run:{}", str_arg(&call.args, "tool")?)),
-        _ => return None,
+        _ => None,
     };
-    if command.starts_with(rustgis_engine::plugins::PREFIX) || user_only(&command) || s.registry.get(&command).is_none() {
-        return None;
-    }
-    // Object keys serialise sorted, so the same parameters always make the same key.
-    // Parameters that won't run make no key.
-    let params = params_arg(&call.args).ok()?;
-    Some(format!("{key} {params}"))
+    Ok(c.map(|c| c.with_request(&call.id)))
 }
-
+/// A mapping of the engine outcome for callers that display the reason only.
+pub fn gate(s: &Session, call: &ToolCall) -> Option<String> {
+    let call = match policy_call(call) {
+        Ok(Some(call)) => call,
+        Ok(None) => return None,
+        Err(error) => return Some(error),
+    };
+    let scope = Scope::assistant(0, std::sync::Arc::new(Live::default()));
+    match s.review(&scope, &call) {
+        Outcome::Allowed => None,
+        Outcome::NeedsApproval(p) => Some(p.review().why.clone()),
+        Outcome::Refused(e) => Some(e),
+    }
+}
+/// A revocable assistant lifetime. A stopped lifetime is never re-enabled.
+pub(crate) struct Live(pub(crate) std::sync::atomic::AtomicBool);
+impl Default for Live {
+    fn default() -> Self {
+        Self(std::sync::atomic::AtomicBool::new(true))
+    }
+}
+impl rustgis_engine::policy::Revocation for Live {
+    fn allows(&self, _: rustgis_engine::policy::Effects) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
 /// A one-line description of a call for the transcript and the approval prompt.
 pub fn summary(call: &ToolCall) -> String {
     let short = |v: Value| {
@@ -252,13 +244,301 @@ pub fn summary(call: &ToolCall) -> String {
     }
 }
 
+/// The largest map image `view_map` draws (pixels a side).
+pub(crate) const MAX_VIEW: f64 = 2048.0;
+
+/// The most a `view_map` picture may weigh: 3.75 MiB of PNG, 5 MiB once base64-encoded, half the
+/// 10 MB an image may be on Anthropic's API (5 MB through Amazon Bedrock) and under OpenAI's and
+/// Gemini's limits. A satellite basemap weighs about 3.9 MB at 2048 × 1229, some 6.5 MB at 2048 × 2048.
+pub(crate) const MAX_PNG_BYTES: usize = 5 * 1024 * 1024 / 4 * 3;
+
+/// Draws at `w` × `h` and, while the picture weighs more than `max` bytes, again smaller (both
+/// sides by the square root of the ratio, with a margin), down to 64 pixels a side. A picture a
+/// provider refuses for its size would otherwise stay among the newest two and fail every later
+/// request. Returns the picture and the size it was drawn at.
+pub(crate) fn draw_within(
+    mut w: f64,
+    mut h: f64,
+    max: usize,
+    mut draw: impl FnMut(f64, f64) -> Result<Vec<u8>, String>,
+) -> Result<(Vec<u8>, f64, f64), String> {
+    loop {
+        let png = draw(w, h)?;
+        if png.len() <= max || w.min(h) <= 64.0 {
+            return Ok((png, w, h));
+        }
+        let k = (max as f64 / png.len() as f64).sqrt() * 0.9;
+        (w, h) = ((w * k).round().max(64.0), (h * k).round().max(64.0));
+    }
+}
+
+/// `view_map`: the current view drawn offscreen at the size asked (default 1024 × 640), and a
+/// caption naming it. It goes through its adapter, so the policy sees what the picture draws.
+///
+/// It draws on the thread that runs the assistant's calls, which on the desktop is the window's:
+/// the agent runs every call there (`run_command` and `run_tool` too, through
+/// `Session::run_scoped`), and a call's result must be in the conversation before the next
+/// request goes out. The drawing is one pass over the features in view, capped at 2048 pixels a
+/// side, with no Cancel; a layer of about 476,000 polygons read in place takes some 12 s at the
+/// default size, one of 120,000 some 2 s. Moving the assistant's calls off the window is a change
+/// to the agent's loop of its own.
+pub fn view_map(s: &mut Session, call: &ToolCall, scope: Scope, permit: Option<Permit>) -> Result<(String, ToolImage), String> {
+    let engine = policy_call(call)?.ok_or("missing view adapter")?;
+    let owned = s.defer(scope, &engine, permit)?;
+    s.finish_deferred(owned, |s| draw_view(s, &call.args, MAX_PNG_BYTES))?
+}
+
+/// The most dots per inch `view_map` draws a layout at, as Export Layout's most.
+const MAX_LAYOUT_DPI: f64 = 600.0;
+
+/// Draws what `view_map` is asked for (the view, a layout's page, a region of either), in a
+/// picture of at most `max` bytes. A picture drawn smaller than asked says so in its caption, and
+/// what drawing it said (texts cut off, layers drawn without their cast shadows) follows it.
+pub(crate) fn draw_view(s: &mut Session, a: &Value, max: usize) -> Result<(String, ToolImage), String> {
+    let mark = s.notice_mark();
+    let size = |k: &str| a.get(k).and_then(Value::as_f64).filter(|v| v.is_finite()).map(|v| v.clamp(64.0, MAX_VIEW).round());
+    let region = match a.get("region") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_array()
+                .filter(|v| v.len() == 4)
+                .map(|v| v.iter().filter_map(Value::as_f64).filter(|x| x.is_finite()).collect::<Vec<_>>())
+                .and_then(|n| <[f64; 4]>::try_from(n).ok())
+                .ok_or("region must be four numbers: [x, y, w, h] in mm with a layout, [west, south, east, north] in degrees on the map")?,
+        ),
+    };
+    let asked = (size("width"), size("height"));
+    let (mut caption, png, w, h) = if a.get("layout").is_some_and(|v| !v.is_null()) {
+        draw_layout(s, a, region, asked, max)?
+    } else {
+        draw_map(s, region, asked, max)?
+    };
+    // Each once: a picture drawn again smaller says it all again.
+    let mut said: Vec<String> = Vec::new();
+    for text in s.notices_since(mark).iter().map(|n| public_text(n.text.clone())) {
+        if !said.contains(&text) {
+            said.push(text);
+        }
+    }
+    if !said.is_empty() {
+        caption.push_str(&format!(" Drawing it said: {}", said.join(" | ")));
+    }
+    Ok((caption, ToolImage { png, width: w, height: h }))
+}
+
+/// The size a PNG says it is, from its header.
+fn png_size(png: &[u8]) -> (u32, u32) {
+    let dim = |at: usize| png.get(at..at + 4).and_then(|b| <[u8; 4]>::try_from(b).ok()).map_or(0, u32::from_be_bytes);
+    (dim(16), dim(20))
+}
+
+/// A picture of `view_map`: its caption, its PNG and its size in pixels.
+type Drawn = (String, Vec<u8>, u32, u32);
+
+/// `view_map` of the map view, or of the part of the map in `region` (lon/lat) fitted in the
+/// asked size as Zoom To fits an extent, with its margin; the view is left as it was.
+fn draw_map(s: &mut Session, region: Option<[f64; 4]>, asked: (Option<f64>, Option<f64>), max: usize) -> Result<Drawn, String> {
+    let (mut asked_w, mut asked_h) = (asked.0.unwrap_or(1024.0), asked.1.unwrap_or(640.0));
+    let fitted = match region {
+        None => None,
+        Some([west, south, east, north]) => {
+            let lon = -180.0..=180.0;
+            let lat = -90.0..=90.0;
+            if !(lon.contains(&west) && lon.contains(&east) && lat.contains(&south) && lat.contains(&north))
+                || west >= east
+                || south >= north
+            {
+                return Err(format!(
+                    "region [{west}, {south}, {east}, {north}] must be [west, south, east, north] in degrees, west < east and south < north (one across the 180° meridian is not drawn)"
+                ));
+            }
+            if s.map().projection.is_globe() {
+                return Err("region needs a flat map, and this one is a globe: give it a flat projection (map.projection), or look at the whole view".into());
+            }
+            let e = rustgis_engine::geom::Extent { min_x: west, min_y: south, max_x: east, max_y: north };
+            // Without a height, the picture takes the region's shape on the map.
+            let m = s.map().flat().extent(&e);
+            if asked.1.is_none() && m.width() > 0.0 && m.height() > 0.0 {
+                asked_h = (asked_w * m.height() / m.width()).round();
+                if asked_h > MAX_VIEW {
+                    asked_w = (asked_w * MAX_VIEW / asked_h).round().max(64.0);
+                }
+                asked_h = asked_h.clamp(64.0, MAX_VIEW);
+            }
+            Some(e)
+        }
+    };
+    let (camera, view_size) = (s.map().camera, s.view_size);
+    let drawn = draw_within(asked_w, asked_h, max, |w, h| {
+        if let Some(e) = &fitted {
+            // Fitted at the picture's own size, which the image then keeps.
+            s.view_size = (w, h);
+            s.map_mut().camera = camera;
+            if !s.map_mut().fit_lonlat(e, w, h) {
+                return Err("the region is outside what the map's projection shows".to_string());
+            }
+        }
+        rustgis_engine::cmd::share::map_png(s, Some(w), Some(h), None)
+    });
+    s.map_mut().camera = camera;
+    s.view_size = view_size;
+    let (png, w, h) = drawn?;
+    let m = s.map();
+    let c = m.center_lonlat();
+    let smaller = if (w, h) != (asked_w, asked_h) {
+        format!(", smaller than the {asked_w:.0} x {asked_h:.0} asked, to fit the {:.2} MB a picture may weigh", max as f64 / 1e6)
+    } else {
+        String::new()
+    };
+    let shown = match region {
+        Some([west, south, east, north]) => format!("region {west}, {south}, {east}, {north} (west, south, east, north)"),
+        None => format!("centre {:.4}, {:.4} (lon, lat), scale 1:{:.0}", c.x, c.y, m.scale()),
+    };
+    let caption = format!("Map \"{}\", {} layers, {shown}, {w:.0} x {h:.0} px{smaller}.", m.name, m.layers.len());
+    Ok((caption, png, w as u32, h as u32))
+}
+
+/// `view_map` of a layout's page, or of the part of it in `region` (mm), drawn at the dpi that
+/// fits the asked width (and height when given), at most [`MAX_LAYOUT_DPI`]. A region is drawn
+/// at that dpi rather than cut out of the whole page, and the frames it cuts are drawn whole, as
+/// on the page: a close look at a large frame costs what exporting the page at that dpi does.
+fn draw_layout(
+    s: &mut Session,
+    a: &Value,
+    region: Option<[f64; 4]>,
+    asked: (Option<f64>, Option<f64>),
+    max: usize,
+) -> Result<Drawn, String> {
+    let li = rustgis_engine::cmd::layout::named(s, a)?;
+    let l = s.project.layouts.get(li).ok_or("no layout")?;
+    let (name, pw, ph) = (l.name.clone(), l.width, l.height);
+    // A region is cut to the page, and the cut said.
+    let (part, cut) = match region {
+        None => ([0.0, 0.0, pw, ph], false),
+        Some([x, y, w, h]) => {
+            let (x0, y0, x1, y1) = (x.max(0.0), y.max(0.0), (x + w).min(pw), (y + h).min(ph));
+            if w <= 0.0 || h <= 0.0 || x1 <= x0 || y1 <= y0 {
+                return Err(format!(
+                    "region [{x}, {y}, {w}, {h}] is not on the page: give [x, y, w, h] in mm from its top left, inside its {pw:.0} x {ph:.0} mm"
+                ));
+            }
+            ([x0, y0, x1 - x0, y1 - y0], (x0, y0, x1, y1) != (x, y, x + w, y + h))
+        }
+    };
+    let (asked_w, asked_h) = (asked.0.unwrap_or(1024.0), asked.1.unwrap_or(MAX_VIEW));
+    // A region's edges are rounded outward to whole pixels, up to one more each side.
+    let edge = if region.is_some() { 2.0 } else { 0.0 };
+    let dpi_for = |w: f64, h: f64| (25.4 * ((w - edge) / part[2]).min((h - edge) / part[3])).min(MAX_LAYOUT_DPI);
+    let (png, w, h) =
+        draw_within(asked_w, asked_h, max, |w, h| rustgis_engine::cmd::layout::layout_png(s, li, dpi_for(w, h), region.map(|_| part)))?;
+    let (pxw, pxh) = png_size(&png);
+    // A page drawn at its least resolution (a quarter of the screen's) can still be larger than
+    // a picture is sent at: refused, rather than sent too large.
+    if f64::from(pxw.max(pxh)) > MAX_VIEW {
+        return Err(format!(
+            "the page, {pw:.0} x {ph:.0} mm, is {pxw} x {pxh} px drawn at its least, more than the {MAX_VIEW:.0} a side view_map draws: give a region"
+        ));
+    }
+    let dpi = f64::from(pxw) * 25.4 / part[2];
+    let shown = match region {
+        Some(_) => format!(
+            ", region {:.1}, {:.1}, {:.1}, {:.1} mm (x, y, w, h){}",
+            part[0],
+            part[1],
+            part[2],
+            part[3],
+            if cut { ", cut to the page" } else { "" }
+        ),
+        None => String::new(),
+    };
+    let smaller = if (w, h) != (asked_w, asked_h) {
+        format!(", smaller than asked, to fit the {:.2} MB a picture may weigh", max as f64 / 1e6)
+    } else if dpi_for(w, h) >= MAX_LAYOUT_DPI {
+        format!(", at the {MAX_LAYOUT_DPI:.0} dpi a page is drawn at the most")
+    } else {
+        String::new()
+    };
+    let caption = format!("Layout \"{name}\", page {pw:.0} x {ph:.0} mm{shown}, {pxw} x {pxh} px at {dpi:.0} dpi{smaller}.");
+    Ok((caption, png, pxw, pxh))
+}
+
 /// Runs a call; `Err` is a result the model is told failed.
-pub fn run(s: &mut Session, call: &ToolCall) -> Result<String, String> {
-    run_with_budget(s, call, DEFAULT_OUTPUT_TOKENS)
+pub fn run(s: &mut Session, call: &ToolCall, scope: Scope, permit: Option<Permit>) -> Result<String, String> {
+    run_with_budget(s, call, DEFAULT_OUTPUT_TOKENS, scope, permit)
 }
 
 /// Runs a call with a per-result token estimate, capped by the absolute ceiling.
-pub fn run_with_budget(s: &mut Session, call: &ToolCall, tokens: usize) -> Result<String, String> {
+pub fn run_with_budget(s: &mut Session, call: &ToolCall, tokens: usize, scope: Scope, permit: Option<Permit>) -> Result<String, String> {
+    // Script failures are structured JSON: clean their error field before serialization.
+    if call.name == "run" {
+        return run_script(s, call, tokens, scope, permit);
+    }
+    run_with_budget_inner(s, call, tokens, scope, permit).map_err(|e| match e {
+        Failure::Plain(e) => public_error(&e),
+        Failure::Clean(e) => e,
+    })
+}
+
+/// A call's failure, which [`run_with_budget`] cleans of login values; a command's failure is
+/// cleaned already, with the codes of its losses added after cleaning ([`error_with_notices`]).
+enum Failure {
+    Plain(String),
+    Clean(String),
+}
+
+impl From<String> for Failure {
+    fn from(e: String) -> Self {
+        Self::Plain(e)
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(e: &str) -> Self {
+        Self::Plain(e.into())
+    }
+}
+
+/// Adapter-owned presentation state for one already-admitted archive command. Execution
+/// authority stays in the engine's ReadAhead/Read, never in this result formatter.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct CommandCompletion {
+    before: Vec<(String, Vec<u32>)>,
+    said: Said,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl CommandCompletion {
+    pub(crate) fn capture(s: &Session) -> Self {
+        Self { before: layer_snap(s), said: Said::now(s) }
+    }
+    pub(crate) fn finish(self, s: &mut Session, result: Result<Value, String>) -> Result<String, String> {
+        result
+            .map(|value| command_result(s, value, &self.before, &self.said, DEFAULT_OUTPUT_TOKENS))
+            .map_err(|e| error_with_notices(e, s, &self.said, DEFAULT_OUTPUT_TOKENS))
+    }
+}
+
+/// Retains the initiating scope and one-use permit while assembling ordinary tool results.
+fn run_with_budget_inner(s: &mut Session, call: &ToolCall, tokens: usize, scope: Scope, permit: Option<Permit>) -> Result<String, Failure> {
+    if matches!(call.name.as_str(), "run_command" | "run_tool") {
+        if call.name == "run_command" && str_arg(&call.args, "command").is_some_and(|id| id.starts_with("ui.")) {
+            return Err("ui.* commands only open panes and dialogs; the assistant can't use them".into());
+        }
+        let engine = policy_call(call)?.ok_or("missing executable call")?;
+        let (before, said) = (layer_snap(s), Said::now(s));
+        let result = match permit {
+            Some(p) => s.run_permitted(scope, p, &engine),
+            None => s.run_scoped(scope, &engine),
+        }
+        .map_err(|e| Failure::Clean(error_with_notices(e, s, &said, tokens)))?;
+        return Ok(command_result(s, result, &before, &said, tokens));
+    }
+    if permit.is_some() {
+        return Err("this approval is for an executable call".into());
+    }
+    s.with_scope(scope, |s| run_read(s, call, tokens))?.map_err(Failure::Plain)
+}
+
+fn run_read(s: &mut Session, call: &ToolCall, tokens: usize) -> Result<String, String> {
     let max_bytes = output_bytes(tokens);
     let a = &call.args;
     let v = match call.name.as_str() {
@@ -269,27 +549,7 @@ pub fn run_with_budget(s: &mut Session, call: &ToolCall, tokens: usize) -> Resul
         "search_commands" => search_commands(s, a)?,
         "search_tools" => search_tools(a)?,
         "describe_tool" => describe_tool(a)?,
-        "run_command" => {
-            let id = str_arg(a, "command").ok_or("command is required")?;
-            if id.starts_with("ui.") {
-                return Err("ui.* commands only open panes and dialogs; the assistant can't use them".into());
-            }
-            if s.registry.get(&id).is_none() && !id.starts_with(rustgis_engine::plugins::PREFIX) {
-                return Err(format!("unknown command '{id}'; find ids with search_commands"));
-            }
-            let (before, mark) = (layer_snap(s), s.notice_mark());
-            let r = s.run(&id, &params_arg(a)?).map_err(|e| error_with_notices(e, s, mark))?;
-            with_notices(with_new_layers(r, s, &before), s, mark)
-        }
-        "run_tool" => {
-            let tool = str_arg(a, "tool").ok_or("tool is required")?;
-            let (before, mark) = (layer_snap(s), s.notice_mark());
-            let r = s.run("gp.run", &json!({"tool": tool, "params": params_arg(a)?})).map_err(|e| error_with_notices(e, s, mark))?;
-            with_notices(with_new_layers(r, s, &before), s, mark)
-        }
         "read_features" => read_features(s, a)?,
-        // MCP's `run` (not offered to the in-app assistant): a script in one call.
-        "run" => return run_script(s, a, tokens),
         "search_docs" => crate::docs::search(&str_arg(a, "query").unwrap_or_default(), limit_arg(a, 8, 30))?,
         "read_doc" => {
             return crate::docs::read_with_budget(
@@ -306,11 +566,141 @@ pub fn run_with_budget(s: &mut Session, call: &ToolCall, tokens: usize) -> Resul
         }
         // Fails the way a bug in RustGIS would, for the agent's panic guard.
         #[cfg(test)]
-        #[allow(clippy::panic)]
         "test_panic" => panic!("a test tool panicked"),
         other => return Err(format!("unknown tool '{other}'")),
     };
-    Ok(bounded_json(&v, tokens))
+    if call.name == "read_features" {
+        Ok(public_envelope(s, v, tokens))
+    } else {
+        let mut withheld = Withheld::default();
+        let v = public_metadata(v, 0, &mut withheld);
+        Ok(finish_result(s, v, tokens, withheld))
+    }
+}
+
+/// How deep a result is searched for runtime login addresses; what is deeper is withheld.
+const MAX_DEPTH: usize = 16;
+
+/// `text` with every runtime login wrapper (`rustgis-login:…`, alone or after a prefix such as
+/// `pmtiles:…@`) replaced by its plain address. Commands return the bound addresses the app needs
+/// to use a connection's login; the model and MCP clients get only the public ones. Active
+/// raw secrets are scrubbed too, including an echo with no wrapper in the result.
+fn public_text(text: String) -> String {
+    rustgis_engine::sources::scrub_s3_wrappers(&rustgis_engine::render::rustgis_tiles::logins::scrub(&text))
+}
+
+/// Generated errors may quote arbitrary addresses; successful values remain data.
+fn public_error(text: &str) -> String {
+    rustgis_engine::sources::scrub_s3_wrappers(&rustgis_engine::render::rustgis_tiles::logins::scrub_error(text))
+}
+
+/// Publishes a completed result, reporting withheld subtrees before enforcing the response budget.
+#[cfg(test)]
+fn public_result(s: &mut Session, value: Value, tokens: usize) -> String {
+    let mut withheld = Withheld::default();
+    let value = public_addresses(value, 0, &mut withheld);
+    finish_result(s, value, tokens, withheld)
+}
+
+/// These fields belong to the adapter's response schema; only their values contain data.
+fn public_envelope(s: &mut Session, value: Value, tokens: usize) -> String {
+    let (value, withheld) = public_projection(value);
+    finish_result(s, value, tokens, withheld)
+}
+
+/// [`public_envelope`]'s cleaning, without serializing, so fixed-schema fields can be added after.
+fn public_projection(value: Value) -> (Value, Withheld) {
+    let mut withheld = Withheld::default();
+    let value = match value {
+        Value::Object(o) => Value::Object(o.into_iter().map(|(key, value)| (key, public_addresses(value, 1, &mut withheld))).collect()),
+        value => public_addresses(value, 0, &mut withheld),
+    };
+    (value, withheld)
+}
+
+/// Generated search, tool and project metadata has a fixed schema at every level. Its
+/// strings may hold private data, but its keys cannot be login values. Row/property maps
+/// and arbitrary command results use `public_addresses` instead.
+fn public_metadata(value: Value, depth: usize, withheld: &mut Withheld) -> Value {
+    match value {
+        Value::String(text) => Value::String(public_text(text)),
+        Value::Array(a) if depth < MAX_DEPTH => Value::Array(a.into_iter().map(|v| public_metadata(v, depth + 1, withheld)).collect()),
+        Value::Object(o) if depth < MAX_DEPTH => {
+            Value::Object(o.into_iter().map(|(key, v)| (key, public_metadata(v, depth + 1, withheld))).collect())
+        }
+        Value::Array(_) | Value::Object(_) => {
+            withheld.depth = withheld.depth.saturating_add(1);
+            json!("[too deep]")
+        }
+        other => other,
+    }
+}
+
+/// Cleans the arbitrary command payload before adding adapter-owned notices/layer metadata.
+fn command_result(s: &mut Session, value: Value, before: &[(String, Vec<u32>)], said: &Said, tokens: usize) -> String {
+    let mut withheld = Withheld::default();
+    let value = public_addresses(value, 0, &mut withheld);
+    let value = with_notices(with_new_layers(value, s, before), s, said.mark);
+    // Added after cleaning: its keys and codes are fixed, and its text was cleaned on its own.
+    let losses = losses_since(s, said);
+    finish_with_losses(s, value, losses, tokens, withheld, false)
+}
+
+/// Publishes counted projection losses without sending the completed envelope through a second redactor.
+fn finish_result(s: &mut Session, value: Value, tokens: usize, withheld: Withheld) -> String {
+    bounded_json(&with_withheld(s, value, withheld), tokens)
+}
+
+/// `value` with the notices of what cleaning it withheld, also given to the app.
+fn with_withheld(s: &mut Session, mut value: Value, withheld: Withheld) -> Value {
+    if withheld.depth > 0 || withheld.keys > 0 {
+        let mark = s.notice_mark();
+        if withheld.depth > 0 {
+            s.notify(format!("Tool result: {} subtrees at nesting depth {MAX_DEPTH} were withheld.", withheld.depth), false);
+        }
+        if withheld.keys > 0 {
+            s.notify(format!("Tool result: {} object(s) were withheld because redacted field names coincide.", withheld.keys), false);
+        }
+        if let Some(notices) = value.get_mut("notices").and_then(Value::as_array_mut) {
+            notices.extend(s.notices_since(mark).iter().map(|n| json!(n.text)));
+        } else {
+            value = with_notices(value, s, mark);
+        }
+    }
+    value
+}
+
+/// Counts output withheld for depth limits or field names that collide after redaction.
+#[derive(Default)]
+struct Withheld {
+    depth: usize,
+    keys: usize,
+}
+
+/// `v` with string values and field names made public ([`public_text`]), to a depth of
+/// [`MAX_DEPTH`]. An object whose public field names collide is withheld as a whole.
+fn public_addresses(v: Value, depth: usize, withheld: &mut Withheld) -> Value {
+    match v {
+        Value::String(s) => Value::String(public_text(s)),
+        Value::Array(a) if depth < MAX_DEPTH => Value::Array(a.into_iter().map(|x| public_addresses(x, depth + 1, withheld)).collect()),
+        Value::Object(o) if depth < MAX_DEPTH => {
+            let mut public = serde_json::Map::new();
+            for (key, value) in o {
+                let key = public_text(key);
+                if public.contains_key(&key) {
+                    withheld.keys = withheld.keys.saturating_add(1);
+                    return json!("[redacted field names coincide]");
+                }
+                public.insert(key, value);
+            }
+            Value::Object(public.into_iter().map(|(key, value)| (key, public_addresses(value, depth + 1, withheld))).collect())
+        }
+        Value::Array(_) | Value::Object(_) => {
+            withheld.depth = withheld.depth.saturating_add(1);
+            json!("[too deep]")
+        }
+        other => other,
+    }
 }
 
 /// Serialize complete JSON. Oversized results become an explicit text preview envelope;
@@ -387,20 +777,10 @@ fn str_arg(a: &Value, k: &str) -> Option<String> {
 /// The `params` a command or tool runs with: an object, or JSON text of one (some models send
 /// that). Anything else is an error: running with defaults instead could act on the wrong layer.
 fn params_arg(a: &Value) -> Result<Value, String> {
-    match a.get("params") {
-        None | Some(Value::Null) => Ok(json!({})),
-        Some(v @ Value::Object(_)) => Ok(v.clone()),
-        Some(Value::String(t)) if t.trim().is_empty() => Ok(json!({})),
-        Some(Value::String(t)) => match serde_json::from_str::<Value>(t) {
-            Ok(v @ Value::Object(_)) => Ok(v),
-            Ok(_) => Err("params must be a JSON object".into()),
-            Err(e) => Err(format!("params is not valid JSON: {e}")),
-        },
-        Some(_) => Err("params must be a JSON object".into()),
-    }
+    rustgis_engine::params_envelope(a.get("params"))
 }
 
-/// An object parameter, which some models send as JSON text (leniently, for display and approval).
+/// An object parameter, which some models send as JSON text (leniently, for display only).
 fn obj_arg(a: &Value, k: &str) -> Value {
     match a.get(k) {
         Some(Value::String(t)) if !t.trim().is_empty() => serde_json::from_str(t).unwrap_or(Value::Null),
@@ -432,7 +812,7 @@ fn with_new_layers(r: Value, s: &Session, before: &[(String, Vec<u32>)]) -> Valu
     let same =
         before.iter().find(|(name, _)| name.eq_ignore_ascii_case(&m.name)).or_else(|| if renamed { before.get(active) } else { None });
     let had = same.map_or(&[][..], |(_, ids)| ids.as_slice());
-    let added: Vec<String> = m.layers.iter().filter(|l| !had.contains(&l.id)).map(|l| l.name.clone()).collect();
+    let added: Vec<String> = m.layers.iter().filter(|l| !had.contains(&l.id)).map(|l| public_text(l.name.clone())).collect();
     if added.is_empty() {
         return if r.is_null() { json!({"ok": true}) } else { r };
     }
@@ -440,11 +820,13 @@ fn with_new_layers(r: Value, s: &Session, before: &[(String, Vec<u32>)]) -> Valu
 }
 
 /// Runs a script (`script.run`'s format: one `command-id {json}` per line, `#` comments) in one
-/// call and one undo step. A failing line stops the script and nothing it did to the project is
-/// kept (files it wrote stay). The answer is `{success, result, lines, layersAdded, notices,
-/// error, duration_s}`, where `result`
-/// is the last command's; a failure is an `Err` holding the same JSON.
-fn run_script(s: &mut Session, a: &Value, tokens: usize) -> Result<String, String> {
+/// call and one undo step, none when its lines only read, moved the view, exported, left a
+/// request or reported they changed nothing. A failing line stops the script and nothing it did
+/// to the project is kept (files it wrote stay). The answer is
+/// `{success, result, lines, layersAdded, notices, losses, error, duration_s}`, where `result` is the
+/// last command's; a failure is an `Err` holding the same JSON.
+fn run_script(s: &mut Session, call: &ToolCall, tokens: usize, scope: Scope, permit: Option<Permit>) -> Result<String, String> {
+    let a = &call.args;
     // Untrimmed, so errors name the same lines the caller wrote.
     let script = a
         .get("script")
@@ -452,10 +834,16 @@ fn run_script(s: &mut Session, a: &Value, tokens: usize) -> Result<String, Strin
         .filter(|t| !t.trim().is_empty())
         .ok_or("script is required: one `command-id {json}` per line")?;
     let start = web_time::Instant::now();
-    let (before, mark) = (layer_snap(s), s.notice_mark());
-    let r = s.run("script.run", &json!({"script": script}));
+    let (before, said) = (layer_snap(s), Said::now(s));
+    let mark = said.mark;
+    let engine = Call::script(script).with_request(&call.id);
+    let r = match permit {
+        Some(p) => s.run_permitted(scope, p, &engine),
+        None => s.run_scoped(scope, &engine),
+    };
     let secs = (start.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
     let notices: Vec<&str> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+    let losses = losses_since(s, &said);
     match r {
         Ok(v) => {
             let ran = v.get("ran").and_then(Value::as_array);
@@ -463,14 +851,19 @@ fn run_script(s: &mut Session, a: &Value, tokens: usize) -> Result<String, Strin
             let added = with_new_layers(json!({}), s, &before).get("layersAdded").cloned().unwrap_or_else(|| json!([]));
             let out = json!({"success": true, "result": last, "lines": ran.map_or(0, Vec::len), "layersAdded": added,
                 "notices": notices, "error": null, "duration_s": secs});
-            Ok(bounded_json(&out, tokens))
+            let (out, withheld) = public_projection(out);
+            Ok(finish_with_losses(s, out, losses, tokens, withheld, true))
         }
         Err(e) => {
+            let e = public_error(&e);
             // Nothing was kept, so no line ran and no layer was added.
-            let said: Vec<&&str> = notices.iter().filter(|t| **t != e).collect();
-            let out = json!({"success": false, "result": null, "lines": 0, "layersAdded": [], "notices": said,
+            // The notice of the failure is the error redacted: compared as such, it isn't repeated.
+            let told = rustgis_engine::data::diagnostics::redact(&e);
+            let kept: Vec<&&str> = notices.iter().filter(|t| **t != e && **t != told).collect();
+            let out = json!({"success": false, "result": null, "lines": 0, "layersAdded": [], "notices": kept,
                 "error": clip(&e, 8000), "duration_s": secs});
-            Err(bounded_json(&out, tokens))
+            let (out, withheld) = public_projection(out);
+            Err(finish_with_losses(s, out, losses, tokens, withheld, true))
         }
     }
 }
@@ -478,7 +871,7 @@ fn run_script(s: &mut Session, a: &Value, tokens: usize) -> Result<String, Strin
 /// A run's result with what it said beside it (a notice that only the first tables of a GeoPackage
 /// were added, a file's warnings), which the status bar shows in the app.
 fn with_notices(r: Value, s: &Session, mark: u64) -> Value {
-    let said: Vec<&str> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| public_text(n.text.clone())).collect();
     if said.is_empty() {
         return r;
     }
@@ -491,13 +884,253 @@ fn with_notices(r: Value, s: &Session, mark: u64) -> Value {
     }
 }
 
-/// A failed run's error with what the command said before failing (a GDAL layer that couldn't be
-/// converted).
-fn error_with_notices(e: String, s: &Session, mark: u64) -> String {
-    let said: Vec<&str> = s.notices_since(mark).iter().map(|n| n.text.as_str()).filter(|t| *t != e).collect();
-    // Preserve the original 8,000-character diagnostic assembly cap for MCP errors;
-    // the agent additionally applies its serialized output budget.
-    if said.is_empty() { e } else { clip(&format!("{e}\n{}", said.join("\n")), 8000) }
+/// Where a run's notices start, and the session's loss counts then: what [`losses_since`] reads.
+struct Said {
+    mark: u64,
+    given: Vec<(rustgis_engine::data::loss::LossCode, u64)>,
+}
+
+impl Said {
+    fn now(s: &Session) -> Self {
+        Self { mark: s.notice_mark(), given: s.losses_given().to_vec() }
+    }
+}
+
+/// The notices since `said` that report a classified loss, as `{code, kind, text, action}`: the
+/// code is never translated or renamed, so it can be matched where the text can't. Losses whose
+/// notices the session no longer keeps (past its last 200) come as one entry per code with their
+/// `count`.
+fn losses_since(s: &Session, said: &Said) -> Vec<Value> {
+    let entry = |code: rustgis_engine::data::loss::LossCode, text: String| {
+        let spec = code.spec();
+        json!({"code": spec.id, "kind": spec.kind.id(), "text": text, "action": spec.action})
+    };
+    let kept: Vec<_> = s.notices_since(said.mark).iter().filter_map(|n| Some((n.loss()?, public_text(n.text.clone())))).collect();
+    let mut out: Vec<Value> = s
+        .losses_given()
+        .iter()
+        .filter_map(|&(code, given)| {
+            let was = said.given.iter().find(|(c, _)| *c == code).map_or(0, |(_, n)| *n);
+            let held = kept.iter().filter(|(c, _)| *c == code).count() as u64;
+            let lost = given.saturating_sub(was).saturating_sub(held);
+            (lost > 0).then(|| {
+                let mut e = entry(code, format!("{lost} further {} notice(s) were not kept", code.spec().id));
+                e["count"] = json!(lost);
+                e
+            })
+        })
+        .collect();
+    out.extend(kept.into_iter().map(|(code, text)| entry(code, text)));
+    out
+}
+
+/// [`finish_result`] for `r` with `losses` (or `[]` when `always`), within the output budget.
+/// The list shrinks until it fits beside `r` ([`loss_forms`]): each entry's code and kind, one
+/// entry per code, and at last the codes alone. When none fits beside `r` whole, `r` is cut to
+/// leave room for one entry per code, keeping its `success`, and the list shrinks again if it
+/// must. `lossesTrimmed` says when the list was shortened or, with the tightest budgets, left out.
+fn finish_with_losses(s: &mut Session, r: Value, losses: Vec<Value>, tokens: usize, withheld: Withheld, always: bool) -> String {
+    // What cleaning withheld is said first, so the sizes below are the final ones.
+    let r = with_withheld(s, r, withheld);
+    // A result that isn't an object goes under `result`, so the codes have their key.
+    let o = match r {
+        Value::Object(o) => o,
+        other if losses.is_empty() && !always => return bounded_json(&other, tokens),
+        other => serde_json::Map::from_iter([("result".to_string(), other)]),
+    };
+    if losses.is_empty() && !always {
+        return bounded_json(&Value::Object(o), tokens);
+    }
+    // Read before a wrap below moves them. A result's `error` that is null (`run`'s on success)
+    // isn't a failure.
+    let failed = o.get("error").is_some_and(|e| !e.is_null());
+    let success = o.get("success").cloned();
+    // A result with its own `losses` goes under `result`, as a result that isn't an object does
+    // beside `notices`, so the codes still have their key; its `success` stays beside them.
+    let o = if o.contains_key("losses") {
+        let mut wrapped = serde_json::Map::from_iter([("result".to_string(), Value::Object(o))]);
+        if let Some(success) = &success {
+            wrapped.insert("success".into(), success.clone());
+        }
+        wrapped
+    } else {
+        o
+    };
+    let max = output_bytes(tokens);
+    let forms = loss_forms(&losses);
+    let with = |mut o: serde_json::Map<String, Value>, (list, trimmed): &(Value, bool)| {
+        o.insert("losses".into(), list.clone());
+        if *trimmed {
+            o.insert("lossesTrimmed".into(), json!(true));
+        }
+        Value::Object(o)
+    };
+    // Sized from the parts, so the result is serialized once: its own bytes, then each form's
+    // with its key (and `lossesTrimmed`'s).
+    let base = Value::Object(o.clone()).to_string().len();
+    let size = |(list, trimmed): &(Value, bool)| {
+        base + list.to_string().len() + r#","losses":"#.len() + if *trimmed { r#","lossesTrimmed":true"#.len() } else { 0 }
+    };
+    if let Some(form) = forms.iter().find(|form| size(form) <= max) {
+        return with(o, form).to_string();
+    }
+    // The result cut to leave room for one entry per code.
+    let summary = forms.get(2).or(forms.last()).map_or(0, |(list, _)| list.to_string().len());
+    let text = bounded_json(&Value::Object(o.clone()), max.saturating_sub(summary + 64).div_ceil(4).max(1));
+    let mut cut = match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(cut)) => cut,
+        // A failure's error alone (`error: …`), kept as JSON with as much of it as fits below.
+        Ok(Value::String(preview)) if failed => {
+            serde_json::Map::from_iter([("error".to_string(), json!(preview)), ("truncated".to_string(), json!(true))])
+        }
+        _ if failed => serde_json::Map::from_iter([("error".to_string(), json!(text)), ("truncated".to_string(), json!(true))]),
+        // No room for any of a result that didn't fail: only that it was cut.
+        _ => serde_json::Map::from_iter([("truncated".to_string(), json!(true))]),
+    };
+    if let Some(success) = &success {
+        cut.insert("success".into(), success.clone());
+    }
+    for form in forms.iter().skip(2) {
+        let v = with(cut.clone(), form);
+        let over = v.to_string().len().saturating_sub(max);
+        if over == 0 {
+            return v.to_string();
+        }
+        // Only a failure's error can still give way: cut it by what's over.
+        if let Some(error) = v.get("error").and_then(Value::as_str) {
+            let mut v = v.clone();
+            v["error"] = json!(clip_bytes(error, error.len().saturating_sub(over + 8)));
+            if v.to_string().len() <= max {
+                return v.to_string();
+            }
+        }
+    }
+    // The codes, saying the result (or the failure's error) was cut: then only that both were.
+    let mut said_cut = serde_json::Map::from_iter(success.map(|v| ("success".to_string(), v)));
+    said_cut.insert("truncated".into(), json!(true));
+    for form in forms.iter().skip(2) {
+        let v = with(said_cut.clone(), form);
+        if v.to_string().len() <= max {
+            return v.to_string();
+        }
+    }
+    // With no losses to leave out, only that the result was cut.
+    let trimmed = !losses.is_empty();
+    let mut v = said_cut;
+    if trimmed {
+        v.insert("lossesTrimmed".into(), json!(true));
+    }
+    let v = Value::Object(v).to_string();
+    // The tightest budgets: the markers alone, then the list's name alone; below that (15 bytes)
+    // no marker fits, and nothing a client could misread is said.
+    let both = if trimmed { json!({"truncated": true, "lossesTrimmed": true}) } else { json!({"truncated": true}) }.to_string();
+    let marker = json!({"lossesTrimmed": true}).to_string();
+    let name = json!("lossesTrimmed").to_string();
+    if v.len() <= max {
+        v
+    } else if both.len() <= max {
+        both
+    } else if trimmed && marker.len() <= max {
+        marker
+    } else if trimmed && name.len() <= max {
+        name
+    } else {
+        "{}".to_string()
+    }
+}
+
+/// `losses` in the forms [`finish_with_losses`] tries, longest first, each with whether it is
+/// shortened: whole; each entry's code and kind; one entry per code ([`loss_summary`]); one entry
+/// per code with its count only; the codes alone.
+fn loss_forms(losses: &[Value]) -> Vec<(Value, bool)> {
+    // An entry for losses whose notices weren't kept keeps its count.
+    let compact: Vec<Value> = losses
+        .iter()
+        .map(|l| {
+            let mut e = json!({"code": l["code"], "kind": l["kind"]});
+            if let Some(n) = l.get("count") {
+                e["count"] = n.clone();
+            }
+            e
+        })
+        .collect();
+    let summary = loss_summary(losses).unwrap_or_else(|| json!([]));
+    let counts: Vec<Value> =
+        summary.as_array().map(|a| a.iter().map(|e| json!({"code": e["code"], "count": e["count"]})).collect()).unwrap_or_default();
+    let codes: Vec<Value> = summary.as_array().map(|a| a.iter().map(|e| e["code"].clone()).collect()).unwrap_or_default();
+    // An empty list is never shortened.
+    let shortened = !losses.is_empty();
+    vec![(json!(losses), false), (json!(compact), shortened), (summary, shortened), (json!(counts), shortened), (json!(codes), shortened)]
+}
+
+/// The first `max` bytes of `text`, cut at a character boundary.
+fn clip_bytes(text: &str, max: usize) -> String {
+    let mut end = max.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+/// A failed command's error, cleaned of login values, with what the command said before failing
+/// (a GDAL layer that couldn't be converted). It can still report losses its rollback can't take
+/// back (a counted omission): their codes follow on a `losses:` line of JSON, added after cleaning
+/// so a login can't rewrite them, and kept whole however long the rest is: the error and notices
+/// are cut to leave it room within 8,000 characters and the output budget. When no form of the
+/// list fits, a `lossesTrimmed: true` line says the codes were left out.
+fn error_with_notices(e: String, s: &Session, said: &Said, tokens: usize) -> String {
+    let told = rustgis_engine::data::diagnostics::redact(&e);
+    let notices: Vec<&str> = s.notices_since(said.mark).iter().map(|n| n.text.as_str()).filter(|t| *t != e && *t != told).collect();
+    let Some(losses) = loss_summary(&losses_since(s, said)) else {
+        // Preserve the original 8,000-character diagnostic assembly cap for MCP errors;
+        // the agent additionally applies its serialized output budget.
+        return public_error(&if notices.is_empty() { e } else { clip(&format!("{e}\n{}", notices.join("\n")), 8000) });
+    };
+    let text = public_error(&if notices.is_empty() { e } else { format!("{e}\n{}", notices.join("\n")) });
+    // Within the 8,000-character cap, and the agent's `{"error": …}` within its output budget,
+    // the error giving way first and then the list ([`loss_forms`]).
+    let fits = |t: &str| t.chars().count() <= 8000 && json!({"error": t}).to_string().len() <= output_bytes(tokens);
+    let raw: Vec<Value> = losses.as_array().cloned().unwrap_or_default();
+    let lines = loss_forms(&raw).into_iter().skip(2).map(|(list, _)| format!("\nlosses: {list}"));
+    // The first line that fits alone, for a budget with no room for any of the error.
+    let mut alone = None;
+    for line in lines.chain(["\nlossesTrimmed: true".to_string()]) {
+        if !fits(&line) {
+            continue;
+        }
+        alone.get_or_insert_with(|| line.trim_start().to_string());
+        if fits(&format!("{text}{line}")) {
+            return format!("{text}{line}");
+        }
+        // The longest start of the error that leaves the line room.
+        let chars: Vec<char> = text.chars().collect();
+        let cut = |keep: usize| format!("{}…{line}", chars.iter().take(keep).collect::<String>());
+        let (mut low, mut high) = (0, chars.len());
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            if fits(&cut(mid)) { low = mid } else { high = mid - 1 }
+        }
+        // With room for the mark that the error was cut, as much of it as fits; without, a
+        // shorter line may leave it room.
+        if fits(&cut(low)) {
+            return cut(low);
+        }
+    }
+    alone.unwrap_or_else(|| clip(&text, 8000))
+}
+
+/// The losses as one entry per code, `{code, kind, count, action}`: short enough to keep whole
+/// when the full list can't be. `None` for none.
+fn loss_summary(losses: &[Value]) -> Option<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for l in losses {
+        let n = l.get("count").and_then(Value::as_u64).unwrap_or(1);
+        match out.iter_mut().find(|o| o["code"] == l["code"]) {
+            Some(o) => o["count"] = json!(o["count"].as_u64().unwrap_or(0).saturating_add(n)),
+            None => out.push(json!({"code": l["code"], "kind": l["kind"], "count": n, "action": l["action"]})),
+        }
+    }
+    (!out.is_empty()).then(|| json!(out))
 }
 
 /// How well `words` match `hay` (all lower case): matched words, with whole-id hits counting more.
@@ -527,6 +1160,7 @@ fn words(a: &Value) -> Result<Vec<String>, String> {
     Ok(words)
 }
 
+/// Ranks command descriptions and reports project changes independently of undo snapshots.
 fn search_commands(s: &Session, a: &Value) -> Result<Value, String> {
     let words = words(a)?;
     let limit = limit_arg(a, 12, 40);
@@ -536,12 +1170,14 @@ fn search_commands(s: &Session, a: &Value) -> Result<Value, String> {
         .iter()
         // Internal plumbing the model has no use for.
         .filter(|c| !matches!(c.id, "gp.finish" | "info.commands"))
+        // Commands of an extension the user turned off (#1752).
+        .filter(|c| s.extensions().blocks(c.id).is_none())
         .filter_map(|c| {
             let (id, label, loc, params) =
                 (c.id.to_lowercase(), c.label.to_lowercase(), c.location.to_lowercase(), c.params.to_lowercase());
             let sc = score(&words, &[&id, &label, &loc, &params]);
             (sc > 0).then(|| {
-                (sc, json!({"id": c.id, "label": c.label, "location": c.location, "params": c.params, "changesProject": c.mutates}))
+                (sc, json!({"id": c.id, "label": c.label, "location": c.location, "params": c.params, "changesProject": c.changes_project()}))
             })
         })
         .collect();
@@ -553,7 +1189,7 @@ fn search_commands(s: &Session, a: &Value) -> Result<Value, String> {
 fn search_tools(a: &Value) -> Result<Value, String> {
     let words = words(a)?;
     let limit = limit_arg(a, 12, 40);
-    let mut hits: Vec<(usize, Value)> = analysis::tools()
+    let mut hits: Vec<(usize, Value)> = analysis::published_tools()
         .filter_map(|t| {
             let (id, name, tb, summary) = (t.id.to_lowercase(), t.name.to_lowercase(), t.toolbox.to_lowercase(), t.summary.to_lowercase());
             let sc = score(&words, &[&id, &name, &tb, &summary]);
@@ -567,7 +1203,9 @@ fn search_tools(a: &Value) -> Result<Value, String> {
 
 fn describe_tool(a: &Value) -> Result<Value, String> {
     let id = str_arg(a, "tool").ok_or("tool is required")?;
-    let t = analysis::tool(&id).ok_or_else(|| format!("no tool '{id}'; find ids with search_tools"))?;
+    let t = analysis::resolve_published(&id)
+        .map(|r| r.spec())
+        .ok_or_else(|| format!("no published tool '{id}'; open the tools or load the suite first"))?;
     let params: Vec<Value> = t
         .params
         .iter()
@@ -674,26 +1312,28 @@ fn read_features(s: &Session, a: &Value) -> Result<Value, String> {
             (by, a.get("descending").and_then(Value::as_bool) == Some(true))
         };
         let fi = ds.fields.iter().position(|f| f.name.eq_ignore_ascii_case(&by)).ok_or_else(|| format!("{name} has no field '{by}'"))?;
-        // A total order (a partial one can make `sort_by` panic): numbers, then text, then empty
-        // values.
-        let key = |r: usize| -> (u8, f64, String) {
+        // A total order (a partial one can make `sort_by` panic): numbers and dates (by instant),
+        // then text, then empty values.
+        let key = |r: usize| -> (u8, f64, i64, String) {
             match ds.features.get(r).and_then(|f| f.attrs.get(fi)) {
-                Some(rustgis_engine::data::Value::Null) | None => (2, 0.0, String::new()),
-                Some(v) => match v.as_f64() {
-                    Some(x) => (0, x, String::new()),
-                    None => (1, 0.0, v.to_string().to_lowercase()),
+                Some(rustgis_engine::data::Value::Null) | None => (2, 0.0, 0, String::new()),
+                Some(v) => match (v.as_f64(), v.temporal_key()) {
+                    (Some(x), _) => (0, x, 0, String::new()),
+                    (None, Some(k)) => (0, 0.0, k, String::new()),
+                    (None, None) => (1, 0.0, 0, v.to_string().to_lowercase()),
                 },
             }
         };
-        let mut keyed: Vec<(usize, (u8, f64, String))> = rows.iter().map(|&r| (r, key(r))).collect();
+        let mut keyed: Vec<(usize, (u8, f64, i64, String))> = rows.iter().map(|&r| (r, key(r))).collect();
         // Descending reverses within numbers and within text; empty values stay last.
         keyed.sort_by(|(_, a), (_, b)| {
-            let within = a.1.total_cmp(&b.1).then_with(|| a.2.cmp(&b.2));
+            let within = a.1.total_cmp(&b.1).then(a.2.cmp(&b.2)).then_with(|| a.3.cmp(&b.3));
             a.0.cmp(&b.0).then(if desc { within.reverse() } else { within })
         });
         rows = keyed.into_iter().map(|(r, _)| r).collect();
     }
     let limit = limit_arg(a, 20, 200);
+    let lonlat = ds.lonlat_conversion()?;
     let out: Vec<Value> = rows
         .iter()
         .take(limit)
@@ -701,13 +1341,11 @@ fn read_features(s: &Session, a: &Value) -> Result<Value, String> {
             let f = ds.features.get(r)?;
             let mut o = serde_json::Map::new();
             o.insert("_row".into(), json!(r));
-            // Where it is (its extent's centre), for zooming or going to it.
-            if let Some(g) = &f.geometry {
-                let c = g.extent().center();
-                if c.x.is_finite() && c.y.is_finite() {
-                    o.insert("_lon".into(), json!((c.x * 1e5).round() / 1e5));
-                    o.insert("_lat".into(), json!((c.y * 1e5).round() / 1e5));
-                }
+            // Where it is (its extent's centre, in longitude/latitude), for zooming or going to it.
+            // Left out where it isn't a place (`point` gives only finite ones).
+            if let Some(c) = f.geometry.as_ref().and_then(|g| lonlat.point(g.extent().center())) {
+                o.insert("_lon".into(), json!((c.x * 1e5).round() / 1e5));
+                o.insert("_lat".into(), json!((c.y * 1e5).round() / 1e5));
             }
             for &fi in &fields {
                 let (Some(field), Some(v)) = (ds.fields.get(fi), f.attrs.get(fi)) else { continue };
@@ -717,6 +1355,7 @@ fn read_features(s: &Session, a: &Value) -> Result<Value, String> {
                     rustgis_engine::data::Value::Float(x) => json!(x),
                     rustgis_engine::data::Value::Bool(b) => json!(b),
                     rustgis_engine::data::Value::Text(t) => json!(clip(t, 200)),
+                    d @ (rustgis_engine::data::Value::Date(_) | rustgis_engine::data::Value::DateTime(_)) => json!(d.to_string()),
                 };
                 o.insert(field.name.clone(), v);
             }
@@ -756,7 +1395,12 @@ pub fn context(s: &Session) -> String {
         let mut line = if l.is_raster() {
             format!("\n- \"{}\" (id {}, raster", l.name, l.id)
         } else {
-            format!("\n- \"{}\" (id {}, {}, {} features", l.name, l.id, l.geometry_type().label(), l.dataset.features.len())
+            let size = match (l.feature_count(), l.is_streamed()) {
+                (Some(n), false) => format!("{n} features"),
+                (Some(n), true) => format!("{n} features, read in place"),
+                (None, _) => "an unknown number of features, read in place".to_string(),
+            };
+            format!("\n- \"{}\" (id {}, {}, {size}", l.name, l.id, l.geometry_type().label())
         };
         if !l.visible {
             line.push_str(", hidden");
@@ -809,4 +1453,427 @@ pub fn context(s: &Session) -> String {
         out.push_str(&line);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    /// Returned tool and fetch errors are cleaned before active patterns can damage URLs;
+    /// successful values and the original call remain outside the generated-error projection.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn generated_tool_and_fetch_errors_clean_addresses_before_active_patterns() {
+        const TEST: &str = "tools::tests::generated_tool_and_fetch_errors_clean_addresses_before_active_patterns";
+        if std::env::var("RUSTGIS_ISOLATED_TOOL_ERRORS").as_deref() != Ok(TEST) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST])
+                .env("RUSTGIS_ISOLATED_TOOL_ERRORS", TEST)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed; 0 failed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use rustgis_engine::render::rustgis_tiles::{failure::Failure, logins};
+        let mut s = Session::new(rustgis_engine::Project::default());
+        let url = "https://returned-error.invalid/a?token=RGSYNTH_returned_error&layer=roads";
+        for active in [false, true] {
+            let binding = active.then(|| {
+                logins::activate(
+                    "https://returned-error.invalid",
+                    "synthetic-returned-error",
+                    logins::Method::Header("X-Key".into()),
+                    "https",
+                    false,
+                )
+                .unwrap()
+            });
+            for (name, args) in [
+                ("read_features", json!({"layer":url})),
+                ("describe_tool", json!({"tool":url})),
+                (url, json!({})),
+                ("run", json!({"script":url})),
+            ] {
+                let call = ToolCall { id: "error".into(), name: name.into(), args };
+                let original = call.clone();
+                let error = run_with_budget(&mut s, &call, DEFAULT_OUTPUT_TOKENS, Scope::peer(), None).unwrap_err();
+                assert!(!error.contains("RGSYNTH_returned_error"), "{name}, active={active}: {error}");
+                assert_eq!(call, original);
+                if name == "run" {
+                    let reply: Value = serde_json::from_str(&error).unwrap();
+                    assert_eq!(reply["success"], false);
+                    assert!(reply["error"].as_str().is_some());
+                }
+            }
+            let address = binding.as_ref().map_or_else(|| url.to_string(), |binding| logins::bind(binding, url).unwrap());
+            let failure = Failure::new(&address, format!("failed to fetch {address}"));
+            assert!(!failure.message.contains("RGSYNTH_returned_error"));
+            if let Some(binding) = binding {
+                assert!(logins::deactivate(&binding));
+            }
+        }
+        let clean = ToolCall { id: "clean".into(), name: "read_features".into(), args: json!({"layer":"ordinary missing layer"}) };
+        assert!(
+            run_with_budget(&mut s, &clean, DEFAULT_OUTPUT_TOKENS, Scope::peer(), None).unwrap_err().contains("ordinary missing layer")
+        );
+        assert_eq!(Failure::new("https://clean.invalid/a?layer=roads", "HTTP 403").message, "HTTP 403");
+        assert_eq!(logins::scrub_error("failed https://clean.invalid/a?layer=roads"), "failed https://clean.invalid/a?layer=roads");
+    }
+    use super::*;
+    use rustgis_engine::render::rustgis_tiles::logins;
+
+    #[test]
+    fn results_carry_plain_addresses_not_login_wrappers() {
+        let mut s = Session::new(rustgis_engine::Project::default());
+        let origin = "https://assistant-login757.example.org";
+        let definition = json!({"kind":"wmts", "address": format!("{origin}/tiles"), "auth":"header", "keyName":"X-Key"});
+        let id = s.run("connection.new", &definition).unwrap()["id"].as_str().unwrap().to_string();
+        s.run("connection.login", &json!({"id": id, "apiKey": "assistant-secret-757"})).unwrap();
+        let plain = format!("{origin}/tiles/{{z}}/{{x}}/{{y}}.png");
+        let tile = rustgis_engine::service_logins::request(&mut s, Some(&id), &plain).unwrap();
+        assert!(tile.starts_with(rustgis_engine::data::login_address::PREFIX));
+        // The app's command result keeps the bound address it reads through; the model's doesn't.
+        let call = |command: &str, params: Value| ToolCall {
+            id: String::new(),
+            name: "run_command".into(),
+            args: json!({"command": command, "params": params}),
+        };
+        let scope = Scope::assistant(757, std::sync::Arc::new(Live::default()));
+        let add = call("map.addTiles", json!({"url": tile, "name": "T"}));
+        let pending = match s.review(&scope, &policy_call(&add).unwrap().unwrap()) {
+            Outcome::NeedsApproval(pending) => Some(pending),
+            _ => None,
+        }
+        .unwrap();
+        let added = run_with_budget(&mut s, &add, DEFAULT_OUTPUT_TOKENS, scope.clone(), Some(pending.allow())).unwrap();
+        let listed = run_with_budget(&mut s, &call("map.tiles", json!({})), DEFAULT_OUTPUT_TOKENS, scope, None).unwrap();
+        assert!(s.map().tiles[0].url.starts_with("rustgis-login:"));
+        for text in [&added, &listed] {
+            assert!(!text.contains("rustgis-login:") && !text.contains("assistant-secret-757"), "{text}");
+        }
+        assert!(listed.contains(&plain), "the model still learns the layer's address: {listed}");
+    }
+
+    /// The known response schema survives a secret that happens to name one of its fields.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn run_envelope_keys_are_not_data_derived_login_values() {
+        if std::env::var_os("RUSTGIS_TEST_RUN_ENVELOPE").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tools::tests::run_envelope_keys_are_not_data_derived_login_values"])
+                .env("RUSTGIS_TEST_RUN_ENVELOPE", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed; 0 failed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut s = Session::new(rustgis_engine::Project::default());
+        let id = s
+            .run("connection.new", &json!({"kind":"wms", "address":"https://envelope.invalid/wms", "auth":"basic", "user":"reader"}))
+            .unwrap()["id"]
+            .clone();
+        s.run("connection.login", &json!({"id":id, "password":"success"})).unwrap();
+        let scope = Scope::assistant(152140, std::sync::Arc::new(Live::default()));
+        for (script, success) in [("map.zoomIn {}", true), ("not.a.command {}", false)] {
+            let call = ToolCall { id: "envelope".into(), name: "run".into(), args: json!({"script":script}) };
+            let text = run(&mut s, &call, scope.clone(), None).unwrap_or_else(|e| e);
+            let out: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(out.get("success"), Some(&json!(success)), "{text}");
+            assert!(out.get("result").is_some() && out.get("notices").is_some() && out.get("duration_s").is_some());
+        }
+        let data = public_addresses(json!({"success":"private field"}), 0, &mut Withheld::default());
+        assert_eq!(data["[redacted]"], "private field", "the same spelling in dynamic data is still scrubbed");
+        s.run("connection.login", &json!({"id":id, "password":"id"})).unwrap();
+        for (name, args, array) in
+            [("search_commands", json!({"query":"zoom"}), "commands"), ("search_tools", json!({"query":"buffer"}), "tools")]
+        {
+            let call = ToolCall { id: "metadata".into(), name: name.into(), args };
+            let text = run(&mut s, &call, scope.clone(), None).unwrap();
+            let out: Value = serde_json::from_str(&text).unwrap();
+            let entries = out.get(array).and_then(Value::as_array).unwrap();
+            assert!(!entries.is_empty(), "{text}");
+            assert!(entries.iter().all(|entry| entry.get("id").is_some()), "fixed nested schema keys survive: {text}");
+        }
+        let data = public_addresses(json!({"id":"private field"}), 0, &mut Withheld::default());
+        assert_eq!(data["[redacted]"], "private field");
+    }
+
+    /// Command discovery distinguishes publishing's project change from a read-only query.
+    #[test]
+    fn publishing_reports_a_project_change_in_command_search() {
+        let s = Session::new(rustgis_engine::Project::default());
+        for (id, changes) in [("source.publish", true), ("source.syncState", false)] {
+            let out = search_commands(&s, &json!({"query":id, "limit":40})).unwrap();
+            let command = out["commands"].as_array().unwrap().iter().find(|c| c["id"] == id).unwrap();
+            assert_eq!(command["changesProject"], changes, "{id}");
+        }
+    }
+
+    #[test]
+    fn wrappers_after_a_prefix_are_made_plain_too() {
+        let origin = "https://assistant-login.example";
+        let binding = logins::activate(origin, "assistant", logins::Method::Header("X-Key".into()), "assistant-secret", false).unwrap();
+        let archive = logins::bind(&binding, &format!("{origin}/a.pmtiles")).unwrap();
+        let result = json!({"layers": [{"next": {"request": {"url": format!("pmtiles:x@{archive}")}}}], "count": 2});
+        let v = public_addresses(result, 0, &mut Withheld::default());
+        assert_eq!(v["layers"][0]["next"]["request"]["url"], format!("pmtiles:x@{origin}/a.pmtiles"));
+        assert_eq!(v["count"], 2);
+        assert!(logins::deactivate(&binding));
+    }
+
+    #[test]
+    fn too_deep_results_report_each_withheld_subtree_without_losing_success() {
+        let mut s = Session::new(rustgis_engine::Project::default());
+        let mut deep = json!({"value": "rustgis-login:leak"});
+        for _ in 0..MAX_DEPTH {
+            deep = json!([deep]);
+        }
+        let result = json!({"success": true, "left": deep.clone(), "right": deep, "notices": ["existing warning"]});
+        let out: Value = serde_json::from_str(&public_result(&mut s, result, DEFAULT_OUTPUT_TOKENS)).unwrap();
+        assert_eq!(out["success"], true, "withholding output must not report an executed command as failed");
+        assert!(!out.to_string().contains("rustgis-login:"));
+        assert_eq!(out["notices"][0], "existing warning");
+        let notice = out["notices"][1].as_str().unwrap();
+        let counts: Vec<usize> = notice.split_whitespace().filter_map(|word| word.parse().ok()).collect();
+        assert_eq!(counts, [2, MAX_DEPTH], "the notice reports truncated subtrees, not an unbounded count of their contents");
+        assert_eq!(s.notices_since(0).len(), 1, "the app also receives one aggregate loss notice");
+    }
+
+    /// A notice that reports lost data comes with its code in `losses`, beside the notice text;
+    /// a run that loses nothing has no `losses`, and a script's answer an empty list.
+    #[test]
+    fn results_give_the_codes_of_the_losses_their_notices_report() {
+        let mut s = Session::new(rustgis_engine::Project::default());
+        // An MCP agent the server lets act without asking (`--yes`).
+        let scope = Scope::agent(rustgis_engine::policy::AgentAccess::Full, true, "loss-codes", None, std::sync::Arc::new(Live::default()));
+        const WMS: &str = r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink">
+<Service><Title>Test WMS</Title></Service>
+<Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="https://maps.example.com/wms?"/></Get></HTTP></DCPType></GetMap></Request>
+<Layer><CRS>EPSG:3857</CRS><Layer><Name>roads</Name><Title>Roads</Title>
+<Style><Name>default</Name><LegendURL><Format>image/png</Format><OnlineResource xlink:href="LEGEND"/></LegendURL></Style></Layer></Layer></Capability></WMS_Capabilities>"#;
+        // A legend picture whose address is too long to keep is left out, and said with its code.
+        let long = format!("https://maps.example.com/legends/{}.png", "a".repeat(5000));
+        let params = |legend: &str| json!({"url": "https://maps.example.com/wms", "layer": "roads", "text": WMS.replace("LEGEND", legend)});
+        let lossy = params(&long);
+        let clean = params("https://maps.example.com/legends/roads.png");
+        let add = |params: &Value| ToolCall {
+            id: "add".into(),
+            name: "run_command".into(),
+            args: json!({"command": "service.add", "params": params}),
+        };
+        let run = |s: &mut Session, call: &ToolCall| -> Value {
+            serde_json::from_str(&run_with_budget(s, call, DEFAULT_OUTPUT_TOKENS, scope.clone(), None).unwrap()).unwrap()
+        };
+        let out = run(&mut s, &add(&lossy));
+        let [loss] = out["losses"].as_array().map(Vec::as_slice).unwrap_or_default() else { panic!("one loss: {out}") };
+        assert_eq!((&loss["code"], &loss["kind"]), (&json!("dropped.legend"), &json!("dropped")), "{out}");
+        assert_eq!(loss["action"], "Use a service with short HTTP or HTTPS addresses for its legend pictures.");
+        assert!(out["notices"].as_array().unwrap().iter().any(|n| n == &loss["text"]), "the loss is a notice too: {out}");
+        assert!(run(&mut s, &add(&clean)).get("losses").is_none());
+        let line = |params: &Value| format!("service.add {params}");
+        let script = |text: String| ToolCall { id: "script".into(), name: "run".into(), args: json!({"script": text}) };
+        let out = run(&mut s, &script(line(&lossy)));
+        assert_eq!(out["losses"][0]["code"], "dropped.legend", "{out}");
+        assert_eq!(run(&mut s, &script(line(&clean)))["losses"], json!([]));
+        // A failed command still says the loss its rollback can't take back, with its code.
+        let failing = format!("{}\nlayer.addDataText {}", line(&lossy), json!({"fileName": "broken.geojson", "text": "{"}));
+        let command = ToolCall {
+            id: "fail".into(),
+            name: "run_command".into(),
+            args: json!({"command": "script.run", "params": {"script": failing}}),
+        };
+        let error = run_with_budget(&mut s, &command, DEFAULT_OUTPUT_TOKENS, scope.clone(), None).unwrap_err();
+        assert!(error.contains(r#"losses: [{"action":"Use a service"#) && error.contains(r#""code":"dropped.legend""#), "{error}");
+        let error = run_with_budget(&mut s, &script(failing), DEFAULT_OUTPUT_TOKENS, scope.clone(), None).unwrap_err();
+        let failed: Value = serde_json::from_str(&error).unwrap();
+        assert_eq!((&failed["success"], &failed["losses"][0]["code"]), (&json!(false), &json!("dropped.legend")), "{failed}");
+        // A login value that matches a code's words cleans the notice's text, never the code.
+        let id = s
+            .run(
+                "connection.new",
+                &json!({"kind":"wms","address":"https://echo-2371.example.invalid/wms","auth":"header","keyName":"X-Key"}),
+            )
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        s.run("connection.login", &json!({"id": id, "apiKey": "legend"})).unwrap();
+        let out = run(&mut s, &script(line(&lossy)));
+        assert_eq!(out["losses"][0]["code"], "dropped.legend", "{out}");
+        assert!(out["losses"][0].get("code").is_some() && !out["losses"][0]["text"].as_str().unwrap().contains("legend"), "{out}");
+        let error = run_with_budget(&mut s, &command, DEFAULT_OUTPUT_TOKENS, scope.clone(), None).unwrap_err();
+        assert!(error.contains(r#""code":"dropped.legend""#), "a failure's code isn't cleaned either: {error}");
+        // An error too long to keep whole is cut, never the losses after it.
+        let long = format!("{}\nmap.drawingMode {}", line(&lossy), json!({"mode": "x".repeat(9000)}));
+        let command =
+            ToolCall { id: "long".into(), name: "run_command".into(), args: json!({"command": "script.run", "params": {"script": long}}) };
+        let error = run_with_budget(&mut s, &command, DEFAULT_OUTPUT_TOKENS, scope.clone(), None).unwrap_err();
+        let last = error.lines().last().unwrap_or_default();
+        assert!(last.starts_with("losses: [") && last.contains(r#""code":"dropped.legend""#), "{last}");
+        assert!(error.chars().count() <= 8000, "{}", error.chars().count());
+        // Within a small output budget too, counted in the bytes of the agent's `{"error": …}`,
+        // with text of several bytes a character.
+        let wide = format!("{}\nmap.drawingMode {}", line(&lossy), json!({"mode": "界".repeat(3000)}));
+        let command =
+            ToolCall { id: "wide".into(), name: "run_command".into(), args: json!({"command": "script.run", "params": {"script": wide}}) };
+        let error = run_with_budget(&mut s, &command, 200, scope.clone(), None).unwrap_err();
+        assert!(json!({"error": error}).to_string().len() <= output_bytes(200), "{error}");
+        assert!(error.lines().last().unwrap_or_default().contains("dropped.legend"), "{error}");
+        // With no room for even the codes, a line says they were left out.
+        let error = run_with_budget(&mut s, &command, 9, scope.clone(), None).unwrap_err();
+        assert!(error.ends_with("lossesTrimmed: true"), "{error}");
+    }
+
+    /// Losses that don't fit the output budget beside the result keep only their codes, so the
+    /// result stays whole; when even those don't fit, one entry per code is kept and the rest of
+    /// the result is cut to leave it room.
+    #[test]
+    fn losses_beyond_the_output_budget_keep_their_codes() {
+        let small_loss = || json!({"code": "dropped.value", "kind": "dropped", "text": "t", "action": "a"});
+        let mut s = Session::new(rustgis_engine::Project::default());
+        let mut finish = |r: Value, losses: Vec<Value>, always: bool| -> Value {
+            serde_json::from_str(&finish_with_losses(&mut s, r, losses, 200, Withheld::default(), always)).unwrap()
+        };
+        let loss = json!({"code": "dropped.value", "kind": "dropped", "text": "x".repeat(600), "action": "Correct the value."});
+        let out = finish(json!({"notices": ["n"]}), vec![loss.clone(), loss.clone()], false);
+        assert_eq!(out["losses"], json!([{"code": "dropped.value", "kind": "dropped"}, {"code": "dropped.value", "kind": "dropped"}]));
+        assert_eq!((&out["lossesTrimmed"], &out["notices"]), (&json!(true), &json!(["n"])));
+        // An entry for losses whose notices weren't kept keeps its count when shortened.
+        let unkept = json!({"code": "dropped.value", "kind": "dropped", "count": 250, "text": "x".repeat(900), "action": "a"});
+        let out = finish(json!({"notices": ["n"]}), vec![unkept], false);
+        assert_eq!(out["losses"], json!([{"code": "dropped.value", "kind": "dropped", "count": 250}]), "{out}");
+        let small = json!({"code": "dropped.value", "kind": "dropped", "text": "t", "action": "a"});
+        let out = finish(json!({"notices": ["n"]}), vec![small.clone()], false);
+        assert_eq!((&out["losses"], out.get("lossesTrimmed")), (&json!([small]), None));
+        // A result over the budget by itself is cut, keeping its `success` and one entry per code
+        // with its count; a tighter budget keeps the codes alone, and the tightest says only that
+        // they were left out, always as JSON within the budget.
+        let big = json!({"success": true, "notices": ["n"], "result": "y".repeat(5000)});
+        let text = finish_with_losses(&mut s, big.clone(), vec![loss.clone(), loss.clone()], 200, Withheld::default(), false);
+        assert!(text.len() <= output_bytes(200), "{}", text.len());
+        let out: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(out["losses"], json!([{"code": "dropped.value", "kind": "dropped", "count": 2, "action": "Correct the value."}]));
+        assert_eq!((&out["lossesTrimmed"], &out["truncated"], &out["success"]), (&json!(true), &json!(true), &json!(true)));
+        // `run`'s success, whose `error` is null, is cut the same way.
+        let run_ok = json!({"success": true, "error": null, "notices": ["n"], "result": "y".repeat(5000)});
+        for (tokens, big) in [(32, &big), (16, &big), (32, &run_ok), (16, &run_ok)] {
+            let text = finish_with_losses(&mut s, big.clone(), vec![loss.clone()], tokens, Withheld::default(), false);
+            let out: Value = serde_json::from_str(&text).unwrap();
+            assert!(text.len() <= output_bytes(tokens), "{tokens}: {text}");
+            assert_eq!((&out["lossesTrimmed"], &out["success"]), (&json!(true), &json!(true)), "{tokens}: {text}");
+            // A success cut this far is never said as an error, and always said to be cut: the
+            // codes go first.
+            assert!(out.get("error").is_none(), "{tokens}: {text}");
+            assert_eq!(out["truncated"], json!(true), "{tokens}: {text}");
+            assert_eq!(out["losses"].to_string().contains("dropped.value"), tokens == 32, "{tokens}: {text}");
+        }
+        for tokens in 1..=8 {
+            let text = finish_with_losses(&mut s, big.clone(), vec![loss.clone()], tokens, Withheld::default(), false);
+            assert!(text.len() <= output_bytes(tokens), "{tokens}: {text}");
+        }
+        // A cut result with no losses says it was cut, not that a list was.
+        let text = finish_with_losses(&mut s, run_ok.clone(), vec![], 32, Withheld::default(), true);
+        let out: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!((&out["truncated"], out.get("lossesTrimmed"), &out["losses"]), (&json!(true), None, &json!([])), "{out}");
+        // A failure with its own `losses`, cut, keeps its `success` and says it was cut.
+        let own = json!({"success": false, "error": "e".repeat(5000), "losses": 3});
+        let text = finish_with_losses(&mut s, own, vec![loss.clone()], 200, Withheld::default(), true);
+        let out: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!((&out["success"], &out["truncated"]), (&json!(false), &json!(true)), "{out}");
+        // A failure whose error gives way says so, at every budget.
+        for tokens in 12..=24 {
+            let failed = json!({"success": false, "error": "e".repeat(5000)});
+            let text = finish_with_losses(&mut s, failed, vec![loss.clone()], tokens, Withheld::default(), true);
+            let out: Value = serde_json::from_str(&text).unwrap();
+            assert!(text.len() <= output_bytes(tokens), "{tokens}: {text}");
+            assert_eq!(out["truncated"], json!(true), "{tokens}: {text}");
+        }
+        // A failure's error alone gives way to its losses, as JSON.
+        let failed = json!({"success": false, "error": "e".repeat(5000)});
+        let text = finish_with_losses(&mut s, failed, vec![loss.clone()], 200, Withheld::default(), true);
+        assert!(text.len() <= output_bytes(200), "{}", text.len());
+        let out: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!((&out["success"], &out["losses"][0]["code"]), (&json!(false), &json!("dropped.value")), "{out}");
+        assert!(out["error"].as_str().unwrap().starts_with("error: eee"), "the error as text, not encoded twice: {out}");
+        assert_eq!(out["truncated"], json!(true), "the error is said to be cut: {out}");
+        let mut finish = |r: Value, always: bool| -> Value {
+            serde_json::from_str(&finish_with_losses(&mut s, r, vec![], 200, Withheld::default(), always)).unwrap()
+        };
+        assert_eq!(finish(json!({"notices": ["n"]}), true)["losses"], json!([]));
+        assert!(finish(json!({"notices": ["n"]}), false).get("losses").is_none());
+        // A result that isn't an object, or has its own `losses`, goes under `result`, beside the codes.
+        let out: Value =
+            serde_json::from_str(&finish_with_losses(&mut s, json!([1, 2]), vec![small_loss()], 200, Withheld::default(), false)).unwrap();
+        assert_eq!((&out["result"], &out["losses"][0]["code"]), (&json!([1, 2]), &json!("dropped.value")), "{out}");
+        let own = json!({"losses": 3});
+        let out: Value =
+            serde_json::from_str(&finish_with_losses(&mut s, own.clone(), vec![small_loss()], 200, Withheld::default(), false)).unwrap();
+        assert_eq!((&out["result"], &out["losses"][0]["code"]), (&own, &json!("dropped.value")), "{out}");
+    }
+
+    #[test]
+    fn successful_results_scrub_active_raw_service_keys_without_a_wrapper() {
+        let mut s = Session::new(rustgis_engine::Project::default());
+        let id = s
+            .run(
+                "connection.new",
+                &json!({"kind":"wms","address":"https://echo-r15.example.invalid/wms","auth":"header","keyName":"X-Key"}),
+            )
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        s.run("connection.login", &json!({"id":id,"apiKey":"fake001"})).unwrap();
+        let result = json!({"success":true,"echo":"server said fake001","clean":"ordinary café text"});
+        let out: Value = serde_json::from_str(&public_result(&mut s, result, DEFAULT_OUTPUT_TOKENS)).unwrap();
+        assert_eq!(out["success"], true);
+        assert_eq!(out["echo"], "server said [redacted]");
+        assert_eq!(out["clean"], "ordinary café text");
+        assert!(s.notices_since(0).is_empty());
+        // A generated row uses imported field names as object keys. Keep the stored data,
+        // but never send a field repeating an active key to the model in plain text.
+        let source = json!({"type":"FeatureCollection","features":[{
+            "type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},
+            "properties":{"fake001":"retained value","clean":"ordinary café text"}
+        }]});
+        s.run("layer.addDataText", &json!({"fileName":"echo-fields.geojson","text":source.to_string()})).unwrap();
+        let name = s.map().layers.last().unwrap().name.clone();
+        let call = ToolCall { id: "echo-fields".into(), name: "read_features".into(), args: json!({"layer":name,"limit":1}) };
+        let scope = Scope::assistant(9035, std::sync::Arc::new(Live::default()));
+        let mark = s.notice_mark();
+        let text = run_with_budget(&mut s, &call, DEFAULT_OUTPUT_TOKENS, scope, None).unwrap();
+        assert!(!text.contains("fake001"), "generated object keys must be scrubbed too: {text}");
+        let out: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(out["rows"][0]["[redacted]"], "retained value");
+        assert_eq!(out["rows"][0]["clean"], "ordinary café text");
+        assert!(s.map().layers.last().unwrap().dataset.fields.iter().any(|f| f.name == "fake001"), "stored data stays unchanged");
+        assert!(s.notices_since(mark).is_empty());
+        // Two keys that become equal must not silently overwrite one value with the other.
+        let mark = s.notice_mark();
+        let collision = json!({"success":true,"result":{"fake001":"first value","[redacted]":"second value"}});
+        let text = public_result(&mut s, collision, DEFAULT_OUTPUT_TOKENS);
+        assert!(!text.contains("fake001"));
+        let out: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(out["success"], true);
+        assert!(out["result"].is_string(), "ambiguous redacted objects are explicitly withheld");
+        assert_eq!(s.notices_since(mark).len(), 1);
+        assert!(s.notices_since(mark)[0].text.contains("field names"));
+    }
+
+    #[test]
+    fn clean_nested_results_need_no_withholding_notice() {
+        let mut s = Session::new(rustgis_engine::Project::default());
+        let result = json!({"result": {"nested": [{"value": "complete"}]}, "success": true});
+        let out: Value = serde_json::from_str(&public_result(&mut s, result.clone(), DEFAULT_OUTPUT_TOKENS)).unwrap();
+        assert_eq!(out, result);
+        assert!(s.notices_since(0).is_empty());
+    }
 }

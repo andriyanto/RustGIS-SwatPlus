@@ -29,7 +29,39 @@ fn child_text(n: &Node, name: &str) -> Option<String> {
 fn coord(n: &Node) -> Option<Coord> {
     let x = n.attribute("lon")?.trim().parse::<f64>().ok()?;
     let y = n.attribute("lat")?.trim().parse::<f64>().ok()?;
-    ((-180.0..=180.0).contains(&x) && (-90.0..=90.0).contains(&y)).then(|| Coord::new(x, y))
+    crate::io::lon_lat_in_range(x, y).then(|| Coord::new(x, y))
+}
+
+/// Whether reading keeps a feature that [`crate::interop::to_gpx`] writes with geometry `g`: a
+/// waypoint in range ([`coord`]), or a track with a segment of two such points.
+pub(crate) fn keeps(g: &Geometry) -> bool {
+    let kept = |c: &&Coord| crate::io::lon_lat_in_range(c.x, c.y);
+    let segment = |p: &Vec<Coord>| p.iter().filter(kept).count() >= 2;
+    match g {
+        Geometry::Point(c) => kept(&c),
+        Geometry::MultiPoint(v) => v.iter().any(|c| kept(&c)),
+        Geometry::Line(parts) => parts.iter().any(segment),
+        // Written as a track along each part's outer ring.
+        Geometry::Polygon(polys) => polys.iter().filter_map(|rings| rings.first()).any(segment),
+    }
+}
+
+/// The vertices of a feature reading keeps ([`keeps`]) that don't read back with it: points of a
+/// multipoint outside longitude/latitude ([`coord`]), and those of a track's segments (a polygon's
+/// outer rings) out of range, or all of a segment left with fewer than two, which reading leaves
+/// out of the track.
+pub(crate) fn lost_vertices(g: &Geometry) -> usize {
+    let in_range = |p: &[Coord]| p.iter().filter(|c| crate::io::lon_lat_in_range(c.x, c.y)).count();
+    let segment = |p: &Vec<Coord>| {
+        let n = in_range(p);
+        if n >= 2 { p.len().saturating_sub(n) } else { p.len() }
+    };
+    match g {
+        Geometry::Point(_) => 0,
+        Geometry::MultiPoint(v) => v.len().saturating_sub(in_range(v)),
+        Geometry::Line(parts) => parts.iter().map(segment).sum(),
+        Geometry::Polygon(polys) => polys.iter().filter_map(|rings| rings.first()).map(segment).sum(),
+    }
 }
 
 fn text(v: Option<String>) -> Value {
@@ -48,6 +80,7 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         return Err(DataError::Format(format!("{file_name}: not a GPX file")));
     }
     let mut skipped = 0usize;
+    let mut short_segments = 0usize;
     let point_fields = |extra: &[(&str, FieldType)]| {
         let mut f: Vec<Field> = extra.iter().map(|(n, t)| Field::new(*n, *t)).collect();
         f.extend(["name", "ele", "time", "desc", "cmt", "sym", "type"].iter().map(|n| Field::new(*n, FieldType::Text)));
@@ -116,6 +149,8 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
             count += part.len();
             if part.len() >= 2 {
                 parts.push(part);
+            } else if !part.is_empty() {
+                short_segments += 1;
             }
         }
         if parts.is_empty() {
@@ -130,14 +165,42 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
         if ds.features.is_empty() {
             continue;
         }
-        // Elevations are typed; names, descriptions, symbols and times stay text.
+        // Elevations are inferred; timestamps are explicitly typed by the GPX schema.
         crate::io::type_text_columns(&mut ds, &["name", "desc", "cmt", "sym", "type", "time", "number"]);
-        out.push((ds, ReadReport::default()));
+        let mut report = ReadReport::default();
+        if let Some(k) = ds.field_index("time") {
+            if let Some(field) = ds.fields.get_mut(k) {
+                field.ty = FieldType::DateTime;
+            }
+            let mut counts = Vec::new();
+            for feature in &mut ds.features {
+                crate::progress::step(1)?;
+                if let Some(value @ Value::Text(_)) = feature.attrs.get_mut(k) {
+                    let Value::Text(s) = &*value else { continue };
+                    let parsed = crate::DateTime::parse(s).filter(|_| s.contains(['T', 't']));
+                    if parsed.is_none() {
+                        crate::source::unread_date(&mut counts, k);
+                    }
+                    *value = parsed.map(Value::DateTime).unwrap_or_default();
+                }
+            }
+            report.unread_dates = crate::source::unread_dates_note(&ds.fields, &counts);
+            report.messages.extend(report.unread_dates.clone());
+        }
+        out.push((ds, report));
     }
     if let Some((_, report)) = out.first_mut() {
+        if short_segments > 0 {
+            let (segment, action) = if short_segments == 1 {
+                ("segment", "was left out of tracks; its point remains in track points")
+            } else {
+                ("segments", "were left out of tracks; their points remain in track points")
+            };
+            report.messages.push(format!("{name}: {short_segments} GPX track {segment} with fewer than two usable points {action}"));
+        }
         report.skipped = skipped;
         if skipped > 0 {
-            report.messages.push(format!("{name}: {skipped} points, routes or tracks without usable coordinates were skipped"));
+            report.messages.push(format!("{name}: {skipped} points, routes or tracks without usable geometry were skipped"));
         }
     }
     if out.is_empty() {
@@ -149,6 +212,26 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xml_loss_short_segments_are_counted_but_their_points_remain() {
+        let xml = br#"<gpx><trk><name>kept</name><trkseg><trkpt lat="1" lon="2"/><trkpt lat="3" lon="4"/></trkseg><trkseg><trkpt lat="5" lon="6"/></trkseg><trkseg/></trk></gpx>"#;
+        let layers = read("a.gpx", xml).unwrap();
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].0.features[0].geometry, Some(Geometry::Line(vec![vec![Coord::new(2.0, 1.0), Coord::new(4.0, 3.0)]])));
+        assert_eq!(layers[0].0.value(0, 0), &Value::Text("kept".into()));
+        assert_eq!(layers[1].0.features.len(), 3);
+        assert_eq!(layers[1].0.features[2].geometry, Some(Geometry::Point(Coord::new(6.0, 5.0))));
+        assert_eq!(layers[1].0.value(2, 1), &Value::Int(2));
+        assert_eq!(
+            layers[0].1.messages,
+            ["a: 1 GPX track segment with fewer than two usable points was left out of tracks; its point remains in track points"]
+        );
+        assert!(layers[1].1.messages.is_empty());
+        let clean =
+            read("a.gpx", br#"<gpx><trk><trkseg><trkpt lat="1" lon="2"/><trkpt lat="3" lon="4"/></trkseg><trkseg/></trk></gpx>"#).unwrap();
+        assert!(clean.iter().all(|(_, r)| r.messages.is_empty()));
+    }
 
     const GPX: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <gpx version="1.1" creator="test" xmlns="http://www.topografix.com/GPX/1/1">
@@ -178,8 +261,21 @@ mod tests {
         let tp = &layers[3].0;
         assert_eq!(tp.features.len(), 4);
         assert_eq!(tp.value(0, tp.field_index("ele").unwrap()), &Value::Float(1000.5));
-        assert_eq!(tp.value(1, tp.field_index("time").unwrap()), &Value::Text("2024-05-01T07:00:10Z".into()));
+        assert_eq!(tp.value(1, tp.field_index("time").unwrap()), &Value::parse("2024-05-01T07:00:10Z", FieldType::DateTime));
         assert_eq!(tp.value(3, tp.field_index("segment").unwrap()), &Value::Int(2));
+    }
+
+    #[test]
+    fn invalid_gpx_times_are_counted_without_changing_clean_times() {
+        let xml = br#"<gpx><wpt lat="1" lon="1"><time>2026-02-30T12:00:00Z</time></wpt><wpt lat="2" lon="2"><time>2026-03-05T14:30:00.123456+02:00</time></wpt><wpt lat="3" lon="3"/></gpx>"#;
+        let layers = read("times.gpx", xml).unwrap();
+        let (ds, report) = &layers[0];
+        let k = ds.field_index("time").unwrap();
+        assert_eq!(ds.fields[k].ty, FieldType::DateTime);
+        assert!(ds.value(0, k).is_null() && ds.value(2, k).is_null());
+        assert_eq!(ds.value(1, k).to_string(), "2026-03-05T14:30:00.123456+02:00");
+        assert!(report.unread_dates.as_deref().unwrap().starts_with("1 value"));
+        assert!(read("clean.gpx", GPX.as_bytes()).unwrap().iter().all(|(_, r)| r.unread_dates.is_none()));
     }
 
     #[test]

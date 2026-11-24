@@ -3,19 +3,43 @@
 //! the overlap a feature has with a polygon, and the rules that roll the values of several matches
 //! up into one.
 //!
-//! Distances are on the WGS 84 ellipsoid, as buffers' are. The nearest points of two features are
-//! found in an azimuthal equidistant plane, centred first between the features and then between
-//! the points found, and measured along the geodesic between them.
+//! In a run in longitude/latitude, distances are on the WGS 84 ellipsoid, as buffers' are. The
+//! nearest points of two features are found in an azimuthal equidistant plane, centred first
+//! between the features and then between the points found, and measured along the geodesic between
+//! them. In a run in a projected system's own plane ([`crate::convert::Plane::Own`], #2032 C2e-3),
+//! they are found there and measured straight, in the system's unit times its length.
 
 use rustgis_data::{Coord, Dataset, FieldType, Geometry, Value};
-use rustgis_geom::{Aeqd, Extent, WGS84_MIN_RADIUS_M, geodesic_interpolate, geodesic_length_m, geodesic_ring_area_m2, wgs84_distance_m};
+use rustgis_geom::{Aeqd, Extent, WGS84_MIN_RADIUS_M, geodesic_interpolate, wgs84_distance_m, wgs84_ring_perimeter_area_m2, wgs84_step_m};
 use serde_json::Value as Json;
 
 /// Whether a coordinate is a place on the Earth in lon/lat: finite, with a latitude of ±90° at most
 /// and a longitude within 540° of the meridian (a shape across the antimeridian goes past 180°).
 /// Distances leave other coordinates out, as places they can't measure from.
 fn on_earth(c: &Coord) -> bool {
-    c.is_finite() && c.x.abs() <= 540.0 && c.y.abs() <= 90.0
+    c.is_finite() && (crate::convert::plane() == crate::convert::Plane::Own || (c.x.abs() <= 540.0 && c.y.abs() <= 90.0))
+}
+
+/// The plane nearest points are found in: an azimuthal equidistant one, or a projected system's
+/// own as it is.
+enum Flat {
+    Aeqd(Aeqd),
+    Own,
+}
+
+impl Flat {
+    fn forward(&self, c: Coord) -> Coord {
+        match self {
+            Flat::Aeqd(p) => p.forward(c),
+            Flat::Own => c,
+        }
+    }
+    fn inverse(&self, c: Coord) -> Coord {
+        match self {
+            Flat::Aeqd(p) => p.inverse(c),
+            Flat::Own => c,
+        }
+    }
 }
 
 /// The first coordinate of a geometry that is a place on the Earth.
@@ -29,7 +53,8 @@ pub fn first_coord(g: &Geometry) -> Option<Coord> {
     first
 }
 
-/// The ground distance (metres) between two features that don't intersect: between their nearest
+/// The distance (metres) between two features that don't intersect, on the ground (flat in a
+/// projected system's own plane, see the module's docs): between their nearest
 /// points, edges and vertices alike. `None` for a geometry without a finite coordinate.
 ///
 /// The nearest pair is found in a plane centred between the features' first vertices, then again
@@ -37,7 +62,10 @@ pub fn first_coord(g: &Geometry) -> Option<Coord> {
 /// the features are.
 pub fn distance_m(a: &Geometry, b: &Geometry) -> Option<f64> {
     let (p, q) = nearest_points(a, b)?;
-    let d = wgs84_distance_m(p, q);
+    let d = match crate::convert::own_unit_m() {
+        Some(unit) => (p.x - q.x).hypot(p.y - q.y) * unit,
+        None => wgs84_distance_m(p, q),
+    };
     d.is_finite().then_some(d)
 }
 
@@ -46,13 +74,16 @@ pub fn distance_m(a: &Geometry, b: &Geometry) -> Option<f64> {
 pub fn nearest_points(a: &Geometry, b: &Geometry) -> Option<(Coord, Coord)> {
     // The features' first vertices are a pair of their points: the search starts from them.
     let (fa, fb) = (first_coord(a)?, first_coord(b)?);
-    let (p, q) = nearest_pair(a, b, &Aeqd::new(geodesic_interpolate(fa, fb, 0.5)), Some((fa, fb)))?;
-    Some(nearest_pair(a, b, &Aeqd::new(geodesic_interpolate(p, q, 0.5)), Some((p, q))).unwrap_or((p, q)))
+    if crate::convert::plane() == crate::convert::Plane::Own {
+        return nearest_pair(a, b, &Flat::Own, Some((fa, fb)));
+    }
+    let (p, q) = nearest_pair(a, b, &Flat::Aeqd(Aeqd::new(geodesic_interpolate(fa, fb, 0.5))), Some((fa, fb)))?;
+    Some(nearest_pair(a, b, &Flat::Aeqd(Aeqd::new(geodesic_interpolate(p, q, 0.5))), Some((p, q))).unwrap_or((p, q)))
 }
 
 /// The nearest points of two geometries (lon/lat) as found in `plane`: a point of `a`, one of `b`.
 /// `seed`, a pair already found, starts the search, so pairs no nearer than it are skipped.
-fn nearest_pair(a: &Geometry, b: &Geometry, plane: &Aeqd, seed: Option<(Coord, Coord)>) -> Option<(Coord, Coord)> {
+fn nearest_pair(a: &Geometry, b: &Geometry, plane: &Flat, seed: Option<(Coord, Coord)>) -> Option<(Coord, Coord)> {
     let boxed = |segs: Vec<(Coord, Coord)>| -> Vec<((Coord, Coord), [f64; 4])> {
         segs.into_iter().map(|(s, e)| ((s, e), [s.x.min(e.x), s.y.min(e.y), s.x.max(e.x), s.y.max(e.y)])).collect()
     };
@@ -94,7 +125,7 @@ fn nearest_pair(a: &Geometry, b: &Geometry, plane: &Aeqd, seed: Option<(Coord, C
 }
 
 /// A geometry's edges in the plane; a point is an edge of no length.
-fn segments(g: &Geometry, plane: &Aeqd) -> Vec<(Coord, Coord)> {
+fn segments(g: &Geometry, plane: &Flat) -> Vec<(Coord, Coord)> {
     let mut out = Vec::new();
     let mut path = |pts: &[Coord], closed: bool| {
         // A coordinate left out ends a run: no edge joins the runs on either side of it, and a
@@ -159,6 +190,11 @@ pub fn may_be_within(a: &Extent, b: &Extent, metres: f64) -> bool {
     if a.is_empty() || b.is_empty() {
         return false;
     }
+    // In a projected system's own plane, extents there: their gap measured straight.
+    if let Some(d) = crate::convert::own_length(metres) {
+        let gap = (b.min_x - a.max_x).max(a.min_x - b.max_x).max(0.0).hypot((b.min_y - a.max_y).max(a.min_y - b.max_y).max(0.0));
+        return gap <= d.max(0.0) * (1.0 + 1e-9) + 1e-9;
+    }
     let (dlat, dlon) = spread(a.min_y.abs().max(a.max_y.abs()), metres);
     let lat_gap = (b.min_y - a.max_y).max(a.min_y - b.max_y).max(0.0);
     if lat_gap > dlat {
@@ -174,6 +210,11 @@ pub fn search_box(ext: &Extent, metres: f64) -> Option<Extent> {
     if ext.is_empty() || !metres.is_finite() {
         return None;
     }
+    // In a projected system's own plane, the extent there widened by the distance in its unit.
+    if let Some(d) = crate::convert::own_length(metres) {
+        let d = d.max(0.0) * (1.0 + 1e-9) + 1e-9;
+        return Some(Extent::new(ext.min_x - d, ext.min_y - d, ext.max_x + d, ext.max_y + d));
+    }
     let (dlat, dlon) = spread(ext.min_y.abs().max(ext.max_y.abs()), metres);
     let dlon = dlon?;
     let (x0, x1) = (ext.min_x - dlon, ext.max_x + dlon);
@@ -188,20 +229,34 @@ fn lon_gap(a: &Extent, b: &Extent) -> f64 {
     [-360.0, 0.0, 360.0].iter().map(|k| (b.min_x + k - a.max_x).max(a.min_x - (b.max_x + k)).max(0.0)).fold(f64::INFINITY, f64::min)
 }
 
-/// The ground area (square metres) of a lon/lat polygon geometry, holes taken out.
+/// The ground area (square metres) of a lon/lat polygon geometry on the WGS 84 ellipsoid, holes
+/// taken out, as the Measure tool gives it. NaN for a ring whose winding is ambiguous.
 pub fn area_m2(g: &Geometry) -> f64 {
     let Geometry::Polygon(polys) = g else { return 0.0 };
     polys
         .iter()
         .flat_map(|rings| rings.iter().enumerate())
-        .map(|(i, r)| if i == 0 { geodesic_ring_area_m2(r) } else { -geodesic_ring_area_m2(r) })
+        .map(|(i, r)| {
+            let (_, area) = wgs84_ring_perimeter_area_m2(r);
+            if i == 0 { area } else { -area }
+        })
         .sum()
 }
 
-/// The ground length (metres) of a lon/lat line geometry.
+/// The ground length (metres) of a lon/lat line geometry on the WGS 84 ellipsoid, each step
+/// measured with [`wgs84_step_m`]: within a millionth of
+/// [`wgs84_length_m`](rustgis_geom::wgs84_length_m), without a geodesic solve for each of a dense
+/// line's many short steps.
 pub fn length_m(g: &Geometry) -> f64 {
     let Geometry::Line(parts) = g else { return 0.0 };
-    parts.iter().map(|p| geodesic_length_m(p)).sum()
+    parts
+        .iter()
+        .flat_map(|p| p.windows(2))
+        .map(|w| match w {
+            [a, b] => wgs84_step_m(*a, *b),
+            _ => 0.0,
+        })
+        .sum()
 }
 
 /// How the values of a join field's matches become one value in a one-to-one join.
@@ -229,6 +284,17 @@ pub const RULES: &[(&str, Rule)] = &[
     ("join", Rule::Join),
 ];
 
+impl Rule {
+    /// Whether this rule can combine values of the given field type.
+    pub fn fits(self, ty: FieldType) -> bool {
+        match self {
+            Self::Sum | Self::Mean => ty.is_numeric(),
+            Self::Min | Self::Max => ty.is_numeric() || ty == FieldType::Text,
+            _ => true,
+        }
+    }
+}
+
 /// A merge rule for one join field.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Merge {
@@ -250,40 +316,82 @@ impl Merge {
         }
     }
 
-    /// The matches' values (in match order) merged into one. Every rule but `first` and `last`
-    /// skips nulls; with nothing left a numeric rule gives null, `count` zero and `join` "".
-    /// An integer field's sum adds its whole numbers (one too large for 64 bits is null).
-    pub fn apply(&self, ty: FieldType, values: &[&Value]) -> Value {
+    /// The matches' values (in match order) merged into one, and what merging them lost. Every
+    /// rule but `first` and `last` skips nulls; with nothing left a numeric rule gives null,
+    /// `count` zero and `join` "". An integer field's sum adds its whole numbers exactly: a total
+    /// too large for 64 bits is null, and said so, as is each number it leaves out (a decimal with
+    /// a fraction, or one past the range). The other numeric rules leave out, and count, a number
+    /// too large for a decimal (text such as "1e309", or an infinite decimal). `min` and `max`
+    /// compare whole numbers exactly, past 2^53 too, where their decimals
+    /// can be equal; a `mean` of whole numbers is worked out from their exact sum, and said to be
+    /// rounded when it is a whole number a decimal can't hold.
+    pub fn apply(&self, ty: FieldType, values: &[&Value]) -> (Value, Lost) {
         let present = || values.iter().copied().filter(|v| !matches!(v, Value::Null));
         let numbers: Vec<f64> = present().filter_map(Value::as_f64).collect();
-        match self.rule {
+        // The numbers no decimal holds, which `numbers` leaves out.
+        let unread = present().filter(|v| is_number(v)).count().saturating_sub(numbers.len());
+        let mut lost = Lost::default();
+        let value = match self.rule {
             Rule::First => values.first().map(|v| (*v).clone()).unwrap_or(Value::Null),
             Rule::Last => values.last().map(|v| (*v).clone()).unwrap_or(Value::Null),
             Rule::Count => Value::Int(i64::try_from(present().count()).unwrap_or(i64::MAX)),
             Rule::Join => Value::Text(present().map(ToString::to_string).collect::<Vec<_>>().join(&self.delimiter)),
             Rule::Sum if ty == FieldType::Integer => {
-                // Whole numbers, however they are held (a whole decimal counts; 2.5 can't be one).
-                let whole = |v: &Value| match v {
-                    Value::Int(i) => Some(*i),
-                    // i64::MIN is exactly a float; i64::MAX rounds up to 2^63, which is out of range.
-                    v => v.as_f64().filter(|f| f.fract() == 0.0 && *f >= i64::MIN as f64 && *f < -(i64::MIN as f64)).map(|f| f as i64),
-                };
-                let ints: Vec<i64> = present().filter_map(whole).collect();
-                if ints.is_empty() {
-                    return Value::Null;
+                // A number that isn't a whole number within the 64-bit range can't be added to the
+                // field's sum: it is left out, and counted. Text that isn't a number is no value.
+                let numeric = || present().filter(|v| is_number(v));
+                let ints: Vec<i64> = numeric().filter_map(whole_number).collect();
+                lost.left_out = numeric().count().saturating_sub(ints.len());
+                // The exact total, checked once: a running total may pass the range and come back.
+                let total = ints.iter().try_fold(0i128, |s, i| s.checked_add(i128::from(*i)));
+                match total.map(i64::try_from) {
+                    _ if ints.is_empty() => Value::Null,
+                    Some(Ok(sum)) => Value::Int(sum),
+                    _ => {
+                        lost.overflowed = true;
+                        Value::Null
+                    }
                 }
-                ints.iter().try_fold(0i64, |s, i| s.checked_add(*i)).map(Value::Int).unwrap_or(Value::Null)
             }
-            Rule::Sum if numbers.is_empty() => Value::Null,
-            Rule::Sum => Value::Float(numbers.iter().sum()),
-            Rule::Mean if numbers.is_empty() => Value::Null,
-            Rule::Mean => Value::Float(numbers.iter().sum::<f64>() / numbers.len() as f64),
+            Rule::Sum | Rule::Mean if numbers.is_empty() => {
+                lost.left_out = unread;
+                Value::Null
+            }
+            Rule::Sum => {
+                lost.left_out = unread;
+                Value::Float(numbers.iter().sum())
+            }
+            Rule::Mean => {
+                lost.left_out = unread;
+                // An integer field's values, when every one is a whole number, are summed exactly:
+                // their decimals can't be, past 2^53. A decimal field's are decimals already.
+                // Only the numbers a decimal holds count, as in `numbers`: text that isn't a number
+                // is no value, and a number too large for a decimal is left out (counted above).
+                let wholes: Option<Vec<i64>> =
+                    (ty == FieldType::Integer).then(|| present().filter(|v| v.as_f64().is_some()).map(whole_number).collect()).flatten();
+                match wholes {
+                    Some(w) => {
+                        let (sum, n) = (w.iter().map(|i| i128::from(*i)).sum::<i128>(), w.len() as i128);
+                        // An evenly dividing mean is a whole number, rounded once to its decimal,
+                        // and said to be rounded when the decimal isn't it.
+                        let whole = sum % n == 0;
+                        let mean = if whole { (sum / n) as f64 } else { sum as f64 / n as f64 };
+                        lost.rounded = whole && mean as i128 != sum / n;
+                        Value::Float(mean)
+                    }
+                    None => Value::Float(numbers.iter().sum::<f64>() / numbers.len() as f64),
+                }
+            }
             Rule::Min | Rule::Max => {
-                // Numbers by value, text by its characters.
-                let cmp = |a: &Value, b: &Value| match (a.as_f64(), b.as_f64()) {
-                    (Some(x), Some(y)) if ty.is_numeric() => x.total_cmp(&y),
+                // Numbers by value, exactly, text by its characters.
+                let cmp = |a: &Value, b: &Value| match (number(a), number(b)) {
+                    (Some(x), Some(y)) if ty.is_numeric() => crate::stats::cmp_number(&x, &y),
                     _ => a.to_string().cmp(&b.to_string()),
                 };
+                // A number no decimal holds is left out, and counted, as by `mean`.
+                if ty.is_numeric() {
+                    lost.left_out = unread;
+                }
                 let candidates = present().filter(|v| !ty.is_numeric() || v.as_f64().is_some());
                 let best = if self.rule == Rule::Max {
                     // The first of equal values, as `min_by` keeps.
@@ -296,7 +404,54 @@ impl Merge {
                 };
                 best.cloned().unwrap_or(Value::Null)
             }
-        }
+        };
+        (value, lost)
+    }
+}
+
+/// What merging one target's matches with a rule lost, for Spatial Join's notices.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Lost {
+    /// An integer field's sum went past the 64-bit range, and is null.
+    pub overflowed: bool,
+    /// How many numbers the rule left out: for an integer field's sum, decimals with a fraction and
+    /// numbers past the 64-bit range, which no whole number of the field holds; for the other
+    /// numeric rules, numbers too large for a decimal.
+    pub left_out: usize,
+    /// A mean of whole numbers is a whole number past 2^53, which its decimal rounds.
+    pub rounded: bool,
+}
+
+/// A value as the whole number it holds exactly: an integer, true or false, a decimal with no
+/// fraction within the i64 range, or text written as one in any form a number is ("12", "12.0",
+/// "1.2e1"), read from its digits. A number past the i64 range isn't one.
+fn whole_number(v: &Value) -> Option<i64> {
+    // 2^63: i64::MIN is exactly a float; i64::MAX rounds up to 2^63, which is out of range.
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    match v {
+        Value::Int(i) => Some(*i),
+        Value::Text(t) => crate::stats::text_i64(t),
+        _ => v.as_f64().filter(|f| f.fract() == 0.0 && (-TWO_63..TWO_63).contains(f)).map(|f| f as i64),
+    }
+}
+
+/// Whether a value is a number: one a decimal holds, an infinite decimal, or text written as a
+/// number too large for any ("1e309"). Not a number (NaN), and text that isn't one, "inf" included,
+/// aren't.
+fn is_number(v: &Value) -> bool {
+    v.as_f64().is_some()
+        || matches!(v, Value::Float(f) if f.is_infinite())
+        || matches!(v, Value::Text(t) if t.bytes().any(|b| b.is_ascii_digit()) && t.trim().parse::<f64>().is_ok_and(f64::is_infinite))
+}
+
+/// A value as a number to compare exactly: a whole number as an integer (text written as one too,
+/// read from its digits), any other number as a decimal. None for a value that isn't a number.
+fn number(v: &Value) -> Option<Value> {
+    match v {
+        Value::Int(_) | Value::Float(_) => Some(v.clone()),
+        Value::Bool(b) => Some(Value::Int(i64::from(*b))),
+        Value::Text(t) => crate::stats::text_i64(t).map(Value::Int).or_else(|| v.as_f64().map(Value::Float)),
+        Value::Null | Value::Date(_) | Value::DateTime(_) => None,
     }
 }
 
@@ -328,12 +483,7 @@ pub fn parse_merge(join: &Dataset, v: Option<&Json>) -> Result<Vec<Merge>, Strin
             )
         })?;
         let ty = join.fields.get(field).map(|f| f.ty).unwrap_or(FieldType::Text);
-        let fits = match rule {
-            Rule::Sum | Rule::Mean => ty.is_numeric(),
-            Rule::Min | Rule::Max => ty.is_numeric() || ty == FieldType::Text,
-            _ => true,
-        };
-        if !fits {
+        if !rule.fits(ty) {
             let needs = if matches!(rule, Rule::Min | Rule::Max) { "a numeric or text field" } else { "a numeric field" };
             return Err(format!("merge rule '{rule_name}' needs {needs} ('{name}' is not)"));
         }
@@ -354,11 +504,12 @@ pub fn parse_merge(join: &Dataset, v: Option<&Json>) -> Result<Vec<Merge>, Strin
 mod tests {
     use super::*;
 
-    use rustgis_geom::haversine_m;
+    use rustgis_geom::{haversine_m, wgs84_length_m};
 
     /// The ground distance from `p` to a line, by sampling each edge finely along its great circle.
     /// Only the samples within 1.2% of the nearest on the sphere are measured on the ellipsoid,
     /// whose distances are within 0.6% of the sphere's.
+    #[expect(clippy::disallowed_methods, reason = "the test ranks samples on the sphere and measures the nearest on the ellipsoid")]
     fn brute(p: Coord, line: &[Coord]) -> f64 {
         let samples: Vec<(Coord, f64)> = line
             .windows(2)
@@ -370,6 +521,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "the test tells the ellipsoid's distance from the sphere's")]
     fn distances_are_on_the_wgs84_ellipsoid() {
         // 0.0904369° north of the equator is 10,000 m on WGS 84 (GeographicLib) but 10,056 m on the
         // mean sphere: within 10 km in the measure, and not ruled out before it (#888).
@@ -382,14 +534,111 @@ mod tests {
         assert!(search_box(&ea, 10_000.0).is_some_and(|e| e.max_y >= b.y));
     }
 
+    /// Spatial Join's Largest overlap ranks overlaps by their area or length on the WGS 84
+    /// ellipsoid, as the Measure tool measures them. A 1° square on the equator, listed first, and a
+    /// band at 60°N that the ellipsoid makes 0.5% larger but the sphere 0.5% smaller: the band
+    /// wins. Likewise for a line along a meridian through a 1° zone and a shorter one at 60°N.
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "the test sets the sphere's ranking against the ellipsoid's")]
+    fn largest_overlap_ranks_overlaps_on_the_ellipsoid() {
+        use crate::{Inputs, Output};
+        use rustgis_data::{Field, GeometryType};
+        use rustgis_geom::{geodesic_length_m, geodesic_ring_area_m2};
+        use std::collections::HashMap;
+        struct Layers(HashMap<String, Dataset>);
+        impl Inputs for Layers {
+            fn dataset(&self, layer: &str) -> Option<&Dataset> {
+                self.0.get(layer)
+            }
+            fn selection(&self, _: &str) -> &[usize] {
+                &[]
+            }
+        }
+        let ring = |x0: f64, x1: f64, y0: f64, y1: f64| {
+            vec![Coord::new(x0, y0), Coord::new(x1, y0), Coord::new(x1, y1), Coord::new(x0, y1), Coord::new(x0, y0)]
+        };
+        let zones = |band_top: f64| {
+            let mut ds = Dataset::new("zones", GeometryType::Polygon, vec![Field::new("zone", FieldType::Text)]);
+            for (name, r) in [("equator", ring(0.0, 1.0, 0.0, 1.0)), ("north", ring(0.0, 1.0, 60.0, band_top))] {
+                ds.push(Some(Geometry::Polygon(vec![vec![r]])), vec![Value::Text(name.into())]);
+            }
+            ds
+        };
+        let joined = |target: Dataset, zones: Dataset| {
+            let layers = Layers(HashMap::from([("t".to_string(), target), ("zones".to_string(), zones)]));
+            let r = crate::run("spatialJoin", &layers, &serde_json::json!({"target": "t", "join": "zones", "match": "Largest overlap"}));
+            let Ok(crate::ToolResult { output: Output::Layer(ds), .. }) = r else { panic!("a layer") };
+            ds.field_index("join_zone").map(|i| ds.value(0, i).clone())
+        };
+        let north = Some(Value::Text("north".into()));
+
+        let (square, band) = (ring(0.0, 1.0, 0.0, 1.0), ring(0.0, 1.0, 60.0, 62.054));
+        let area = |r: &Vec<Coord>| wgs84_ring_perimeter_area_m2(r).1;
+        assert!(area(&band) > area(&square) * 1.004 && geodesic_ring_area_m2(&band) < geodesic_ring_area_m2(&square) * 0.996);
+        let mut parcel = Dataset::new("t", GeometryType::Polygon, vec![]);
+        parcel.push(Some(Geometry::Polygon(vec![vec![ring(0.0, 1.0, -1.0, 63.0)]])), vec![]);
+        assert_eq!(joined(parcel, zones(62.054)), north);
+
+        let (near_equator, near_pole) = ([Coord::new(0.5, 0.0), Coord::new(0.5, 1.0)], [Coord::new(0.5, 60.0), Coord::new(0.5, 60.995)]);
+        assert!(wgs84_length_m(&near_pole) > wgs84_length_m(&near_equator) * 1.002);
+        assert!(geodesic_length_m(&near_pole) < geodesic_length_m(&near_equator) * 0.996);
+        let mut road = Dataset::new("t", GeometryType::Polyline, vec![]);
+        road.push(Some(Geometry::Line(vec![vec![Coord::new(0.5, -1.0), Coord::new(0.5, 63.0)]])), vec![]);
+        assert_eq!(joined(road, zones(60.995)), north);
+
+        // A dense road, its steps short enough to be measured without a solve: the same zone wins,
+        // and each overlap's length is within a millionth of the solve's.
+        let dense: Vec<Coord> = (0..=6_400).map(|i| Coord::new(0.5, -1.0 + f64::from(i) * 0.01)).collect();
+        for part in [&dense[100..=200], &dense[6_100..=6_199]] {
+            let exact = wgs84_length_m(part);
+            let stepped = length_m(&Geometry::Line(vec![part.to_vec()]));
+            assert!((stepped / exact - 1.0).abs() < 1e-6, "{stepped} m, {exact} m on the ellipsoid");
+        }
+        let mut road = Dataset::new("t", GeometryType::Polyline, vec![]);
+        road.push(Some(Geometry::Line(vec![dense])), vec![]);
+        assert_eq!(joined(road, zones(60.995)), north);
+    }
+
     #[test]
     fn an_integer_sum_takes_decimals_over_the_whole_i64_range() {
         let sum = Merge { field: 0, rule: Rule::Sum, delimiter: String::new() };
         let (min, past_max) = (Value::Float(i64::MIN as f64), Value::Float(9_223_372_036_854_775_808.0));
-        assert_eq!(sum.apply(FieldType::Integer, &[&min]), Value::Int(i64::MIN));
+        assert_eq!(sum.apply(FieldType::Integer, &[&min]).0, Value::Int(i64::MIN));
         // 2^63 is one past i64::MAX: not a whole number the field holds, so it's left out.
-        assert_eq!(sum.apply(FieldType::Integer, &[&past_max, &Value::Int(3)]), Value::Int(3));
-        assert_eq!(sum.apply(FieldType::Integer, &[&Value::Float(2.5)]), Value::Null);
+        assert_eq!(sum.apply(FieldType::Integer, &[&past_max, &Value::Int(3)]).0, Value::Int(3));
+        assert_eq!(sum.apply(FieldType::Integer, &[&Value::Float(2.5)]).0, Value::Null);
+        // What a sum leaves out is counted: 2^63 and 2.5, not text that isn't a number.
+        let skipped = sum.apply(FieldType::Integer, &[&past_max, &Value::Float(2.5), &Value::Text("n/a".into()), &Value::Int(3)]);
+        assert_eq!(skipped, (Value::Int(3), Lost { left_out: 2, ..Lost::default() }));
+        // Text written as a number too large for a decimal is a number left out too; "inf" isn't one.
+        let huge = [Value::Text("1e309".into()), Value::Text("-1E400".into()), Value::Text("inf".into()), Value::Int(3)];
+        let huge: Vec<&Value> = huge.iter().collect();
+        assert_eq!(sum.apply(FieldType::Integer, &huge), (Value::Int(3), Lost { left_out: 2, ..Lost::default() }));
+        // The other numeric rules leave out what no decimal holds, and count it.
+        let mean = Merge { field: 0, rule: Rule::Mean, delimiter: String::new() };
+        let left_out = |n| Lost { left_out: n, ..Lost::default() };
+        assert_eq!(mean.apply(FieldType::Integer, &huge), (Value::Float(3.0), left_out(2)));
+        assert_eq!(mean.apply(FieldType::Double, &huge), (Value::Float(3.0), left_out(2)));
+        assert_eq!(sum.apply(FieldType::Double, &huge), (Value::Float(3.0), left_out(2)));
+        assert_eq!(mean.apply(FieldType::Integer, &huge[..1]), (Value::Null, left_out(1)));
+        let infinite = Value::Float(f64::INFINITY);
+        // What is left out doesn't stop the exact mean of the rest: 2^53 + 1 twice is rounded.
+        let big = Value::Int((1 << 53) + 1);
+        let rounded = Lost { left_out: 1, rounded: true, ..Lost::default() };
+        assert_eq!(mean.apply(FieldType::Integer, &[&infinite, &big, &big]), (Value::Float(9_007_199_254_740_992.0), rounded));
+        assert_eq!(mean.apply(FieldType::Integer, &[&big, huge[0], &big]), (Value::Float(9_007_199_254_740_992.0), rounded));
+        assert_eq!(sum.apply(FieldType::Integer, &[&infinite, &Value::Float(f64::NAN), &Value::Int(3)]), (Value::Int(3), left_out(1)));
+        let max = Merge { field: 0, rule: Rule::Max, delimiter: String::new() };
+        let min = Merge { field: 0, rule: Rule::Min, delimiter: String::new() };
+        assert_eq!(max.apply(FieldType::Integer, &huge), (Value::Int(3), left_out(2)));
+        assert_eq!(min.apply(FieldType::Integer, &huge), (Value::Int(3), left_out(2)));
+        assert_eq!(max.apply(FieldType::Double, &[&Value::Int(3), &infinite]), (Value::Int(3), left_out(1)));
+        // A text field's min and max take every value, as text.
+        assert_eq!(max.apply(FieldType::Text, &huge), (Value::Text("inf".into()), Lost::default()));
+        // The total is checked once: i64::MAX + 1 - 1 is i64::MAX; i64::MAX + 1 isn't a sum.
+        let (max, one, minus) = (Value::Int(i64::MAX), Value::Int(1), Value::Int(-1));
+        assert_eq!(sum.apply(FieldType::Integer, &[&max, &one, &minus]), (max.clone(), Lost::default()));
+        assert_eq!(sum.apply(FieldType::Integer, &[&max, &one]), (Value::Null, Lost { overflowed: true, ..Lost::default() }));
     }
 
     #[test]

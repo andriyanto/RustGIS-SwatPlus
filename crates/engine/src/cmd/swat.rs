@@ -44,38 +44,38 @@ pub struct SwatState {
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("swat.open", "Open SWAT+ Project", WHERE, open).view().params(
+        C::new("swat.open", "Open SWAT+ Project", WHERE, open).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).view().params(
             r#"{"path": "a TxtInOut folder (with file.cio)", "confidential"?: bool (answers carry counts and statistics only, no record names or values; only the user can lift it)} — reads the project's input files"#,
         ),
-        C::new("swat.close", "Close SWAT+ Project", WHERE, close).view().when(need_swat).params("{} — closes the SWAT+ project (unsaved changes are lost)"),
-        C::new("swat.summary", "SWAT+ Project Summary", WHERE, summary)
+        C::new("swat.close", "Close SWAT+ Project", WHERE, close).roles(&[]).effects(crate::policy::Effects::NONE).view().when(need_swat).params("{} — closes the SWAT+ project (unsaved changes are lost)"),
+        C::new("swat.summary", "SWAT+ Project Summary", WHERE, summary).roles(&[]).effects(crate::policy::Effects::NONE)
             .view()
             .when(need_swat)
             .params("{} — the period simulated, the number of each kind of object, the files, and whether any are missing"),
-        C::new("swat.check", "Check SWAT+ Project", WHERE, check).view().when(need_swat).params(
+        C::new("swat.check", "Check SWAT+ Project", WHERE, check).roles(&[]).effects(crate::policy::Effects::NONE).view().when(need_swat).params(
             r#"{} — input files file.cio names that are missing, and parameter values outside cal_parms.cal's calibration ranges (not necessarily wrong)"#,
         ),
-        C::new("swat.find", "Find SWAT+ Parameter", WHERE, find).view().when(need_swat).params(
+        C::new("swat.find", "Find SWAT+ Parameter", WHERE, find).roles(&[]).effects(crate::policy::Effects::NONE).view().when(need_swat).params(
             r#"{"query": text (part of a column name, e.g. "cn", "esco", "awc"), "file"?: text (one file, e.g. "hydrology.hyd")} — the files and columns that match, with their records' count and range, and cal_parms.cal's range"#,
         ),
-        C::new("swat.get", "Read SWAT+ Parameter", WHERE, get).view().when(need_swat).params(
+        C::new("swat.get", "Read SWAT+ Parameter", WHERE, get).roles(&[]).effects(crate::policy::Effects::NONE).view().when(need_swat).params(
             r#"{"file": text, "column": text, "match"?: "record names, * and ? as wildcards", "where"?: {"column": text, "match": "values, * and ? as wildcards"}} — the values of a column (up to 500 records listed) and their statistics"#,
         ),
-        C::new("swat.set", "Change SWAT+ Parameter", WHERE, set).view().when(need_swat).params(
+        C::new("swat.set", "Change SWAT+ Parameter", WHERE, set).roles(&[]).effects(crate::policy::Effects::NONE).view().when(need_swat).params(
             r#"{"file": text, "column": text, "value": number or text, "mode"?: "replace" (default) | "add" | "multiply" (by 1 + value, as SWAT-CUP's r__), "match"?: record names with * and ?, "where"?: {"column": text, "match": text}, "force"?: bool (allow values outside cal_parms.cal's range)} — changes the matching records' values (in memory: swat.save writes them)"#,
         ),
-        C::new("swat.diff", "SWAT+ Changes", WHERE, diff)
+        C::new("swat.diff", "SWAT+ Changes", WHERE, diff).roles(&[]).effects(crate::policy::Effects::NONE)
             .view()
             .when(need_swat)
             .params(r#"{"file"?: text} — every value changed since the project was opened (or counts only, when confidential)"#),
-        C::new("swat.revert", "Revert SWAT+ Changes", WHERE, revert)
+        C::new("swat.revert", "Revert SWAT+ Changes", WHERE, revert).roles(&[]).effects(crate::policy::Effects::NONE)
             .view()
             .when(need_swat)
             .params(r#"{"file"?: text, "column"?: text} — undoes the changes (all, a file's, or a file's column)"#),
-        C::new("swat.save", "Save SWAT+ Project", WHERE, save).view().when(need_swat).params(
+        C::new("swat.save", "Save SWAT+ Project", WHERE, save).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).view().when(need_swat).params(
             r#"{"path"?: "a folder to save the whole project to (default: write the changed files over the folder it was opened from)"} — writes the files"#,
         ),
-        C::new("swat.confidential", "SWAT+ Confidential Mode", WHERE, confidential)
+        C::new("swat.confidential", "SWAT+ Confidential Mode", WHERE, confidential).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved))
             .view()
             .when(need_swat)
             .params(r#"{"on": bool} — answers with statistics only (on), or with record names and values (off; only the user can turn it off)"#),
@@ -619,7 +619,7 @@ fn confidential(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-#[allow(clippy::unwrap_used)]
+#[expect(clippy::unwrap_used, reason = "a test module gated on more than `test`, which clippy's allow-unwrap-in-tests does not see")]
 mod tests {
     use super::*;
 

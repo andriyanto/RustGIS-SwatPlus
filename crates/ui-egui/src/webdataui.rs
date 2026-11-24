@@ -76,7 +76,7 @@ fn listing(app: &mut RustGisApp, url: &str, kind: &'static str) -> Look {
     let state = &mut app.ui.web_services;
     let doc = state.docs.entry(url.to_string()).or_insert_with(|| {
         let caps = rustgis_engine::data::ogc::capabilities_url(url, Some(kind));
-        Doc::Waiting(crate::fetch_into(&caps))
+        Doc::Waiting(crate::fetch_document_into(&caps))
     });
     if let Doc::Waiting(slot) = doc {
         let landed = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -148,11 +148,28 @@ fn poll(app: &mut RustGisApp) {
                 if dated {
                     p["time"] = json!(date);
                 }
-                let r = app.run("service.add", p);
-                done(app, r.map(|v| v.get("name").and_then(Value::as_str).unwrap_or(&name).to_string()));
+                app.ui.web_services.note = None;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let _ = crate::readjob::run_then(app, "service.add", p, Some(service_added));
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let r = app.run("service.add", p);
+                    service_added(app, crate::Landed::Ran(r));
+                }
             }
         }
     }
+}
+
+/// Reports the command's actual completion, including a queued add that never ran.
+fn service_added(app: &mut RustGisApp, result: crate::Landed) {
+    let result = match result {
+        crate::Landed::Ran(result) => result,
+        crate::Landed::NotRun(why) => Err(why),
+    };
+    done(app, result.map(|v| text(&v, "name").to_string()));
 }
 
 /// Notes what an Add did.
@@ -270,7 +287,7 @@ pub fn nasa_earthdata(app: &mut RustGisApp, ui: &mut egui::Ui) {
         let mut follow = !app.ui.web_services.fixed;
         if ui
             .checkbox(&mut follow, tl!("Follow the time slider"))
-            .on_hover_text(tl!("Step through the days with the time slider (View › Time), which starts with the layer's"))
+            .on_hover_text(tl!("Step through the days with the time slider (View › Time), which starts with the layer's days"))
             .changed()
         {
             app.ui.web_services.fixed = !follow;
@@ -607,7 +624,10 @@ pub fn fema_nfhl(app: &mut RustGisApp, ui: &mut egui::Ui) {
                         .on_hover_text(tl!("Download its features in the view (up to the server's limit)"))
                         .clicked()
                 {
-                    features = f.pointer("/offer/url").and_then(Value::as_str).map(|u| (u.to_string(), format!("FEMA NFHL {title}")));
+                    features = f
+                        .pointer("/offer/url")
+                        .and_then(Value::as_str)
+                        .map(|u| (u.to_string(), format!("FEMA NFHL {title}"), f.get("bbox").cloned().unwrap_or_default()));
                 }
             });
         }
@@ -615,8 +635,9 @@ pub fn fema_nfhl(app: &mut RustGisApp, ui: &mut egui::Ui) {
     if let Some((layer, name)) = add {
         add_layer(app, FEMA_NFHL, "arcgis", &layer, &name);
     }
-    if let Some((url, name)) = features {
-        let r = app.run("ui.addUrl", json!({"url": url, "name": name, "service": true}));
+    if let Some((url, name, bounds)) = features {
+        // The layer's bounds go along, for its features' axes (#1053).
+        let r = app.run("ui.addUrl", json!({"url": url, "name": name, "service": true, "bounds": bounds}));
         // Not added yet: on its way.
         app.ui.web_services.note = Some(match r {
             Ok(_) => (true, tl!("Downloading…").to_string()),
@@ -766,4 +787,47 @@ pub fn fields_of_the_world(app: &mut RustGisApp, ui: &mut egui::Ui) {
         done(app, r);
     }
     status(app, ui, None);
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ogc_dataset_web_data_waits_for_add_completion() {
+        let url = "https://maps.example.org/MapServer";
+        let doc = json!({"mapName":"Fixture","layers":[]}).to_string();
+        for outcome in ["success", "failure", "cancel"] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            let listing = app.session.run("service.layers", &json!({"url":url,"type":"arcgis","text":doc})).unwrap();
+            assert_eq!(listing["layers"][0]["name"], "map");
+            app.ui.web_services.docs.insert(url.into(), Doc::Ready(Arc::new(doc.clone()), Arc::new(listing)));
+            app.reads_off_frame = true;
+            add_layer(&mut app, url, "arcgis", if outcome == "failure" { "absent" } else { "map" }, "Fixture");
+            assert!(crate::readjob::showing(&app));
+            assert!(app.session.map().tiles.is_empty());
+            assert!(
+                app.ui.web_services.note.as_ref().is_none_or(|(_, note)| !note.starts_with("Added")),
+                "an enqueued add is not a success"
+            );
+            if outcome == "cancel" {
+                app.reads.cancel_for_tests();
+            }
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while crate::readjob::land(&mut app) {
+                assert!(std::time::Instant::now() < until);
+                std::thread::sleep(std::time::Duration::from_millis(5)); // test-wait: legacy polling for dataset add completion
+            }
+            let (ok, note) = app.ui.web_services.note.as_ref().unwrap();
+            assert_eq!(*ok, outcome == "success", "{note}");
+            assert_eq!(app.session.map().tiles.len(), usize::from(*ok));
+            if *ok {
+                assert_eq!(note, "Added Fixture");
+            } else if outcome == "cancel" {
+                assert!(note.contains("cancelled"), "{note}");
+            } else {
+                assert!(note.contains("absent"), "{note}");
+            }
+        }
+    }
 }

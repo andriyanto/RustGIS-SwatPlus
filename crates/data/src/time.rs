@@ -2,6 +2,7 @@
 //! formatting. Instants are milliseconds since 1970-01-01 UTC (as `f64`, exact well beyond any
 //! date a map shows); everything is UTC.
 
+use crate::date::{civil_from_days, days_from_civil, days_in_month};
 use crate::value::Value;
 
 /// The years an instant may fall in: far past any data, small enough that day counts can't
@@ -128,14 +129,17 @@ pub enum Kind {
     EpochS,
     /// Whole years (`1958`).
     Year,
-    /// Text dates (`2015-03-01`, `2015-03-01T12:00:00Z`, `2015/3/1`).
+    /// Dates: values of date and date-time fields, and text dates (`2015-03-01`,
+    /// `2015-03-01T12:00:00Z`, `2015/3/1`).
     Text,
 }
 
 /// What kind of time a value is, if it reads as one: numbers from 1e11 are milliseconds since
-/// 1970 and from 1e8 seconds; whole numbers from 1000 to 9999 are years; text is a date.
+/// 1970 and from 1e8 seconds; whole numbers from 1000 to 9999 are years; text is a date, as are
+/// dates and date-times.
 pub fn kind_of(v: &Value) -> Option<Kind> {
     match v {
+        Value::Date(_) | Value::DateTime(_) => Some(Kind::Text),
         Value::Int(i) => number_kind(*i as f64),
         Value::Float(x) => number_kind(*x),
         Value::Text(s) => {
@@ -167,13 +171,17 @@ fn number_kind(x: f64) -> Option<Kind> {
     }
 }
 
-/// The instant a value names, read as `kind` (`None` for a value that isn't one).
+/// The instant a value names, read as `kind` (`None` for a value that isn't one). Dates and
+/// date-times name theirs whatever the kind, a time without a zone read as UTC.
 pub fn instant(v: &Value, kind: Kind) -> Option<f64> {
+    if let Some(us) = v.temporal_key() {
+        return Some(us as f64 / 1000.0);
+    }
     let x = match v {
         Value::Int(i) => Some(*i as f64),
         Value::Float(x) => Some(*x),
         Value::Text(s) => plain_number(s.trim()),
-        Value::Null | Value::Bool(_) => return None,
+        Value::Null | Value::Bool(_) | Value::Date(_) | Value::DateTime(_) => return None,
     };
     let t = match (kind, x) {
         // Epoch times only as the field's were recognised (1900 to 2100, at their scale): a stray
@@ -407,19 +415,6 @@ pub fn parse_input(v: &serde_json::Value) -> Option<f64> {
     (t.is_finite() && t.abs() <= Civil::date(MAX_YEAR, 1, 1).ms()).then_some(t)
 }
 
-fn leap(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-}
-
-fn days_in_month(y: i64, m: i64) -> i64 {
-    match m {
-        2 if leap(y) => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
-}
-
 /// A UTC calendar date and clock time.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Civil {
@@ -440,15 +435,7 @@ impl Civil {
         let t = t.clamp(-1e17, 1e17);
         let days = (t / DAY_MS).floor();
         let ms = t - days * DAY_MS;
-        let z = days as i64 + 719_468;
-        let era = z.div_euclid(146_097);
-        let doe = z - era * 146_097;
-        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let day = doy - (153 * mp + 2) / 5 + 1;
-        let month = if mp < 10 { mp + 3 } else { mp - 9 };
-        let year = yoe + era * 400 + i64::from(month <= 2);
+        let (year, month, day) = civil_from_days(days as i64);
         let secs = ms / 1000.0;
         let hour = (secs / 3600.0).floor() as i64;
         let minute = ((secs - hour as f64 * 3600.0) / 60.0).floor() as i64;
@@ -456,13 +443,7 @@ impl Civil {
     }
 
     fn ms(&self) -> f64 {
-        let y = if self.month <= 2 { self.year - 1 } else { self.year };
-        let era = y.div_euclid(400);
-        let yoe = y - era * 400;
-        let mp = (self.month + 9) % 12;
-        let doy = (153 * mp + 2) / 5 + self.day - 1;
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        let days = era * 146_097 + doe - 719_468;
+        let days = days_from_civil(self.year, self.month, self.day);
         days as f64 * DAY_MS + (self.hour * 3600 + self.minute * 60) as f64 * 1000.0 + self.second * 1000.0
     }
 }
@@ -538,6 +519,15 @@ mod tests {
     }
 
     #[test]
+    fn date_fields_are_dates() {
+        let vals =
+            [Value::parse("2015-03-01", crate::FieldType::Date), Value::parse("2015-03-01T12:00:00+02:00", crate::FieldType::DateTime)];
+        assert_eq!(detect(vals.iter(), 500), Some((Kind::Text, 1.0)));
+        assert_eq!(instant(&vals[0], Kind::Year), Some(d("2015-03-01")));
+        assert_eq!(instant(&vals[1], Kind::Text), Some(d("2015-03-01T10:00:00Z")));
+    }
+
+    #[test]
     fn steps_by_the_calendar() {
         assert_eq!(add(d("2015-01-31"), Unit::Month, 1), d("2015-02-28"));
         assert_eq!(add(d("2016-02-29"), Unit::Year, 1), d("2017-02-28"));
@@ -550,7 +540,9 @@ mod tests {
         assert_eq!(steps(d("2015-01-01"), d("2015-12-31"), Unit::Month, 3, 1000).len(), 4);
         assert_eq!(steps(0.0, 1e15, Unit::Hour, 1, 50).len(), 50);
         assert!(steps(f64::NAN, 1.0, Unit::Day, 1, 50).is_empty());
-        assert_eq!(add(f64::MAX, Unit::Year, i64::MAX), add(f64::MAX, Unit::Year, i64::MAX));
+        // A step that overflows the calendar stops at its last year instead of wrapping.
+        assert_eq!(Civil::of(add(f64::MAX, Unit::Year, i64::MAX)).year, MAX_YEAR);
+        assert_eq!(Civil::of(add(0.0, Unit::Year, i64::MIN)).year, -MAX_YEAR);
         assert_eq!(Unit::for_span(365.0 * DAY_MS), Unit::Month);
         assert_eq!(Unit::from_code("Months"), Some(Unit::Month));
         assert_eq!(Unit::from_code("dayss"), None);

@@ -1,247 +1,305 @@
 # Roadmap
 
-_Last reviewed: 2026-10-24 (v0.4.0). Reviewed weekly; if this date is old, trust the linked issues
-over this page._
+_Last reviewed: 2026-11-22 (v0.8.0). Reviewed at each release; if this date is old, trust the
+linked issues over this page._
 
-This page says where RustGIS is heading and where help is most useful. Details live in the linked
-issues. RustGIS and GeoLibre complement each other
-([#951](https://github.com/opengeos/RustGIS/discussions/951)): GeoLibre is web and mobile first,
-RustGIS desktop first and built for automation and AI agents.
-[GEOLIBRE_PARITY.md](GEOLIBRE_PARITY.md) compares the two feature by feature as a reference, not a
-plan: not every GeoLibre feature suits RustGIS.
+This page lists the work planned for RustGIS and where help is most useful; details of each item
+live in its linked issue. Gaps nobody has planned are listed in the
+[GeoLibre parity checklist](docs/geolibre-parity.md) without a theme.
 
 ## Goals
 - **What exists works.** A feature that crashes, misreads data or is undocumented costs more
-  than a missing one. Robustness and correct coordinates come before breadth.
+  than a missing one. Robustness and correct coordinates come before breadth, and a result that
+  loses or approximates data says so ([AGENTS.md](AGENTS.md): Never crash, Never silent).
 - **Finish the everyday workflow first.** Add data, style it, edit it, analyse it, print or share
   it: depth in these beats a long list of first versions.
 - **Foundations before features.** Build the shared piece once (an expression engine, a secret
   store, Z coordinates) and let several features stand on it.
+- **Work you saved keeps working.** A project, model, script or plugin made with one release opens
+  in the next; a file from a newer release is refused or kept unchanged, never saved again with
+  parts missing ([saved files](docs/maintaining.md#saved-files-and-settings)).
 - **Free and self-contained.** Pure Rust with nothing else to install; GDAL and DuckDB are
   optional extras that add formats, not requirements.
 - **One program everywhere.** Desktop, browser, CLI, Python and AI agents share the same commands;
-  nothing below `apps/` breaks the WebAssembly build.
+  nothing below `apps/` breaks the WebAssembly build. On the desktop, long work never holds the
+  window ([#1562](https://github.com/opengeos/RustGIS/issues/1562)).
 
-## Contributing
-Most items below have no issue yet: propose one and open a pull request. See
-[CONTRIBUTING.md](CONTRIBUTING.md) for which items to pick freely, which to coordinate first, and
-how to write a proposal. Themes under Next are not releases and not in order; where an item
-needs another first, it says so.
+## How to use this page
+Themes are not releases and not in order; where an item needs another first, it says so. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for how to propose work, and
+[docs/maintaining.md](docs/maintaining.md) for who approves what. Items carry one of three
+markers, or none:
+- _(open)_: self-contained; open a pull request directly.
+- _Coordinate first_: propose on the linked issue and wait for a maintainer's reply before writing
+  much code.
+- _Decide first_: the project hasn't settled the design, and the decision is one
+  [docs/maintaining.md](docs/maintaining.md#who-approves-a-coordinate-first-change) reserves for
+  the project lead (core types, how a project stores its data, the plugin ABI). Join in
+  where it is linked (an issue or a discussion); don't start code until the decision is recorded
+  there.
+
+An item marked _Coordinate first_ or _Decide first_ links the issue or discussion where it is
+decided, or says an issue is needed; opening that issue is the first step. A theme's tracking issue
+holds its details and progress; this page keeps one line per item. A pull request that lands an item
+removes it from this page, or narrows it to what is left, in the same change.
+
+Before proposing something, check that RustGIS doesn't already do it: the
+[README's feature table](README.md#features), the [user guide](docs/user-guide/index.md), and the
+live lists of commands and geoprocessing tools (`rustgis-cli commands`, `rustgis-cli tools`; over
+MCP, `search_commands` and `search_tools`).
+
+The [GeoLibre parity checklist](docs/geolibre-parity.md) compares RustGIS with GeoLibre feature by feature: a
+source of ideas, not a plan ([#951](https://github.com/opengeos/RustGIS/discussions/951)). Issues
+labelled [good first issue](https://github.com/opengeos/RustGIS/labels/good%20first%20issue) are a
+place to start.
 
 ## Underway
-An item is underway when it has an open pull request, or someone said on its issue in the last
-week that they are working on it. Check here and the
-[open pull requests](https://github.com/opengeos/RustGIS/pulls) before starting; to take an item,
-comment on its issue or pull request and open a draft pull request early.
+An item is underway when it has an open pull request, or someone said on its issue or discussion
+in the last week that they are working on it. The
+[open pull requests](https://github.com/opengeos/RustGIS/pulls) are the live list; check them, and
+the item's issue, before starting. To take an item, comment on its
+issue if it has one, and open a draft pull request early. Design work without a pull request yet:
+- How a project stores its data: a prototype (posted 2026-11-09) and the first steps
+  ([discussion #1378](https://github.com/opengeos/RustGIS/discussions/1378),
+  [poll #1660](https://github.com/opengeos/RustGIS/discussions/1660)).
+
+## Foundations
+The shared pieces the everyday workflow stands on.
+
+### Correct results
+A result is right, or RustGIS says what it lost or assumed
+([AGENTS.md](AGENTS.md#never-silent)).
+- Known silent losses: DXF polyface faces with missing vertices and unreadable supplied Z outside 3D POLYLINE vertices; and the text
+  reader loss listed as `Silent` in `crates/engine/tests/integration/never_silent_reading.rs`:
+  attribute fields/values in XLSB short-cell workbooks (the original SheetJS 0.18.5 clean
+  workbook retains its point but no attributes, without a notice). A fix makes
+  its case `Said` or `Imported` _(open)_.
+- Lossy sample files in `never_silent_reading.rs` for the readers it doesn't cover yet:
+  remaining distinct loss families and parser paths (see the finite
+  [coverage inventory](crates/engine/testdata/reading-losses/README.md#coverage-boundaries)). It covers GeoJSON, TopoJSON, CSV,
+  KML, KMZ, GPX, GML, GeoRSS,
+  DXF, LandXML and MapInfo, with height-loss cases for CityJSON, CityGML, GeoPackage,
+  FlatGeobuf, GeoParquet and FileGDB, Z/M-loss and non-UTF-8 text cases for Shapefile, and
+  ring-loss cases for OSM PBF, separate Z- and M-loss cases for feature-service PBF, and WKT
+  height/member losses for XLSX, ODS, XLS and XLSB, and
+  error-cell losses for XLSX and invalid-date losses for standalone DBF; other loss kinds remain.
+  XLSM shares the XLSX parser; macros are untested.
+  Exports are checked by `never_silent_roundtrip.rs` _(open)_.
+- The remaining loss notices classified by code (the engine carries codes through reader and
+  tool results today), so `rustgis-cli run --strict`, Python's warnings and MCP's `losses` see
+  them ([#2371](https://github.com/opengeos/RustGIS/issues/2371)).
+- NTv2 grid shifts named in a file's own definition (a WKT or PROJ string that binds NAD27 to
+  WGS 84 through a `.gsb` grid), which are said but not applied today (the grids PROJ's
+  operations use are applied when present and downloaded on request). _Coordinate first_ (needs
+  an issue).
+- Data without a coordinate system: one written rule per format (assumed with a notice, or
+  refused), tested. Custom coordinate systems saved by name
+  ([#1702](https://github.com/opengeos/RustGIS/issues/1702)).
+- A Known Limitations page that collects every limit in one place: memory budget, feature
+  counts, sampled drawing, what the browser refuses, missing datum grids _(open)_.
+
+### Projects, saved files and the data model
+Projects that open whatever their size, saved work that keeps working from release to release
+([#1405](https://github.com/opengeos/RustGIS/issues/1405),
+[discussion #1378](https://github.com/opengeos/RustGIS/discussions/1378)), and the core types
+features build on.
+- No map, layer, layout or presentation file saved that RustGIS couldn't reopen (projects
+  already are refused, [#1364](https://github.com/opengeos/RustGIS/pull/1364)); packages
+  (`.rgispkg`) that hold everything or say what stayed linked; projects written to disk as they
+  save, not built in memory first.
+- A compressed encoding of today's project JSON, read one release before it is written.
+  _Coordinate first_: an issue is needed.
+- A system for the data a project refers to: named connections, copies that remember their
+  source, missing and changed states, a place for results
+  ([#1653](https://github.com/opengeos/RustGIS/issues/1653)). _Coordinate first._
+- What a project holds by default, its own data or links to it
+  ([poll #1660](https://github.com/opengeos/RustGIS/discussions/1660)), and storage that opens a
+  large project without reading it whole. _Decide first._
+- Time zones for dates (the date types, files and database providers are in;
+  [#853](https://github.com/opengeos/RustGIS/issues/853) has the plan): a time without a zone
+  stays as written; where an instant is needed, an assumed zone is saved in the project, never
+  written into the data. Then recovering a project with an invalid date.
+- Z coordinates kept from the data and written back, Phase 1 of
+  [#726](https://github.com/opengeos/RustGIS/issues/726). _Decide first_ (it changes `Coord`).
+- Persistent attribute joins and virtual fields. _Decide first_ (they change `Feature`; needs an
+  issue).
+
+### Large data and speed
+Big layers work, or say plainly where they stop
+([#1111](https://github.com/opengeos/RustGIS/issues/1111),
+[#1227](https://github.com/opengeos/RustGIS/issues/1227)).
+- An adjustable memory budget, and the feature cap (2 million on the desktop, 500,000 in the
+  browser) lifted for the sources that still have it: everything but local or uploaded GeoPackage,
+  FlatGeobuf, GeoParquet and Shapefiles read in place, which are read a chunk at a time
+  (`visits_chunks`). Remote FlatGeobuf and GeoParquet still stop at the cap when read whole.
+- Shapefile, KML, KMZ and GPX exported a chunk at a time, as the other formats are.
+- Faster drawing: layers read in place read and projected once per draw, filtered by extent
+  ([#1065](https://github.com/opengeos/RustGIS/issues/1065)) (only the changed layer redrawn
+  and a heavy layer drawn on several cores are done).
+- Long work off the UI thread: what [#1562](https://github.com/opengeos/RustGIS/issues/1562)
+  leaves open, such as a warning in debug builds when the UI thread is held too long.
+
+### Platform, docs and security
+- Signed Windows builds (no SmartScreen warning), then a signature check, by publisher name, in
+  Check for Updates' Download and Install; in-place updates for the macOS app; settings an
+  administrator can fix for a managed install (no AI Assistant, plugins or web services).
+- Autosave and crash recovery in the browser, as the desktop app has since
+  [#873](https://github.com/opengeos/RustGIS/issues/873) (`apps/rustgis-web/src/web.rs`; the
+  browser half needs an issue of its own).
+- A plugin `secrets` permission backed by the OS keychain and bound to one origin
+  ([#760](https://github.com/opengeos/RustGIS/issues/760)); testing the secret store on each platform
+  ([#891](https://github.com/opengeos/RustGIS/issues/891)).
+- Waiting on upstream releases: Control-click menus on macOS
+  ([#707](https://github.com/opengeos/RustGIS/issues/707)) and asking to save on ⌘Q
+  ([#966](https://github.com/opengeos/RustGIS/issues/966)), both on winit; FlatGeobuf export in
+  the web app, on a `flatgeobuf` crate release
+  ([#1111](https://github.com/opengeos/RustGIS/issues/1111)).
+- Docs: a pass over the user guide and the comparison pages against the app today, and short task
+  tutorials for newcomers: buffer, select and export a list; edit a layer and save the result; a
+  print layout _(open)_.
+
+### Plugins
+What plugin authors have asked for. An addition that plugins declare through
+`minRustgisVersion` needs two maintainers ([docs/maintaining.md](docs/maintaining.md)).
+- Panels: a text box ([#1260](https://github.com/opengeos/RustGIS/issues/1260)).
+- Host requests: a file or folder chosen by the user in a panel (a process plugin's file
+  parameter hands it a path today; [#1438](https://github.com/opengeos/RustGIS/issues/1438)); for
+  session plugins,
+  symbology and raster tile requests and a view in a page layout (asked on
+  [#1518](https://github.com/opengeos/RustGIS/issues/1518), which session plugins closed).
+- The WebAssembly plugin memory limit raised or made configurable
+  ([#1357](https://github.com/opengeos/RustGIS/issues/1357)); commands that declare what they
+  reach, instead of special cases by id ([#1316](https://github.com/opengeos/RustGIS/issues/1316)).
+- An older RustGIS offered the newest plugin release it can run (one that needs a newer RustGIS
+  is marked today; [#1405](https://github.com/opengeos/RustGIS/issues/1405) item 6).
+  _Coordinate first_ (registry feed).
+
+## The everyday workflow
+In the order of the work: add data, style it, edit it, analyse it, lay it out and share it.
+
+### Add data
+- Georeferencer: side-by-side window, transform picker, more formats
+  ([#609](https://github.com/opengeos/RustGIS/issues/609)).
+- ArcGIS: browsing a signed-in portal's own content (Hub search, sign-in and adding by address
+  work today); Esri JSON for layers that offer neither protocol buffers nor GeoJSON (older
+  servers; GeoJSON is asked for whenever `supportedQueryFormats` lacks PBF, in
+  `crates/data/src/ogc.rs`); large feature layers read live, a view at a time, from
+  `service.add` and saved in the project (the source that reads them is in;
+  [#829](https://github.com/opengeos/RustGIS/issues/829)).
+- Coded-value domains and subtypes read from File Geodatabases (their codes show raw today).
+- Layer metadata, exported as STAC items.
+- GeoLibre opening RustGIS `.rgis` projects, once the project format settles.
+- Other worlds: higher-resolution planetary basemaps read directly
+  ([#1447](https://github.com/opengeos/RustGIS/issues/1447)), the USGS planetary WMS layers drawn
+  ([#1446](https://github.com/opengeos/RustGIS/issues/1446)), highlights and landing sites
+  ([#1449](https://github.com/opengeos/RustGIS/issues/1449)); IAU coordinate systems beyond the
+  first step ([#1448](https://github.com/opengeos/RustGIS/issues/1448)). _Decide first_ for
+  #1448 (what dataset coordinates mean).
+
+### Style and map
+On top of the expression language:
+- Dates in expressions: date functions and arithmetic, once the date types land
+  ([#853](https://github.com/opengeos/RustGIS/issues/853)).
+- Expression labels: case, priority and number formats (text, size, colour and angle are done).
+- Rule-based renderer: ordered rules with an expression, symbol and scale range, edited as such
+  (QGIS's rules import as Unique Values by expression).
+- Quick filters in the attribute table; pop-up templates: chosen fields, a title and date formats
+  (links and pictures are done).
+
+And alongside it:
+- Label placement: candidate positions, conflicts, obstacles and fitting
+  ([#995](https://github.com/opengeos/RustGIS/issues/995)); line labels that try other places
+  along the line (an offset above or below it is done) ([#1187](https://github.com/opengeos/RustGIS/issues/1187)).
+- Kernel density (heat map) as a renderer; point clustering.
+- SVG markers (PNG and JPEG pictures are done,
+  [#2266](https://github.com/opengeos/RustGIS/issues/2266)), image fill patterns and a symbol
+  library.
+- A legend and colour bar on the map (layouts have both).
+- Extend QGIS QML style import beyond the supported renderers
+  ([#882](https://github.com/opengeos/RustGIS/issues/882)); add SLD styles.
+- A histogram for raster stretches; editable raster class labels (labels from a colour table or
+  `.aux.xml` attribute table are read; [#889](https://github.com/opengeos/RustGIS/issues/889)).
+- What [#1042](https://github.com/opengeos/RustGIS/issues/1042) leaves open of UTM and MGRS
+  grids: MGRS square labels in layout frames north of 84° N or south of 80° S, where MGRS uses UPS
+  (measured and UTM zone graticules, MGRS labels elsewhere and UPS readouts are done) _(open)_;
+  more than two synced maps side by side _(open)_; auto-refresh for web service layers _(open)_.
 - GPU map: vector tiles and labels on the GPU tile layer
   ([#635](https://github.com/opengeos/RustGIS/issues/635),
   [#596](https://github.com/opengeos/RustGIS/issues/596)).
-- Georeferencer: side-by-side window, transform picker, more formats
-  ([#609](https://github.com/opengeos/RustGIS/issues/609)).
 
-- Rebindable keyboard shortcuts ([#562](https://github.com/opengeos/RustGIS/issues/562)).
-
-## Next
-
-### Fixes and quick wins
-The bugs users hit, the docs and a few quick wins: good first pull requests.
-- Robustness: Control-click menus on macOS
-  ([#707](https://github.com/opengeos/RustGIS/issues/707)), Load Off-Map Data
-  ([#661](https://github.com/opengeos/RustGIS/issues/661)).
-- A pass over the user guide, the comparison pages and the README against what the app does
-  today (no page says layout PDFs are pictures of each page), and short
-  task tutorials for newcomers: buffer, select and export a list; edit a layer and save the
-  result; a print layout _(open)_.
-
-### Solid ground
-Correct, robust and recoverable, with the foundations other themes stand on.
-- Correct coordinates: grid datum shifts (NTv2 and GeoTIFF grids) for NAD27, NAD83(HARN),
-  GDA94↔GDA2020 and OSGB36, and a notice whenever a layer is read without its shift; GDA94
-  ([#730](https://github.com/opengeos/RustGIS/issues/730)) is one case. _Coordinate first._
-- Reloading files changed on disk.
-- Autosave and crash recovery in the browser: reopen unsaved work after a crash. The desktop app
-  has them ([#873](https://github.com/opengeos/RustGIS/issues/873)).
-- Signed Windows builds (no SmartScreen warning), then in-place updates; settings an
-  administrator can fix for a managed install (no AI Assistant, plugins or web services).
-- Extend the OS keychain secret store to service connections (database passwords, S3 keys,
-  AI provider keys and the ChatGPT sign-in's tokens are already kept there).
-- Spatial Join by distance, closest, centre in and largest overlap, with merge rules (sum, mean,
-  first…) for one-to-one joins ([#851](https://github.com/opengeos/RustGIS/issues/851)).
-- Vector tools, each writing a new layer: join field (a one-off attribute join), points along lines, check and fix geometry _(open)_; summary fields
-  (sum, mean, first…) on Dissolve and Summarize Within _(open)_.
-- Batch runs: one tool over many layers or a folder of files.
-
-### Expressions and cartography
-One expression engine, a superset of today's SQL where clause so existing definition queries,
-label-class queries and display filters keep working. It replaces the three parsers of today
-(where clauses, Calculate Field, attribute rules) and serves Calculate Field, attribute rules,
-labels, definition queries, display filters, pop-ups and symbol properties. On top of it:
-- Calculate Field with functions, not only `field op value`.
-- Expression labels, with offset, rotation, wrapping, case, priority, number formats and halo
-  colour/width.
-- Data-defined symbol size, colour and rotation.
-- Rule-based renderer: ordered rules with an expression, symbol and scale range.
-- Quick filters in the attribute table; pop-up templates (chosen fields, formats for dates, links
-  and images, a title).
-
-And alongside it:
-- Kernel density (heat map) as a tool and as a renderer; point clustering.
-- SVG and PNG markers, fill patterns and a symbol library.
-- A legend and colour bar on the map. In layouts, legend entries reordered, renamed and set in
-  columns; several values grouped into one unique-value class.
-- Layouts and reports exported as vector PDF, with text and map frames as vectors (each page is
-  one picture today).
-- Map series at a fixed scale, with the current feature highlighted and its attributes in the
-  page's text.
-- Extend QGIS QML style import beyond the supported renderers; add SLD styles.
-- A histogram for raster stretches; raster attribute tables.
-
-### Data at the source
-- GeoLibre opening RustGIS `.rgis` projects, once RustGIS's project format and supported
-  data types settle. RustGIS imports GeoLibre projects; combined colour and size rendering
-  is tracked in [#1017](https://github.com/opengeos/RustGIS/issues/1017).
-- A date and date-time field type, read and written as dates (they are text today)
-  ([#853](https://github.com/opengeos/RustGIS/issues/853)). _Coordinate first_ (it changes
-  `FieldType`).
-- Editable standalone tables (they are read-only today).
-- Export into an existing GeoPackage as an added or replaced table, leaving its other tables
-  ([#852](https://github.com/opengeos/RustGIS/issues/852); export refuses an existing file today).
-- Polygon editing: cut a polygon, reshape and trace _(open)_; then shared edges, where moving one
-  boundary moves its neighbour's too. Coincident polygon vertices can already move together
-  with Shared Vertices (`edit.moveSharedVertex`); different vertex densities and linked
-  insertion/deletion remain open.
+### Edit
+- Selecting and deleting rows of a standalone table (its cells, rows and fields are editable).
+- Shared edges, so that moving one polygon boundary moves its neighbour's too
+  ([#872](https://github.com/opengeos/RustGIS/issues/872)). Coincident vertices already move
+  together (`edit.moveSharedVertex`, with Shared Vertices on); boundaries with different vertex
+  densities still separate, and linked insertion and deletion remain open.
+- Traverse closure for `edit.traverse`: a misclosure report, an optional compass-rule adjustment,
+  curve legs and a form.
 - Editor tracking fields (created/edited by and at).
-- Attribute table columns: rename, hide and reorder _(open)_.
-- Persistent attribute joins and virtual fields. _Coordinate first_ (they change `Feature`).
+- Attribute table columns: rename (hide and reorder are done) _(open)_.
 - Attribute forms: widgets, constraints and conditional visibility, on top of domains and
   subtypes.
-- Coded-value domains and subtypes read from File Geodatabases (their codes show raw today).
-- Layer metadata, exported as STAC items.
-- ArcGIS sign-in (OAuth) and a Portal browser, once the secret store (Solid ground) exists; Esri
-  JSON for services that don't offer GeoJSON.
 
-### Analysis
-- Routing: isochrones, service areas and an origin–destination matrix (today shortest path over
-  a line layer).
+### Analyse
+Before adding a tool, check whether the GeoLibre suite already has it (`gp.tools`); a built-in
+version must justify itself: no runner download, the selection honoured, geodesic distances and
+attributes kept.
+- Network analysis over a line layer (#2344). Built in today: shortest path, Service Area (lines)
+  and OD Cost Matrix, and online Directions. Still to come: one-way travel and travel time,
+  closest facility, service-area polygons and isochrones (also from a point on the map, through its
+  right-click menu), barriers and turns; location-allocation and vehicle routing as a guided
+  workflow over the GeoLibre suite's network tools, once their results are checked against known
+  answers. Follow the [ribbon guidelines](docs/contributing.md#ribbon-guidelines) for where it
+  goes.
 - Hot-spot statistics (Getis-Ord Gi\*), and emerging hot spots on the time slider.
+- Kriging with a fitted variogram and leave-one-out cross-validation (the variogram is a default
+  estimated from the points and extent today, not fitted; `kriging.rs`).
 - Charts linked to the selection: histogram, scatter, bar and box plots of a layer's fields.
-- Tabulate intersection: one layer's counts and totals shared out to another by area overlap.
-- Reverse geocoding, and the US Census geocoder beside Nominatim and Photon; a DEM downloader so
+- ISEA3H (DGGAL) and DGGRID grids, next to Generate Tessellation's H3, S2, A5 and hexagons _(open)_.
+- Reverse geocoding; a DEM downloader so
   viewshed works without a loaded elevation raster _(open)_.
+- Reference results for zonal statistics and the terrain tools, beside the existing analysis
+  reference cases _(open)_.
 
-### 3D scenes, first steps
-- Phases 1–2 of [#726](https://github.com/opengeos/RustGIS/issues/726): Z coordinates kept from
-  the data and written back; a scene with a free camera and each layer's elevation mode (on the
-  ground, relative, absolute).
+### Lay out and share
+- Layout legends: entries reordered and renamed, several values grouped into one unique-value
+  class (a label per layer and a classified raster's classes are done).
+- Map series at a fixed scale, and the current feature's attributes in the page's text (the
+  page's feature, name and number drive styles through expressions today).
+
+### 3D scenes
+- A scene with a free camera and each layer's elevation mode (on the ground, relative, absolute),
+  Phase 2 of [#726](https://github.com/opengeos/RustGIS/issues/726), after the Z design above.
 - LiDAR point layers (LAS/LAZ/COPC, read today as points) drawn at their heights in the scene.
+- Terrain from several layers ([#1310](https://github.com/opengeos/RustGIS/issues/1310)).
 - 3D objects and 3D Tiles follow.
-
-### Self-contained, any time _(open)_
-Built in means no runner download, the selection honoured, geodesic distances and attributes
-kept. Before adding a tool, check whether the GeoLibre suite already has it (`gp.tools`); a
-built-in version must justify itself on one of those.
-- SVG layout export with map frames and surrounds as vectors (they are pictures in it today); STL
-  export; copy a layout to the clipboard.
-- UTM and MGRS grids and coordinate readouts.
-- H3 grids built in, next to the A5 grids (the GeoLibre suite has H3 tools only when its runner
-  is installed).
-- An on-map right-click menu: copy the coordinate, run a buffer or viewshed from the point.
-- More than two synced maps side by side.
-- Auto-refresh for web service layers.
-- A catalog of data cubes for the time slider
-  ([#683](https://github.com/opengeos/RustGIS/issues/683)).
 
 ## Exploratory
 Open questions rather than plans; discuss before building.
-- Layers kept in their own coordinate system rather than WGS 84.
-- Integrating [opengeos/terrio](https://github.com/opengeos/terrio), the pure-Rust raster, vector
-  and point cloud I/O library: which of its drivers, coordinate transformations and GDAL-style
+- Tools on layers bigger than memory: stream them, or cut the memory each feature takes
+  ([#1111](https://github.com/opengeos/RustGIS/issues/1111)).
+- Long work in the browser on Web Workers or WebAssembly threads (the desktop rule of
+  [#1562](https://github.com/opengeos/RustGIS/issues/1562) leaves the browser out).
+- Integrating more of [opengeos/terrio](https://github.com/opengeos/terrio), the pure-Rust raster,
+  vector and point cloud I/O library (coordinate systems, transformations, datum grids and ellipsoids
+  already come from its `terrio-crs`): which of its drivers and GDAL-style
   operations could back or replace RustGIS's own readers, or stand in for the GDAL program, and
-  which of them build for the web app.
+  which of them build for the web app ([#663](https://github.com/opengeos/RustGIS/issues/663)).
 - Native NetCDF-4/HDF5 without GDAL ([#396](https://github.com/opengeos/RustGIS/issues/396)),
   kerchunk and Icechunk.
 - Broader QGIS project compatibility and opening ArcGIS Pro projects (supported QGIS projects
   already open as maps).
-- An in-app Python console; an R package.
+- An in-app Python console, and notebooks whose Python cells run beside the map (`.ipynb` files
+  open and save today, but their Python cells don't run;
+  [#1056](https://github.com/opengeos/RustGIS/issues/1056)); an R package.
+- Mesh layers for model results ([#1166](https://github.com/opengeos/RustGIS/issues/1166)).
+- A server that GeoLibre and RustGIS can both use, once RustGIS is stable
+  ([#951](https://github.com/opengeos/RustGIS/discussions/951)).
 
-## Done
-- Save edits back to existing GeoPackage and PostGIS tables on desktop, with atomic saves,
-  conflict detection and discard/reload ([#1041](https://github.com/opengeos/RustGIS/issues/1041)).
-- Projects that survive a move: local data paths relative to the project and undoable Repair
-  Data Source for layers and tile archives ([#879](https://github.com/opengeos/RustGIS/issues/879)).
-- Layered workspace, command registry with undo, project files (`.rgis`), `rustgis-cli`, the
-  web app (WebAssembly, installable with offline start, opened with a project or data by its
-  web address, self-hostable with the `Dockerfile`), 18 interface languages; a ribbon laid out in
-  the order of the work (Home, Data, Style, Edit, Analyze, View, Publish), start-up preferences,
-  Check for Updates, autosave and crash recovery in the desktop app.
-- Data: files by their web address; GeoJSON, CSV/TSV (x/y in any EPSG system, or WKT), Excel
-  and OpenDocument spreadsheets, GeoRSS, LandXML, encoded polylines, Shapefile (zipped too,
-  with the coordinate system in its `.prj`), GeoPackage, GeoParquet, FlatGeobuf, KML/KMZ
-  (styles included), GPX, GML, MapInfo MIF, OSM PBF, TopoJSON, DXF and LiDAR (LAS/LAZ/COPC) in,
-  all of them in the web app too (large files read in place, a view at a time); Esri File
-  Geodatabases without GDAL (desktop; 3D multipatches as footprints with their heights); the
-  vector formats GDAL reads when it is installed, PostGIS, MySQL, MariaDB and SQL Server tables
-  read live (desktop), and SQL queries and DuckDB databases (DuckDB Spatial) when DuckDB is;
-  GeoJSON, CSV, GeoPackage, GeoParquet, Shapefile, FlatGeobuf, KML/KMZ, GPX and WKT out;
-  standalone tables; geotagged photos and KML ground overlays; geocoding (Find Place, address
-  tables); a Data Sources pane (favourites, recent, saved services, a library, reusable
-  connections and dataset browsing) and an SQL pane (DuckDB Spatial); layer, map, style,
-  template, task and package files; supported QGIS `.qgs`/`.qgz` and GeoLibre `.geolibre` projects opened as maps,
-  with supported layer styles and notes on import differences.
-- Open data: STAC search (Planetary Computer assets), NASA Earthdata (desktop), Hugging Face,
-  Overture Maps, Source Cooperative, OpenStreetMap by area (Overpass), geoBoundaries, CKAN,
-  Socrata and ArcGIS Hub portals, and S3 buckets with signed connections and a bucket browser.
-- Rasters: GeoTIFF/COG (by web address, read in place by range; Zstandard too) and ASCII grids,
-  Zarr 2 and 3 stores (a variable's step, by folder or web address), and JPEG 2000, NetCDF,
-  HDF, ERDAS Imagine… through GDAL, EPSG reprojection, stretch/RGB/classified/shaded-relief
-  symbology, raster functions, indices, change detection, classification, georeferencing;
-  cloud-optimised GeoTIFFs out; data cubes on a time slider, point time-series charts, temporal
-  and categorical summaries, and trends (Sen's slope, Mann–Kendall), including STAC bands read
-  in place.
-- Services: WMS, WMTS, WFS, WCS, OGC API Features and Tiles, and ArcGIS REST, listed from their
-  capabilities; CSW catalogue search.
-- Maps: multiple maps, a GPU renderer (beta) with smooth zoom and pan, tilt, rotation and
-  terrain, a 3D globe with the flat map draped over it, maps of the Moon, Mars and other
-  celestial bodies, projection presets and EPSG codes (features cut along the edge of world
-  projections), a search box for layers, places and coordinates, bookmarks, web tile layers
-  (XYZ/TMS/WMS, Mapbox Vector Tiles, MapLibre styles, PMTiles and MBTiles archives), a basemap
-  gallery (OpenFreeMap, USGS Imagery), worldviews.
-- Cartography: single, unique values, graduated colours (natural breaks, equal interval,
-  quantile, geometric interval, standard deviation, manual) and proportional symbols; layer
-  groups; label classes with SQL queries, managed in the Labeling pane; straight and curved line
-  placement, installed font families and annotation; stacked and dashed line strokes, symbol
-  levels, reference scales, polygon outlines without fill; custom colour ramps (and QGIS, GDAL
-  and GMT palette files); masking, display filters, blend modes, aggregation, extrusion; graphics.
-- Merge vector layers: append matching geometry types, union attributes without type conversion,
-  honor selections and complete streamed inputs ([#1061](https://github.com/opengeos/RustGIS/issues/1061)).
-- Editing: create, move, rotate, scale, merge, split, explode, vertex editing; snapping,
-  templates, elevation, topology; domains, subtypes, attribute rules, contingent values,
-  relationships, archiving.
-- Analysis: selection by attributes and location; polygon, lasso and radius on the map; overlay
-  (clip, erase, intersect, identity, union), proximity (buffer, near) and summary tools, spatial
-  join, feature vertices to points, zonal statistics, A5 grids, kriging, Calculate Geometry with
-  metric or imperial units, and Vector to PMTiles export (#557); guided workflows (viewshed, line
-  of sight, IDW, shortest path, suitability); ModelBuilder on a node canvas, scripts with command,
-  parameter and value completion, and history copied as code; the GeoLibre and Whitebox suite
-  (1,000+ tools) natively and in the browser.
-- Layouts (map frames, surrounds, map series, publication sheets and figures in one command,
-  format panes, guides, snapping, element locking and PDF), reports, presentations and
-  notebooks; the web app embeddable in a page (`?embed`).
-- Sharing as open formats (web maps, OGC API Features collections, MapLibre styles, glTF
-  scenes, locators), offline areas with sync, deep learning pixel classification, hosted
-  imagery tiles.
-- The AI Assistant (Anthropic, OpenAI, ChatGPT sign-in, Gemini, OpenRouter, Ollama,
-  OpenAI-compatible) in the app, the web app and `rustgis-cli ask`; an MCP server
-  (`rustgis-cli mcp`) for AI agents such as Claude Code, Cursor and VS Code, with the
-  documentation built in.
-- The AI Assistant's skills, subagents and ACP clients; MCP over HTTP, an audited loopback
-  relay and a file bridge, which let external AI clients drive the app. Database passwords, S3
-  keys and AI provider keys optionally remembered in the desktop OS keychain, where the ChatGPT
-  sign-in keeps its tokens.
-- Sandboxed WebAssembly plugins with a registry at plugins.rustgis.app; process plugins that
-  run as programs (with Python environments RustGIS makes), in the background with progress and
-  Cancel.
-- The `rustgis` Python package on PyPI: the engine in-process, and `rustgis.Map` in Jupyter.
-- Desktop packages: Windows installers (setup.exe, .msi), a portable zip and a Store MSIX; a
-  signed and notarized macOS DMG; Linux .deb, .rpm, AppImage and tarballs; Homebrew, the AUR,
-  Fedora COPR and winget; a download mirror at downloads.rustgis.app.
+## Not planned for RustGIS
+Left to GeoLibre, which is web first
+([#951](https://github.com/opengeos/RustGIS/discussions/951)). Open a discussion if you think one
+belongs here after all.
+- Real-time collaborative editing.
+- An SQL engine inside the web app (the desktop has DuckDB).
+- Segmentation with SAM and other ONNX models.

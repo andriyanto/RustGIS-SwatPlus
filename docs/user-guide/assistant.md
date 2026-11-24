@@ -21,8 +21,22 @@ than relying only on the model's reply. Commands that would read or write files,
 an address on the internet, run a plugin, script, task or model, or replace the project wait
 for you: **Allow** or **Decline**. SQL queries also ask, because SQL can access files and the
 network. **Allow such actions for this conversation** remembers the exact command and all
-its parameters, not general access to a file or server. Plugin commands, user automation and
+its parameters, not general access to a file or server. Plugin commands and tools, user automation and
 project replacement ask every time.
+
+The approval freezes the ordered operations shown, including tool defaults, target layers,
+selected layers used implicitly, and the current source and account choices. Changing those,
+editing a task or notebook, reloading a plugin, or replacing the project requires a new review.
+A remembered operation must match the same contents and targets; at most 64 are retained for
+the conversation. Large or unresolved requests refuse before running: split them into smaller
+steps or run them yourself. Reviews are bounded to 1,000 operations, four nested items, 64 KiB
+of frozen parameters and bindings, and 4 KiB of displayed text.
+
+Queued tools and downloads keep the initiating caller's authority. Stop, a revoked agent grant,
+a disabled plugin or project replacement prevents a new stage or result from being applied.
+A network request already sent may still finish; its revoked result is discarded. Tasks,
+notebooks and models opened from files, or made or changed by an assistant, agent or plugin,
+remain restricted to project edits. Undo restores the provenance of the exact content it restores.
 
 Enter sends, Shift+Enter starts a new line, and Up and Down recall earlier messages when the
 message box is empty or showing a recalled message. Drag the grip above it to resize it.
@@ -31,6 +45,28 @@ controls.
 
 From the command line, `rustgis-cli ask` sends one request (see
 [Command Line](../cli.md#asking-the-ai-assistant)).
+
+## Attaching pictures
+
+A picture can go with a message: a map whose style you want, a screenshot of something that
+looks wrong, a photo of a sketch. Click the picture button beside **Send** and choose PNG, JPEG
+or WebP files, or, on a computer, paste a picture into the message box. Each shows above the box
+with its size until you send the message or take it off with **×**; a message can be pictures
+alone. A message takes up to four pictures, each a file of up to 20 MiB and 8,192 pixels a side.
+From the command line, add `--image FILE` to `rustgis-cli ask`, up to four times.
+
+Before it is sent, a picture is turned upright when the photo says it was taken on its side, drawn
+at most 1,568 pixels on its longest side, and saved again as a JPEG (a PNG when it has transparent
+parts). Saving it again leaves out what the file carried besides its pixels, such as where a photo
+was taken. The conversation says each picture attached, and the size it was sent at when that is
+smaller than the file's. The latest eight pictures go with every request; older ones are replaced
+by a line naming them, and so are those in the part of a long conversation that is summarised.
+A model that doesn't read images gets the pictures' names instead, and the conversation says so;
+switching to a model that reads images afterwards doesn't bring them back. Attach a picture again
+when the assistant needs to see it once more.
+
+A picture shows the model what you mean; it doesn't give coordinates. To place a scanned map, use
+georeferencing with control points rather than asking the model where things are.
 
 ## Choosing a model
 
@@ -45,6 +81,9 @@ Click the model name or the gear to open the settings. The assistant works with:
 | OpenRouter | `openrouter/auto` | [openrouter.ai](https://openrouter.ai/keys), or `OPENROUTER_API_KEY` |
 | Ollama (local) | `qwen3` | none; the server from `OLLAMA_BASE_URL` (default `http://localhost:11434`) |
 | OpenAI-compatible | — | LM Studio, vLLM, llama.cpp…: `OPENAI_COMPATIBLE_BASE_URL` (default `http://localhost:1234/v1`), with an optional `OPENAI_COMPATIBLE_API_KEY` |
+| Requesty | `anthropic/claude-sonnet-5-5` | [app.requesty.ai](https://app.requesty.ai/api-keys), or `REQUESTY_API_KEY`; for the EU, set the **Address** to `https://router.eu.requesty.ai/v1` |
+| TrustedRouter | `trustedrouter/auto` | [trustedrouter.com](https://trustedrouter.com), or `TRUSTEDROUTER_API_KEY` |
+| Opper | `claude-sonnet-5-5` | [platform.opper.ai](https://platform.opper.ai), or `OPPER_API_KEY` |
 
 The ↻ button lists the provider's models. The provider and model you last chose in the settings
 are used at start. Until you choose one, `RUSTGIS_ASSISTANT_PROVIDER` and
@@ -99,6 +138,21 @@ Team/Business, Enterprise and Edu workspace policy may block plan usage.
 Weekly usage opens ChatGPT's settings page. RustGIS does not show a live percentage: there is
 no documented usage endpoint, and the tested live responses supplied no rate-limit headers.
 
+## Looking at the map
+
+The assistant can call `view_map` to see the map as a picture: the current view drawn offscreen,
+1024 × 640 pixels unless it asks for another size, as the MCP server's tool of the same name
+draws it. It changes nothing. Each request carries the two latest pictures; older ones are
+replaced by a line saying they're no longer attached. When the provider refuses images (an
+Ollama model without vision, say), the request is sent again without them, and from then on
+`view_map` tells that model it doesn't read images.
+
+`view_map` can also show a layout's page (`layout`, by name), and a closer look at part of the
+page or the map (`region`: millimetres on a page, degrees on the map), drawn at full detail rather
+than cut out of a smaller picture, so the assistant can read small text, a legend's rows or a
+label at the frame's edge. What drawing it said, such as a text cut off at the page's edge, comes
+with the picture.
+
 ## Tool output limits
 
 The assistant can `search_docs` and `read_doc` to look up RustGIS features and commands.
@@ -124,6 +178,10 @@ Tiny output budgets use minimal truncation metadata or a diagnostic string prefi
 returning bare `null`; extremely small budgets can only retain an abbreviated marker.
 Reading a section avoids loading an entire page. A single line that cannot fit produces an
 explicit error rather than silently skipping text.
+
+Nested tool results are checked for runtime login bindings through 16 levels. Deeper containers
+are withheld, with one notice reporting their count and the depth limit to the assistant and
+the app. This does not turn a successfully executed command into a failure.
 
 ## Skills
 
@@ -247,7 +305,11 @@ fetch the USGS stream gauges in Texas and add them to the map."
   file it writes) waits for **Allow**, **Always allow** (when the agent offers it) or
   **Decline** in its window. **Allow** never becomes a persistent approval: if no once-only
   option exists, use the explicitly labelled **Always allow** or decline. **Approve agents' actions without asking** lets them through
-  instead. Turn it on only if you trust the agent with your computer.
+  instead. Turn it on only if you trust the agent with your computer. With it off, RustGIS
+  sends a task only after confirming an asking or read-only mode; an agent with unknown or
+  missing modes must first report a compatible mode. Turning the setting off during a turn
+  that bypasses approval cancels that turn and requests an asking mode where available.
+  Cancellation cannot recall actions the agent already performed.
 - **RustGIS checks its own tools.** File, network, plugin-command and project-replacement
   requests from a local agent wait for a separate **Allow** or **Decline** in its window.
   Approval applies only to that exact MCP message and that agent's run; a batch is approved or
@@ -259,7 +321,7 @@ fetch the USGS stream gauges in Texas and add them to the map."
   the agent and its inputs. It also selects the agent's own full-access mode where available.
 - **Its work is kept.** Each task gets a folder in `Documents/RustGIS/Agent work`, and what the
   agent adds to the map comes from there. The assistant's reply names the folder.
-- **On the map, it has its thread's permission only.** It reaches the map through the MCP relay
+- **Its relay token carries its thread's permission.** It reaches the map through the MCP relay
   with a token of its own, which RustGIS revokes when the thread ends. **Stop** in its window, or
   **×** in the list, revokes its token immediately and terminates its live process tree on a
   background thread. A reaped leader's old process ID is never signalled.
@@ -275,8 +337,9 @@ fetch the USGS stream gauges in Texas and add them to the map."
 ## Privacy
 
 Assistant requests go directly to the provider and address you chose, using your API key or
-ChatGPT sign-in. They carry your messages, the map's layer names, fields and extent, and tool
-results such as rows the assistant reads. Local agents use their own providers and tools,
+ChatGPT sign-in. They carry your messages, the map's layer names, fields and extent, tool
+results such as rows the assistant reads, the pictures you attach to a message, and, when the
+assistant calls `view_map`, a picture of the map, basemap tiles included. Local agents use their own providers and tools,
 with their own data handling. A key typed in the settings is used for the session only unless
 you tick **Remember the key on this computer**. On the desktop, this saves it in the system
 keychain (macOS Keychain, Windows Credential Manager, or the Secret Service on Linux). Clearing
@@ -314,8 +377,8 @@ OpenAI API receives the tokens. Renewals are serialized across RustGIS processes
 can be used only once), and the keychain is read under the same lock.
 Plain HTTP is only used for servers on your computer or local network.
 
-In the web app, the browser calls the provider directly. Anthropic, OpenAI, Gemini and
-OpenRouter accept that; a local Ollama server must allow the page's origin
+In the web app, the browser calls the provider directly. Anthropic, OpenAI, Gemini,
+OpenRouter, Requesty, TrustedRouter and Opper accept that; a local Ollama server must allow the page's origin
 (`OLLAMA_ORIGINS=https://web.rustgis.app ollama serve`).
 
 ## Retries and long conversations
@@ -360,3 +423,10 @@ ACP input uses a bounded background writer queue, so a stalled agent cannot bloc
 buttons or follow-up submission. Queue overflow reports an error instead of blocking. On Linux
 and macOS, an exited leader is observed without reaping until cleanup; its reserved identity
 lets Stop terminate surviving process-group descendants before finally reaping the leader.
+
+Exact approvals can follow an ordered activation of an existing map: later default layers use
+that map's normal selection rules. Layer identities include their owning map, even when two
+maps use the same numeric layer ids. A later step after a map creation, duplication, removal or
+rename cannot yet be frozen without running the change, so an exact approval refuses that
+combined request. Split it into requests, or perform the map change yourself first. Ordinary
+native commands and already allowed execution keep their existing behavior.

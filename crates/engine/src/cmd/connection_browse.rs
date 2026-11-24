@@ -24,22 +24,45 @@ const MAX_NODE: usize = 4096;
 /// What a node of a connection stands for.
 enum Level {
     Database,
-    DatabaseSchema { schema: String },
-    Service { url: String, kind: Option<String> },
+    DatabaseSchema {
+        schema: String,
+    },
+    /// A geodatabase's feature dataset.
+    DatabaseDataset {
+        dataset: String,
+    },
+    Service {
+        url: String,
+        kind: Option<String>,
+    },
     Catalogue,
-    StacRoot { api: String },
-    StacCollection { api: String, id: String },
-    StacCatalog { url: String },
-    StacItem { url: String },
+    StacRoot {
+        api: String,
+    },
+    StacCollection {
+        api: String,
+        id: String,
+    },
+    StacCatalog {
+        url: String,
+        origin: address::Origin,
+    },
+    StacItem {
+        url: String,
+        origin: address::Origin,
+    },
     S3Root,
-    S3Prefix { bucket: String, prefix: String },
+    S3Prefix {
+        bucket: String,
+        prefix: String,
+    },
 }
 
 /// The types a `service:<type>:<url>` node names (`auto` leaves the type to be guessed).
 const SERVICE_TYPES: [&str; 7] = ["auto", "wms", "wmts", "wfs", "wcs", "ogcapi", "arcgis"];
 
 /// The level a connection's `node` names (its top level when empty).
-fn level(c: &Connection, node: &str) -> Result<Level, String> {
+fn level(c: &Connection, node: &str, observed: Option<&address::Origin>) -> Result<Level, String> {
     let kind = c.kind.as_str();
     let not_a_node = || format!("'{node}' isn't a node of {}", c.name);
     if node.is_empty() {
@@ -67,17 +90,26 @@ fn level(c: &Connection, node: &str) -> Result<Level, String> {
         address::check(url, Some(&c.address))?;
         return Ok(Level::Service { url: url.to_string(), kind: (t != "auto").then(|| t.to_string()) });
     }
-    if let Some(schema) = node.strip_prefix("schema:") {
-        if !matches!(kind, "postgres" | "mysql" | "sqlserver") || schema.is_empty() {
+    // A schema's or a geodatabase dataset's name, as `schemas` and `geodatabase_tree` encode it.
+    let named = |encoded: &str| {
+        if !matches!(kind, "postgres" | "mysql" | "sqlserver") || encoded.is_empty() {
             return Err(not_a_node());
         }
-        let schema = URL_SAFE_NO_PAD
-            .decode(schema)
+        URL_SAFE_NO_PAD
+            .decode(encoded)
             .ok()
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .filter(|name| !name.is_empty())
-            .ok_or_else(not_a_node)?;
-        return Ok(Level::DatabaseSchema { schema });
+            .ok_or_else(not_a_node)
+    };
+    if let Some(schema) = node.strip_prefix("schema:") {
+        return Ok(Level::DatabaseSchema { schema: named(schema)? });
+    }
+    if let Some(dataset) = node.strip_prefix("dataset:") {
+        if kind != "sqlserver" {
+            return Err(not_a_node());
+        }
+        return Ok(Level::DatabaseDataset { dataset: named(dataset)? });
     }
     if let Some(id) = node.strip_prefix("collection:") {
         if kind != "stac" || id.is_empty() {
@@ -93,16 +125,18 @@ fn level(c: &Connection, node: &str) -> Result<Level, String> {
         if kind != "stac" {
             return Err(not_a_node());
         }
-        address::check(url, Some(&c.address))?;
-        return Ok(Level::StacCatalog { url: url.to_string() });
+        let origin = observed.cloned().unwrap_or_else(|| address::Origin::named(&c.address));
+        origin.check(url)?;
+        return Ok(Level::StacCatalog { url: url.to_string(), origin });
     }
     if let Some(url) = node.strip_prefix("item:") {
         // A static catalog's item: its own file, read when opened.
         if kind != "stac" {
             return Err(not_a_node());
         }
-        address::check(url, Some(&c.address))?;
-        return Ok(Level::StacItem { url: url.to_string() });
+        let origin = observed.cloned().unwrap_or_else(|| address::Origin::named(&c.address));
+        origin.check(url)?;
+        return Ok(Level::StacItem { url: url.to_string(), origin });
     }
     if let Some(rest) = node.strip_prefix("s3:") {
         let (bucket, prefix) = rest
@@ -134,14 +168,14 @@ fn s3_login(s: &mut Session, c: &Connection, level: &Level) -> Result<Option<s3:
 /// The address a level reads (`None`: nothing is fetched, or the database driver reads it).
 fn fetch_url(s: &Session, c: &Connection, level: &Level, conn: Option<&s3::Connection>) -> Result<Option<String>, String> {
     Ok(match level {
-        Level::Database | Level::DatabaseSchema { .. } => None,
+        Level::Database | Level::DatabaseSchema { .. } | Level::DatabaseDataset { .. } => None,
         Level::Service { url, kind } => Some(rustgis_data::ogc::capabilities_url(url, kind.as_deref())),
         Level::Catalogue => Some(super::super::service::records_request(s, &json!({"url": c.address}))?),
         Level::StacRoot { api } => Some(if stac::catalog::is_static(api) { api.clone() } else { stac::collections_url(api) }),
         Level::StacCollection { api, id } => {
             Some(stac::search_url(api, &stac::Search { collections: vec![id.clone()], limit: ITEMS, ..stac::Search::default() })?)
         }
-        Level::StacCatalog { url } | Level::StacItem { url } => Some(url.clone()),
+        Level::StacCatalog { url, .. } | Level::StacItem { url, .. } => Some(url.clone()),
         Level::S3Root => match (super::first_bucket(c), conn) {
             (Some(_), _) => None,
             (None, Some(conn)) if conn.credentials.is_some() => Some(super::through(s, c, conn, s3::buckets_url(conn))?),
@@ -159,13 +193,15 @@ fn fetch_url(s: &Session, c: &Connection, level: &Level, conn: Option<&s3::Conne
 
 /// What a level reads, fetched here (waiting for it).
 #[cfg(not(target_arch = "wasm32"))]
-fn download(url: &str) -> Result<String, String> {
-    let bytes = crate::render::rustgis_tiles::cache::download_blocking(url)?;
-    Ok(String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+fn download(url: &str, ceiling: address::Reach) -> Result<(String, address::Origin), String> {
+    use crate::render::rustgis_tiles::cache;
+    let fetched = cache::download_blocking_with_origin_within(url, cache::MAX_DOWNLOAD, cache::BLOCKING_TIMEOUT, &[], ceiling)?;
+    let text = String::from_utf8(fetched.bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    Ok((text, fetched.origin))
 }
 
 #[cfg(target_arch = "wasm32")]
-fn download(_: &str) -> Result<String, String> {
+fn download(_: &str, _: address::Reach) -> Result<(String, address::Origin), String> {
     Err("in the web app, expand the connection under Data Sources › Connections".into())
 }
 
@@ -202,45 +238,85 @@ pub(super) fn browse(s: &mut Session, p: &Value) -> CmdResult {
     if ps(p, "answer").map(str::len).into_iter().chain(documents).sum::<usize>() > super::super::service::MAX_GROUP_BYTES {
         return Err("answer and documents are too large to read".into());
     }
-    let level = level(&c, node)?;
+    let observed = node_origin(s, &c, node);
+    let level = level(&c, node, observed.as_ref())?;
+    let ceiling = match &level {
+        Level::StacCatalog { origin, .. } | Level::StacItem { origin, .. } => origin.reach(),
+        _ => address::Reach::Local,
+    };
     let conn = s3_login(s, &c, &level)?;
     let url = fetch_url(s, &c, &level, conn.as_ref())?;
+    let url = match url {
+        Some(url) if crate::service_logins::is_service(&c) => Some(crate::service_logins::request(s, Some(&c.id), &url)?),
+        other => other,
+    };
+    if ceiling == address::Reach::Public
+        && let Some(url) = &url
+    {
+        crate::render::rustgis_tiles::cache::restrict_to_public(url);
+    }
     let mut out = json!({"connection": c.id, "node": node});
     if b(p, "probe").unwrap_or(false) {
         out["fetch"] = json!(url);
+        if ceiling == address::Reach::Public {
+            out["fromDocument"] = json!(true);
+        }
         return Ok(out);
     }
     let found = match &level {
-        Level::Database => database_schemas(s, &c)?,
-        Level::DatabaseSchema { schema } => database_schema(s, &c, schema)?,
-        Level::Service { url, kind } => service(s, p, &mut out, url, kind.as_deref())?,
+        Level::Database => database_schemas(s, &c, &mut out)?,
+        Level::DatabaseSchema { schema } => database_schema(s, &c, schema, &mut out)?,
+        Level::DatabaseDataset { dataset } => database_dataset(s, &c, dataset, &mut out)?,
+        Level::Service { url, kind } => service(s, p, &mut out, &c, url, kind.as_deref())?,
         Level::S3Root if url.is_none() => {
             buckets(c.options.get("buckets").map(String::as_str).unwrap_or("").split(',').map(str::to_string))
         }
         _ => {
             let at = url.as_deref().unwrap_or("");
-            let text: Cow<str> = match ps(p, "answer") {
-                Some(a) => Cow::Borrowed(a),
-                None => Cow::Owned(download(at)?),
+            let (text, origin): (Cow<str>, address::Origin) = match ps(p, "answer") {
+                Some(a) => {
+                    let origin = match s.browse_response.take() {
+                        Some((id, supplied_node, origin)) if id == c.id && supplied_node == node => origin,
+                        _ => address::Origin::named(at).narrow_reach(address::Reach::Public),
+                    };
+                    (Cow::Borrowed(a), origin)
+                }
+                None => {
+                    let (text, origin) = download(at, ceiling)?;
+                    (Cow::Owned(text), origin)
+                }
             };
             let bytes = text.as_bytes();
-            match &level {
+            let found = match &level {
                 Level::Catalogue => catalogue(s, &c, &text, &mut out)?,
-                Level::StacRoot { api } if stac::catalog::is_static(api) => catalogs(bytes, api)?,
+                Level::StacRoot { api } if stac::catalog::is_static(api) => catalogs(s, bytes, &origin)?,
                 Level::StacRoot { .. } => collections(bytes)?,
-                Level::StacCatalog { url } => catalogs(bytes, url)?,
-                Level::StacItem { url } => item_file(bytes, url)?,
-                Level::StacCollection { .. } => items(bytes, at)?,
+                Level::StacCatalog { .. } => catalogs(s, bytes, &origin)?,
+                Level::StacItem { .. } => item_file(s, bytes, &origin)?,
+                Level::StacCollection { .. } => items(s, bytes, &origin)?,
                 Level::S3Root => buckets(s3::parse_buckets(bytes)?.into_iter()),
                 Level::S3Prefix { bucket, prefix } => {
                     let binding = conn.as_ref().and_then(|conn| super::saved_binding(s, &c, conn));
                     objects(bytes, bucket, prefix, binding.as_deref())?
                 }
-                Level::Database | Level::DatabaseSchema { .. } | Level::Service { .. } => Found::default(),
+                Level::Database | Level::DatabaseSchema { .. } | Level::DatabaseDataset { .. } | Level::Service { .. } => Found::default(),
+            };
+            if matches!(&level, Level::StacCatalog { .. }) || matches!(&level, Level::StacRoot { api } if stac::catalog::is_static(api)) {
+                remember_node_origins(s, &c, &found.children, &origin, node.is_empty())?;
             }
+            found
         }
     };
-    out["children"] = json!(found.children);
+    let mut children = found.children;
+    for child in &mut children {
+        public_addresses(child);
+    }
+    if crate::service_logins::is_service(&c) {
+        for child in &mut children {
+            name_connection(child, &c.id, 0);
+        }
+    }
+    out["children"] = json!(children);
     if found.truncated {
         out["truncated"] = json!(true);
     }
@@ -250,10 +326,234 @@ pub(super) fn browse(s: &mut Session, p: &Value) -> CmdResult {
     Ok(out)
 }
 
-/// A live database's schemas, each browsed separately so one large schema cannot hide later ones.
-fn database_schemas(s: &mut Session, c: &Connection) -> Result<Found, String> {
-    let tables = super::connection_use::tables(s, c, None)?;
-    Ok(schemas(&tables))
+impl Session {
+    /// Completes a native UI transport response without accepting provenance through JSON.
+    /// A fresh probe checks the exact request and current project before one command consumes it.
+    pub fn browse_from_origin(&mut self, params: &Value, requested: &str, opened: u64, origin: address::Origin) -> CmdResult {
+        if !self.policy_user() {
+            return Err("only native UI dispatch supplies a fetched browse origin".into());
+        }
+        if self.opened != opened {
+            return Err("the project changed while the connection was being read; browse again".into());
+        }
+        let connection = super::found(self, params)?.clone();
+        let node = ps(params, "node").unwrap_or("");
+        let probe = self.run("connection.browse", &json!({"id":connection.id,"node":node,"probe":true}))?;
+        if probe.get("fetch").and_then(Value::as_str) != Some(requested) {
+            return Err("the connection changed while it was being read; browse again".into());
+        }
+        let ceiling =
+            if probe.get("fromDocument").and_then(Value::as_bool) == Some(true) { address::Reach::Public } else { address::Reach::Local };
+        let previous = self.browse_response.replace((connection.id, node.to_string(), origin.narrow_reach(ceiling)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run("connection.browse", params)));
+        self.browse_response = previous;
+        match result {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+}
+
+/// A node's provenance is runtime-only and belongs to this project and connection definition.
+fn node_origin(s: &Session, c: &Connection, node: &str) -> Option<address::Origin> {
+    if s.browse_origins.0 != s.opened {
+        return None;
+    }
+    let root = s.browse_origins.1.get(&(c.id.clone(), c.address.clone(), String::new()));
+    let origin = match s.browse_origins.1.get(&(c.id.clone(), c.address.clone(), node.to_string())) {
+        Some(origin) => origin.clone(),
+        None => root.map(|_| address::Origin::named(&c.address))?,
+    };
+    Some(match root {
+        Some(root) => origin.narrow_reach(root.reach()),
+        None => origin,
+    })
+}
+
+/// Retains only nodes actually admitted by a fetched or conservatively named document origin.
+/// Neither reach nor provenance is reconstructed from caller-supplied JSON fields.
+fn remember_node_origins(s: &mut Session, c: &Connection, children: &[Value], origin: &address::Origin, root: bool) -> Result<(), String> {
+    if c.address.len() > MAX_NODE || origin.url().len() > MAX_NODE {
+        return Err(format!("catalog source addresses exceed the {MAX_NODE}-byte provenance limit"));
+    }
+    if s.browse_origins.0 != s.opened {
+        s.browse_origins = (s.opened, Default::default());
+    }
+    let mut keys = Vec::new();
+    if root {
+        keys.push((c.id.clone(), c.address.clone(), String::new()));
+    }
+    for child in children {
+        if let Some(node) = ps(child, "node") {
+            let mut public = json!(node);
+            public_addresses(&mut public);
+            if let Some(node) = public.as_str() {
+                keys.push((c.id.clone(), c.address.clone(), node.to_string()));
+            }
+        }
+    }
+    let added = keys.iter().filter(|key| !s.browse_origins.1.contains_key(*key)).count();
+    if s.browse_origins.1.len().saturating_add(added) > 16_384 {
+        return Err("too many catalog nodes are open in this session; reopen the project to browse more".into());
+    }
+    for key in keys {
+        s.browse_origins.1.insert(key, origin.clone());
+    }
+    Ok(())
+}
+
+/// Browse candidates persist public addresses plus a connection id, not a live capability.
+fn public_addresses(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            if let Some((prefix, tail)) = text.split_once(rustgis_data::login_address::PREFIX) {
+                let wrapped = format!("{}{tail}", rustgis_data::login_address::PREFIX);
+                if let Ok(Some(bound)) = rustgis_data::login_address::parse(&wrapped) {
+                    *text = format!("{prefix}{}", bound.url);
+                }
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(public_addresses),
+        Value::Object(values) => values.values_mut().for_each(public_addresses),
+        _ => {}
+    }
+}
+
+/// Names the connection in the add commands a listed child (and its children) offers, so the
+/// layers they add record it and are read with its login.
+fn name_connection(child: &mut Value, id: &str, depth: usize) {
+    if depth > 4 {
+        return;
+    }
+    let command = child.get("add").and_then(|a| a.get("command")).and_then(Value::as_str).unwrap_or("");
+    if crate::service_logins::ADD_COMMANDS.contains(&command)
+        && let Some(params) = child.get_mut("add").and_then(|a| a.get_mut("params")).and_then(Value::as_object_mut)
+    {
+        params.insert("connection".into(), json!(id));
+    }
+    if let Some(list) = child.get_mut("children").and_then(Value::as_array_mut) {
+        for c in list {
+            name_connection(c, id, depth + 1);
+        }
+    }
+}
+
+/// A live database's rows, with a note when it is a geodatabase whose catalog couldn't be read
+/// (it then browses as plain SQL Server).
+fn database_rows(s: &mut Session, c: &Connection, out: &mut Value) -> Result<Vec<Value>, String> {
+    let (rows, geodatabase, problem) = super::connection_use::tables_and_geodatabase(s, c, None)?;
+    if let Some(note) = listing_note(geodatabase.as_ref(), problem.as_deref()) {
+        out["notes"] = json!([note]);
+    }
+    Ok(rows)
+}
+
+/// What a listing says beside its rows: that the catalog couldn't be read, or was cut short.
+fn listing_note(geodatabase: Option<&Value>, problem: Option<&str>) -> Option<String> {
+    match problem {
+        Some(why) => Some(format!("the geodatabase catalog couldn't be read: {why}")),
+        None => geodatabase.and_then(|g| g.get("note")).and_then(Value::as_str).map(str::to_string),
+    }
+}
+
+/// A live database's schemas, each browsed separately so one large schema cannot hide later ones;
+/// a geodatabase's feature datasets, classes and tables instead.
+fn database_schemas(s: &mut Session, c: &Connection, out: &mut Value) -> Result<Found, String> {
+    let rows = database_rows(s, c, out)?;
+    Ok(if is_geodatabase(&rows) { geodatabase_tree(&rows, &c.address, None) } else { schemas(&rows) })
+}
+
+/// Whether a database's rows are an Esri geodatabase's: each says what item it is.
+fn is_geodatabase(rows: &[Value]) -> bool {
+    rows.iter().any(|r| r.get("item").is_some())
+}
+
+/// A geodatabase's classes and tables as `connection.browse` lists them: the root has the
+/// `Feature datasets` folder, the classes outside any dataset, a `Tables` folder of the
+/// registered tables and an `Other spatial tables` folder (the empty ones left out); the node
+/// of a feature dataset (`Some(its name)`) lists its classes.
+fn geodatabase_tree(rows: &[Value], address: &str, node: Option<&str>) -> Found {
+    let text = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let item = |r: &Value| r.get("item").and_then(Value::as_str).unwrap_or("").to_string();
+    // A row says what it is and, for a feature class, its kind of geometry (the tree's icon).
+    let child = |r: &Value, name: String, detail: String| {
+        let label = text(r, "label");
+        let mut out = json!({
+            "key": label,
+            "name": name,
+            "what": "table",
+            "item": item(r),
+            "detail": detail,
+            "add": {"command": "layer.addDatabase", "params": {"database": address, "layer": label}},
+            "options": true,
+        });
+        if let Some(geometry) = r.get("geometry").and_then(Value::as_str) {
+            out["geometry"] = json!(geometry);
+        }
+        out
+    };
+    let shown = |r: &Value| match text(r, "display") {
+        d if d.is_empty() => text(r, "name"),
+        d => d,
+    };
+    // Alphabetical by what is shown (the alias, else the name).
+    let by_name = |r: &Value| (shown(r).to_lowercase(), text(r, "label"));
+    fn sorted<'a>(mut rows: Vec<&'a Value>, key: &impl Fn(&Value) -> (String, String)) -> Vec<&'a Value> {
+        rows.sort_by_cached_key(|r| key(r));
+        rows
+    }
+    let class_child = |r: &Value| {
+        let detail = match text(r, "versioning").as_str() {
+            v @ ("traditional" | "branch") => format!("feature class · {v}"),
+            _ => "feature class".to_string(),
+        };
+        child(r, shown(r), detail)
+    };
+    let dataset_of = |r: &Value| r.get("dataset").and_then(Value::as_str).filter(|d| !d.is_empty()).map(str::to_string);
+    let classes = || rows.iter().filter(|r| item(r) == "featureClass");
+
+    if let Some(dataset) = node {
+        let inside = classes().filter(|r| dataset_of(r).as_deref() == Some(dataset)).collect();
+        return Found { children: sorted(inside, &by_name).into_iter().map(class_child).collect(), ..Found::default() };
+    }
+
+    let mut children = Vec::new();
+    let datasets: std::collections::BTreeSet<String> = classes().filter_map(dataset_of).collect();
+    if !datasets.is_empty() {
+        let listed: Vec<Value> = datasets
+            .iter()
+            .map(|name| {
+                let mut node = String::with_capacity(8 + name.len().div_ceil(3) * 4);
+                node.push_str("dataset:");
+                URL_SAFE_NO_PAD.encode_string(name, &mut node);
+                json!({"key": node, "node": node, "name": name, "what": "dataset"})
+            })
+            .collect();
+        children.push(json!({"key": "datasets", "name": "Feature datasets", "what": "folder", "children": listed}));
+    }
+    children.extend(sorted(classes().filter(|r| dataset_of(r).is_none()).collect(), &by_name).into_iter().map(class_child));
+    let tables: Vec<Value> = sorted(rows.iter().filter(|r| item(r) == "table").collect(), &by_name)
+        .into_iter()
+        .map(|r| child(r, shown(r), "table".into()))
+        .collect();
+    if !tables.is_empty() {
+        children.push(json!({"key": "tables", "name": "Tables", "what": "folder", "children": tables}));
+    }
+    // Several geometry columns of one table are told apart by the label (`name:column`).
+    let other: Vec<Value> = rows.iter().filter(|r| item(r) == "other").map(|r| child(r, text(r, "label"), text(r, "kind"))).collect();
+    if !other.is_empty() {
+        children.push(json!({"key": "other", "name": "Other spatial tables", "what": "folder", "children": other}));
+    }
+    Found { children, ..Found::default() }
+}
+
+/// A geodatabase feature dataset's classes.
+fn database_dataset(s: &mut Session, c: &Connection, dataset: &str, out: &mut Value) -> Result<Found, String> {
+    let rows = database_rows(s, c, out)?;
+    if !is_geodatabase(&rows) {
+        return Err(format!("that isn't a node of {}", c.name));
+    }
+    Ok(geodatabase_tree(&rows, &c.address, Some(dataset)))
 }
 
 /// The names of every schema represented by the database's geometry tables.
@@ -279,8 +579,8 @@ fn schemas(tables: &[Value]) -> Found {
 }
 
 /// A live database schema's geometry tables.
-fn database_schema(s: &mut Session, c: &Connection, schema: &str) -> Result<Found, String> {
-    let tables = super::connection_use::tables(s, c, None)?;
+fn database_schema(s: &mut Session, c: &Connection, schema: &str, out: &mut Value) -> Result<Found, String> {
+    let tables = database_rows(s, c, out)?;
     Ok(schema_tables(&tables, schema, &c.address))
 }
 
@@ -305,8 +605,8 @@ fn schema_tables(tables: &[Value], schema: &str, address: &str) -> Found {
 }
 
 /// A service's layers (capabilities read here, or the app's `answer` and `documents`).
-fn service(s: &mut Session, p: &Value, out: &mut Value, url: &str, kind: Option<&str>) -> Result<Found, String> {
-    let mut q = json!({"url": url});
+fn service(s: &mut Session, p: &Value, out: &mut Value, c: &Connection, url: &str, kind: Option<&str>) -> Result<Found, String> {
+    let mut q = json!({"url": crate::service_logins::request(s, Some(&c.id), url)?, "connection": c.id});
     if let Some(k) = kind {
         q["type"] = json!(k);
     }
@@ -382,7 +682,8 @@ fn service(s: &mut Session, p: &Value, out: &mut Value, url: &str, kind: Option<
 
 /// A catalogue's records, each with the services and files it links to.
 fn catalogue(s: &mut Session, c: &Connection, text: &str, out: &mut Value) -> Result<Found, String> {
-    let r = super::super::service::catalog_search(s, &json!({"url": c.address, "text": text}))?;
+    let url = crate::service_logins::request(s, Some(&c.id), &c.address)?;
+    let r = super::super::service::catalog_search(s, &json!({"url": url, "connection": c.id, "text": text}))?;
     if let Some(n) = r.get("notes") {
         out["notes"] = n.clone();
     }
@@ -456,66 +757,124 @@ fn collections(bytes: &[u8]) -> Result<Found, String> {
 /// What a static catalog's document lists below it: its catalogs and collections (`child` links)
 /// and its items (`item` links), each a node read when it is opened (an item's file holds its
 /// assets).
-fn catalogs(bytes: &[u8], from: &str) -> Result<Found, String> {
-    let mut dropped = false;
+fn catalogs(s: &mut Session, bytes: &[u8], origin: &address::Origin) -> Result<Found, String> {
+    let mut dropped = 0usize;
+    let mut omitted = 0usize;
+    let mut skipped = 0usize;
+    let mut refused = 0usize;
     let mut children = Vec::new();
     for (prefix, what, list) in [
-        ("catalog", "catalog", stac::catalog::parse_children(bytes, from)?),
-        ("item", "item", stac::catalog::parse_item_links(bytes, from)?),
+        ("catalog", "catalog", stac::catalog::parse_children_noted(bytes, origin)?),
+        ("item", "item", stac::catalog::parse_item_links_noted(bytes, origin)?),
     ] {
-        for c in list {
+        refused += list.refused;
+        omitted += list.omitted;
+        skipped += list.skipped;
+        for c in list.links {
             let node = format!("{prefix}:{}", c.url);
             if node_ok(&node) {
                 children.push(json!({"key": node, "node": node, "name": c.title, "what": what}));
             } else {
-                dropped = true;
+                dropped += 1;
             }
         }
     }
+    omitted += children.len().saturating_sub(MAX_CHILDREN);
+    for note in crate::cmd::stac::catalog_link_notes(refused, skipped, omitted) {
+        s.notify(note, false);
+    }
+    match dropped {
+        0 => {}
+        1 => s.notify("1 catalog link was left out because its node address is too long or contains control characters".to_string(), false),
+        n => s.notify(
+            format!("{n} catalog links were left out because their node addresses are too long or contain control characters"),
+            false,
+        ),
+    }
     let mut found = Found::new(children);
-    found.truncated |= dropped;
+    found.truncated |= dropped > 0 || refused > 0 || omitted > 0 || skipped > 0;
     Ok(found)
 }
 
-/// The assets of an item that can be added, each with the `stac.addAsset` that adds it.
-fn assets_of(item: &stac::Item) -> Vec<Value> {
-    item.assets
-        .iter()
-        .take(MAX_CHILDREN)
-        .filter_map(|a| {
-            let (key, href) = item.asset_href(Some(&a.key)).ok()?;
-            let mut params = json!({"asset": key, "name": format!("{} {key}", item.id)});
-            match &item.url {
-                Some(u) => params["url"] = json!(u),
-                None => params["item"] = stac::item_json_with(item, false),
-            }
-            Some(json!({
-                "key": format!("{}#{key}", item.url.as_deref().unwrap_or(&item.id)),
-                "name": if a.title.is_empty() { key.as_str() } else { a.title.as_str() },
-                "what": "asset",
-                "detail": a.media_type,
-                "href": href,
-                "add": {"command": "stac.addAsset", "params": params},
-            }))
-        })
-        .collect()
+#[derive(Default)]
+struct AssetListing {
+    children: Vec<Value>,
+    skipped: usize,
+}
+
+/// The usable assets, retaining a count of unsupported or refused entries.
+fn assets_of(item: &stac::Item) -> AssetListing {
+    let mut listing = AssetListing::default();
+    for a in item.assets.iter().take(MAX_CHILDREN) {
+        let Ok((key, href)) = item.asset_href(Some(&a.key)) else {
+            listing.skipped += 1;
+            continue;
+        };
+        let mut params = json!({"asset": key, "name": format!("{} {key}", item.id)});
+        match &item.url {
+            Some(u) => params["url"] = json!(u),
+            None => params["item"] = stac::item_json_with(item, false),
+        }
+        listing.children.push(json!({
+            "key": format!("{}#{key}", item.url.as_deref().unwrap_or(&item.id)),
+            "name": if a.title.is_empty() { key.as_str() } else { a.title.as_str() },
+            "what": "asset",
+            "detail": a.media_type,
+            "href": href,
+            "fromDocument": item.origin_reach == address::Reach::Public,
+            "add": {"command": "stac.addAsset", "params": params},
+        }));
+    }
+    listing
+}
+
+/// One counted notice per parsing-loss kind for this document, with a redacted source address.
+fn listing_notices(s: &mut Session, origin: &address::Origin, losses: stac::ParseLosses) {
+    let source = crate::sources::address_in_message(origin.url());
+    for (count, kind, reason) in [
+        (losses.skipped_items, "STAC items", "they were invalid"),
+        (losses.omitted_items, "STAC items", "the response limit was reached"),
+        (losses.skipped_assets, "STAC assets", "their addresses were missing, invalid, unsupported or refused"),
+        (losses.omitted_assets, "STAC assets", "the response limit was reached"),
+    ] {
+        if count > 0 {
+            s.notify(format!("{source}: {count} {kind} were left out because {reason}"), false);
+        }
+    }
 }
 
 /// A static catalog's item (its own file): its assets.
-fn item_file(bytes: &[u8], from: &str) -> Result<Found, String> {
-    Ok(Found::new(assets_of(&stac::parse_item(bytes, from)?)))
+fn item_file(s: &mut Session, bytes: &[u8], origin: &address::Origin) -> Result<Found, String> {
+    let stac::ParsedItem { item, mut losses } = stac::parse_item_noted(bytes, origin)?;
+    let listing = assets_of(&item);
+    losses.skipped_assets += listing.skipped;
+    listing_notices(s, origin, losses);
+    let mut found = Found::new(listing.children);
+    found.truncated |= !losses.is_empty();
+    Ok(found)
 }
 
 /// The items of a collection's search, each with the assets that can be added.
-fn items(bytes: &[u8], from: &str) -> Result<Found, String> {
-    let (list, next) = stac::parse_items(bytes, from)?;
-    let matched = stac::parse_matched(bytes);
-    let truncated = next.is_some() || matched.is_some_and(|m| m > list.len() as u64);
+fn items(s: &mut Session, bytes: &[u8], origin: &address::Origin) -> Result<Found, String> {
+    let stac::ItemListing { items: list, next, next_refused, matched, mut losses } = stac::parse_items_noted(bytes, origin)?;
     let children = list
         .iter()
         .take(MAX_CHILDREN)
-        .map(|item| json!({"key": format!("item:{}", item.url.as_deref().unwrap_or(&item.id)), "name": item.id, "what": "item", "detail": item.datetime, "children": assets_of(item)}))
+        .map(|parsed| {
+            let item = &parsed.item;
+            let listing = assets_of(item);
+            losses.skipped_assets += listing.skipped;
+            let mut child = json!({"key": format!("item:{}", item.url.as_deref().unwrap_or(&item.id)), "name": item.id, "what": "item", "detail": item.datetime, "children": listing.children});
+            if listing.skipped > 0 || !parsed.losses.is_empty() { child["truncated"] = json!(true); }
+            child
+        })
         .collect();
+    listing_notices(s, origin, losses);
+    if next_refused {
+        let source = crate::sources::address_in_message(origin.url());
+        s.notify(format!("{source}: 1 next-page link was refused by the document's network reach"), false);
+    }
+    let truncated = next.is_some() || next_refused || matched.is_some_and(|m| m > list.len() as u64) || !losses.is_empty();
     Ok(Found { children, truncated, matched })
 }
 
@@ -572,6 +931,7 @@ fn objects(bytes: &[u8], bucket: &str, prefix: &str, binding: Option<&str>) -> R
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine;
     use serde_json::{Value, json};
 
     #[test]
@@ -597,13 +957,20 @@ mod tests {
         assert_eq!(root.children[1]["name"], "tiger");
         for child in &root.children {
             let node = child["node"].as_str().unwrap();
-            let parsed =
-                super::level(&crate::connections::Connection { kind: "postgres".into(), name: "gis".into(), ..Default::default() }, node)
-                    .unwrap();
+            let parsed = super::level(
+                &crate::connections::Connection { kind: "postgres".into(), name: "gis".into(), ..Default::default() },
+                node,
+                None,
+            )
+            .unwrap();
             assert!(matches!(parsed, super::Level::DatabaseSchema { .. }));
             assert!(
-                super::level(&crate::connections::Connection { kind: "service".into(), name: "gis".into(), ..Default::default() }, node)
-                    .is_err()
+                super::level(
+                    &crate::connections::Connection { kind: "service".into(), name: "gis".into(), ..Default::default() },
+                    node,
+                    None
+                )
+                .is_err()
             );
         }
 
@@ -625,7 +992,7 @@ mod tests {
             assert!(super::node_ok(node), "generated schema node must pass command validation: {node:?}");
             for kind in ["postgres", "mysql", "sqlserver"] {
                 let connection = crate::connections::Connection { kind: kind.into(), ..Default::default() };
-                let super::Level::DatabaseSchema { schema } = super::level(&connection, node).unwrap() else {
+                let super::Level::DatabaseSchema { schema } = super::level(&connection, node, None).unwrap() else {
                     panic!("schema node must select a database schema");
                 };
                 assert_eq!(schema, name);
@@ -640,7 +1007,7 @@ mod tests {
     fn invalid_encoded_schema_nodes_are_rejected() {
         let connection = crate::connections::Connection { kind: "postgres".into(), ..Default::default() };
         for node in ["schema:", "schema:!", "schema:_w", "schema:YQ=="] {
-            assert!(super::level(&connection, node).is_err(), "{node}");
+            assert!(super::level(&connection, node, None).is_err(), "{node}");
         }
     }
 
@@ -651,5 +1018,477 @@ mod tests {
         assert_eq!(tiger.children.len(), 2);
         assert!(!tiger.truncated);
         assert_eq!(tiger.matched, None);
+    }
+    #[test]
+    fn catalog_browsing_reports_refused_children_and_items_and_keeps_clean_input_quiet() {
+        use crate::render::rustgis_tiles::address::Origin;
+        let mut session = crate::Session::new(crate::Project::default());
+        let from = "https://catalog.corp.example/catalog.json";
+        for (local, lossy) in [(false, false), (false, true), (true, true)] {
+            let mut links = vec![json!({"rel":"child","href":"https://public.example/child.json"})];
+            if lossy {
+                links.extend([
+                    json!({"rel":"child","href":"http://10.0.0.5/catalog.json"}),
+                    json!({"rel":"item","href":"http://10.0.0.5/item.json"}),
+                    json!({"rel":"item","href":"http://10.0.0.5/item.json"}),
+                ]);
+            }
+            let origin = if local { Origin::connected(from, "10.0.0.5".parse().unwrap()).unwrap() } else { Origin::named(from) };
+            let text = json!({"type":"Catalog","id":"test","links":links}).to_string();
+            let mark = session.notice_mark();
+            let found = super::catalogs(&mut session, text.as_bytes(), &origin).unwrap();
+            let refused = lossy && !local;
+            assert_eq!(found.truncated, refused);
+            assert_eq!(found.children.len(), if lossy && local { 3 } else { 1 });
+            let notices = session.notices_since(mark);
+            assert_eq!(notices.len(), usize::from(refused));
+            if refused {
+                assert!(notices[0].text.contains("2 catalog links were refused"));
+            }
+        }
+    }
+    #[test]
+    fn partial_catalog_browsing_keeps_usable_nodes_and_reports_both_listing_limits() {
+        use crate::render::rustgis_tiles::address::Origin;
+        let mut session = crate::Session::new(crate::Project::default());
+        let origin = Origin::named("https://public.example/catalog.json");
+        for count in [super::MAX_CHILDREN, super::MAX_CHILDREN + 1, 2501] {
+            let mut links: Vec<Value> =
+                (0..count).map(|i| json!({"rel":"child","href":format!("https://public.example/{i}.json")})).collect();
+            links.extend([links[0].clone(), links[0].clone()]);
+            let text = json!({"type":"Catalog","id":"test","links":links}).to_string();
+            let mark = session.notice_mark();
+            let found = super::catalogs(&mut session, text.as_bytes(), &origin).unwrap();
+            let omitted = count - super::MAX_CHILDREN;
+            assert_eq!(found.children.len(), super::MAX_CHILDREN);
+            assert_eq!(found.truncated, omitted > 0);
+            let notices = session.notices_since(mark);
+            assert_eq!(notices.len(), usize::from(omitted > 0));
+            if omitted > 0 {
+                assert!(notices[0].text.contains(&format!("{omitted} catalog link")) && notices[0].text.contains("listing limit"));
+            }
+        }
+    }
+    #[test]
+    fn admitted_intranet_nodes_keep_their_origin_and_cannot_be_granted_by_json() {
+        use crate::render::rustgis_tiles::address::Origin;
+        let mut session = crate::Session::new(crate::Project::default());
+        let saved = session.run("connection.new", &json!({"kind":"stac","address":"https://catalog.corp.example/catalog.json"})).unwrap();
+        let connection = session.connections.connections.iter().find(|c| c.id == saved["id"].as_str().unwrap()).unwrap().clone();
+        let body = json!({"type":"Catalog","id":"test","links":[
+            {"rel":"child","href":"http://10.0.0.5/catalog.json"},
+            {"rel":"item","href":"http://10.0.0.5/item.json"}
+        ]})
+        .to_string();
+        let fake = json!({"id":connection.id,"node":"catalog:http://10.0.0.5/catalog.json","probe":true,"origin":{"reach":"Local"},"fromDocument":false});
+        assert!(super::browse(&mut session, &fake).is_err());
+        let origin = Origin::connected(&connection.address, "10.0.0.5".parse().unwrap()).unwrap();
+        let found = super::catalogs(&mut session, body.as_bytes(), &origin).unwrap();
+        super::remember_node_origins(&mut session, &connection, &found.children, &origin, true).unwrap();
+        for child in &found.children {
+            let node = child["node"].as_str().unwrap();
+            let probe = super::browse(&mut session, &json!({"id":connection.id,"node":node,"probe":true})).unwrap();
+            assert_eq!(probe["fetch"], node.split_once(':').unwrap().1);
+            let mut changed = connection.clone();
+            changed.address = "https://another.example/catalog.json".into();
+            assert!(super::node_origin(&session, &changed, node).is_none());
+        }
+        // A later public root narrows older private node grants even when it no longer lists them.
+        let public = Origin::connected(&connection.address, "93.184.216.34".parse().unwrap()).unwrap();
+        super::remember_node_origins(&mut session, &connection, &[], &public, true).unwrap();
+        assert!(super::browse(&mut session, &fake).is_err());
+        super::remember_node_origins(&mut session, &connection, &found.children, &origin, true).unwrap();
+        session.opened += 1;
+        assert!(super::browse(&mut session, &fake).is_err(), "another project cannot inherit a node's local allowance");
+    }
+
+    #[test]
+    fn invalid_catalog_children_are_counted_in_connection_notices() {
+        use crate::render::rustgis_tiles::address::Origin;
+        let mut session = crate::Session::new(crate::Project::default());
+        let origin = Origin::named("https://public.example/catalog.json");
+        let body = json!({"type":"Catalog","id":"test","links":[
+            {"rel":"child","href":"ftp://files.example/catalog.json"}, {"rel":"item","href":""}
+        ]})
+        .to_string();
+        let mark = session.notice_mark();
+        let found = super::catalogs(&mut session, body.as_bytes(), &origin).unwrap();
+        assert!(found.children.is_empty());
+        assert!(found.truncated);
+        let notices = session.notices_since(mark);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].text.contains("2 catalog links were left out because their addresses"));
+    }
+
+    #[test]
+    fn ui_browse_origin_is_scoped_to_the_current_request_and_project() {
+        use crate::render::rustgis_tiles::address::Origin;
+        let mut session = crate::Session::new(crate::Project::default());
+        let requested = "https://ui-origin.corp.example/catalog.json";
+        let saved = session.run("connection.new", &json!({"kind":"stac","address":requested})).unwrap();
+        let id = saved["id"].as_str().unwrap();
+        let body = json!({"type":"Catalog","id":"test","links":[{"rel":"child","href":"http://10.0.0.7/catalog.json"}]}).to_string();
+        let params = json!({"id":id,"answer":body,"origin":{"reach":"Local"}});
+        let raw = session.run("connection.browse", &params).unwrap();
+        assert!(raw["children"].as_array().unwrap().is_empty());
+        let origin = Origin::connected(requested, "10.0.0.7".parse().unwrap()).unwrap();
+        let opened = session.opened;
+        let found = session.browse_from_origin(&params, requested, opened, origin.clone()).unwrap();
+        assert_eq!(found["children"][0]["node"], "catalog:http://10.0.0.7/catalog.json");
+        assert!(session.browse_response.is_none());
+        assert!(session.browse_from_origin(&params, "https://changed.example/catalog.json", opened, origin.clone()).is_err());
+        session.opened += 1;
+        assert!(session.browse_from_origin(&params, requested, opened, origin.clone()).is_err());
+        let opened = session.opened;
+        // Observed Public redirects narrow a locally named entry point as well.
+        let public = Origin::connected("https://public.example/catalog.json", "93.184.216.34".parse().unwrap()).unwrap();
+        let found = session.browse_from_origin(&params, requested, opened, public).unwrap();
+        assert!(found["children"].as_array().unwrap().is_empty());
+        assert!(session.browse_response.is_none());
+    }
+
+    #[test]
+    fn listed_assets_carry_the_observed_items_public_download_ceiling() {
+        use crate::render::rustgis_tiles::address::Origin;
+        let requested = "https://catalog.corp.example/item.json";
+        let mut session = crate::Session::new(crate::Project::default());
+        for (peer, href, public) in
+            [("10.0.0.5", "http://10.0.0.5/scene.geojson", false), ("93.184.216.34", "https://public.example/scene.geojson", true)]
+        {
+            let body = json!({"type":"Feature","id":"scene","geometry":null,"properties":{},
+                "assets":{"data":{"href":href,"roles":["data"]}},"links":[]})
+            .to_string();
+            let origin = Origin::connected(requested, peer.parse().unwrap()).unwrap();
+            let found = super::item_file(&mut session, body.as_bytes(), &origin).unwrap();
+            assert_eq!(found.children[0]["href"], href);
+            assert_eq!(found.children[0]["fromDocument"], public);
+        }
+    }
+
+    #[test]
+    fn collection_search_assets_keep_the_responses_observed_origin() {
+        let mut session = crate::Session::new(crate::Project::default());
+        let requested = "https://search.corp.example/search";
+        let body = json!({"type":"FeatureCollection","features":[{
+            "type":"Feature","id":"scene","geometry":null,"properties":{},
+            "assets":{"data":{"href":"http://10.0.0.5/scene.geojson","roles":["data"]}},"links":[]
+        }]})
+        .to_string();
+        let local = super::address::Origin::connected(requested, "10.0.0.5".parse().unwrap()).unwrap();
+        let found = super::items(&mut session, body.as_bytes(), &local).unwrap();
+        assert_eq!(found.children[0]["children"][0]["href"], "http://10.0.0.5/scene.geojson");
+        assert_eq!(found.children[0]["children"][0]["fromDocument"], false);
+        let public = super::address::Origin::connected(requested, "93.184.216.34".parse().unwrap()).unwrap();
+        let found = super::items(&mut session, body.as_bytes(), &public).unwrap();
+        assert!(found.children[0]["children"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unusable_assets_are_counted_once_per_listing_and_clean_assets_stay_quiet() {
+        let mut session = crate::Session::new(crate::Project::default());
+        let origin = super::address::Origin::named("https://public.example/item.json");
+        for bad in [None, Some("http://10.0.0.5/private.geojson"), Some("ftp://files.example/scene.geojson")] {
+            let mut item = json!({"type":"Feature","id":"scene","geometry":null,"properties":{},"links":[],
+                "assets":{"data":{"href":"https://public.example/scene.geojson","roles":["data"]}}});
+            if let Some(href) = bad {
+                item["assets"]["bad"] = json!({"href":href,"roles":["data"]});
+            }
+            let mark = session.notice_mark();
+            let found = super::item_file(&mut session, item.to_string().as_bytes(), &origin).unwrap();
+            assert_eq!(found.children.len(), 1);
+            assert_eq!(found.truncated, bad.is_some());
+            let notices = session.notices_since(mark);
+            assert_eq!(notices.len(), usize::from(bad.is_some()));
+            if bad.is_some() {
+                assert!(notices[0].text.contains("1 STAC assets were left out"));
+                assert!(notices[0].text.contains("public.example/item.json"));
+            }
+            let mut second = item.clone();
+            second["id"] = json!("scene2");
+            let body = json!({"type":"FeatureCollection","features":[item,second]}).to_string();
+            let mark = session.notice_mark();
+            let found = super::items(&mut session, body.as_bytes(), &origin).unwrap();
+            assert_eq!(found.truncated, bad.is_some());
+            for child in &found.children {
+                assert_eq!(child["children"].as_array().unwrap().len(), 1);
+                assert_eq!(child.get("truncated").and_then(Value::as_bool).unwrap_or(false), bad.is_some());
+            }
+            let notices = session.notices_since(mark);
+            assert_eq!(notices.len(), usize::from(bad.is_some()));
+            if bad.is_some() {
+                assert!(notices[0].text.contains("2 STAC assets were left out"));
+            }
+        }
+    }
+
+    #[test]
+    fn browse_reports_parser_caps_and_invalid_entries_and_clean_lists_stay_quiet() {
+        let mut session = crate::Session::new(crate::Project::default());
+        let origin = super::address::Origin::named("https://public.example/search");
+        let item = |id: usize| json!({"type":"Feature","id":id.to_string(),"properties":{},"assets":{}});
+        for (count, omitted) in [(3, 0), (201, 1)] {
+            let body = json!({"features":(0..count).map(item).collect::<Vec<_>>()}).to_string();
+            let mark = session.notice_mark();
+            let found = super::items(&mut session, body.as_bytes(), &origin).unwrap();
+            assert_eq!(found.children.len(), count.min(200));
+            assert_eq!(found.truncated, omitted > 0);
+            let notices = session.notices_since(mark);
+            assert_eq!(notices.len(), usize::from(omitted > 0));
+            if omitted > 0 {
+                assert!(notices[0].text.contains("1 STAC items were left out because the response limit"));
+            }
+        }
+        let body = json!({"features":[item(0),{"type":"Feature"}]}).to_string();
+        let mark = session.notice_mark();
+        let found = super::items(&mut session, body.as_bytes(), &origin).unwrap();
+        assert_eq!(found.children.len(), 1);
+        assert!(found.truncated);
+        assert!(session.notices_since(mark)[0].text.contains("1 STAC items were left out because they were invalid"));
+
+        let mut feature = item(0);
+        for i in 0..101 {
+            feature["assets"][format!("a{i:03}")] = json!({"href":format!("https://public.example/{i}.geojson")});
+        }
+        let mark = session.notice_mark();
+        let found = super::item_file(&mut session, feature.to_string().as_bytes(), &origin).unwrap();
+        assert_eq!(found.children.len(), 100);
+        assert!(found.truncated);
+        let notices = session.notices_since(mark);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].text.contains("1 STAC assets were left out because the response limit"));
+
+        let body = json!({"features":[item(0)],"links":[{"rel":"next","href":"http://10.0.0.5/next"}]}).to_string();
+        let mark = session.notice_mark();
+        assert!(super::items(&mut session, body.as_bytes(), &origin).unwrap().truncated);
+        assert!(session.notices_since(mark)[0].text.contains("1 next-page link was refused"));
+    }
+
+    #[test]
+    fn public_catalog_nodes_keep_a_public_transport_ceiling_after_a_local_entrypoint() {
+        use crate::render::rustgis_tiles::address::{Origin, Reach};
+        let mut session = crate::Session::new(crate::Project::default());
+        let saved = session.run("connection.new", &json!({"kind":"stac","address":"http://localhost/catalog.json"})).unwrap();
+        let connection = session.connections.connections.iter().find(|c| c.id == saved["id"].as_str().unwrap()).unwrap().clone();
+        let url = "https://public-node-ceiling.example/child.json";
+        let body = json!({"type":"Catalog","id":"test","links":[{"rel":"child","href":url}]}).to_string();
+        let origin = Origin::connected("https://public.example/final.json", "93.184.216.34".parse().unwrap()).unwrap();
+        let found = super::catalogs(&mut session, body.as_bytes(), &origin).unwrap();
+        super::remember_node_origins(&mut session, &connection, &found.children, &origin, true).unwrap();
+        let probe = super::browse(&mut session, &json!({"id":connection.id,"node":found.children[0]["node"],"probe":true})).unwrap();
+        assert!(
+            super::browse(&mut session, &json!({"id":connection.id,"node":"catalog:http://10.0.0.8/private.json","probe":true})).is_err()
+        );
+        let unlisted = super::browse(
+            &mut session,
+            &json!({"id":connection.id,"node":"catalog:https://unlisted-public-node.example/catalog.json","probe":true}),
+        )
+        .unwrap();
+        assert_eq!(unlisted["fromDocument"], true);
+        assert_eq!(probe["fromDocument"], true);
+        assert_eq!(crate::render::rustgis_tiles::cache::ceiling_for(url), Reach::Public);
+    }
+
+    /// The rows `connection_use::tables` gives for a geodatabase (a class in a dataset, a class
+    /// at the root, a registered table, a spatial table the catalog doesn't register).
+    fn geodatabase_rows() -> Vec<Value> {
+        vec![
+            json!({"label": "sde.Mains", "schema": "sde", "name": "Mains", "column": "Shape", "kind": "MultiLineString", "item": "featureClass",
+                   "geometry": "lines", "dataset": "Water", "alias": "Water mains", "versioning": "traditional", "display": "Water mains"}),
+            json!({"label": "sde.Valves", "schema": "sde", "name": "Valves", "column": "Shape", "kind": "Point", "item": "featureClass",
+                   "geometry": "points", "dataset": null, "alias": null, "versioning": "none", "display": "Valves"}),
+            json!({"label": "sde.Readings", "schema": "sde", "name": "Readings", "item": "table", "dataset": null, "alias": null, "display": "Readings"}),
+            json!({"label": "dbo.Parcels", "schema": "dbo", "name": "Parcels", "column": "geom", "kind": "MultiPolygon", "item": "other"}),
+        ]
+    }
+
+    fn names(found: &super::Found) -> Vec<&str> {
+        found.children.iter().map(|c| c["name"].as_str().unwrap()).collect()
+    }
+
+    #[test]
+    fn a_geodatabase_browses_by_dataset_class_and_table() {
+        let rows = geodatabase_rows();
+        let root = super::geodatabase_tree(&rows, "mssql://gis-db/utility", None);
+        assert_eq!(names(&root), ["Feature datasets", "Valves", "Tables", "Other spatial tables"]);
+        assert_eq!(root.children[0]["what"], "folder");
+        let datasets = root.children[0]["children"].as_array().unwrap();
+        assert_eq!(datasets.len(), 1);
+        assert_eq!(datasets[0]["name"], "Water");
+        assert_eq!(datasets[0]["what"], "dataset");
+        let node = datasets[0]["node"].as_str().unwrap();
+        assert_eq!(node, format!("dataset:{}", super::URL_SAFE_NO_PAD.encode("Water")));
+        let valves = &root.children[1];
+        assert_eq!(valves["what"], "table");
+        // What it is and its kind of geometry, for the tree's icon.
+        assert_eq!((valves["item"].as_str(), valves["geometry"].as_str()), (Some("featureClass"), Some("points")));
+        assert_eq!(valves["detail"], "feature class");
+        assert_eq!(valves["add"]["command"], "layer.addDatabase");
+        assert_eq!(valves["add"]["params"]["layer"], "sde.Valves");
+        assert_eq!(valves["add"]["params"]["database"], "mssql://gis-db/utility");
+        let tables = root.children[2]["children"].as_array().unwrap();
+        assert_eq!(tables[0]["name"], "Readings");
+        assert_eq!(tables[0]["item"], "table");
+        assert!(tables[0].get("geometry").is_none());
+        assert_eq!(tables[0]["detail"], "table");
+        assert_eq!(tables[0]["add"]["params"]["layer"], "sde.Readings");
+        let other = root.children[3]["children"].as_array().unwrap();
+        assert_eq!(other[0]["add"]["params"]["layer"], "dbo.Parcels");
+
+        // The dataset's node lists its classes, by their aliases, and says how they are versioned.
+        let connection = crate::connections::Connection { kind: "sqlserver".into(), ..Default::default() };
+        let super::Level::DatabaseDataset { dataset } = super::level(&connection, node, None).unwrap() else {
+            panic!("a dataset node selects a dataset");
+        };
+        assert_eq!(dataset, "Water");
+        let water = super::geodatabase_tree(&rows, "mssql://gis-db/utility", Some(&dataset));
+        assert_eq!(names(&water), ["Water mains"]);
+        assert!(water.children[0]["detail"].as_str().unwrap().contains("traditional"));
+        assert_eq!(water.children[0]["geometry"], "lines");
+        assert_eq!(water.children[0]["add"]["params"]["layer"], "sde.Mains");
+        assert!(super::geodatabase_tree(&rows, "mssql://gis-db/utility", Some("Elsewhere")).children.is_empty());
+    }
+
+    #[test]
+    fn a_geodatabase_leaves_out_empty_folders() {
+        let rows: Vec<Value> = geodatabase_rows().into_iter().filter(|r| r["item"] == "featureClass" && r["dataset"].is_null()).collect();
+        assert_eq!(names(&super::geodatabase_tree(&rows, "mssql://gis-db/utility", None)), ["Valves"]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_geodatabase_lists_layers_without_its_registered_tables() {
+        let mut rows = geodatabase_rows();
+        rows.push(
+            json!({"label": "sde.Orphans", "schema": "sde", "name": "Orphans", "column": null, "kind": null, "item": "featureClass"}),
+        );
+        let result = super::super::connection_use::listing_result(&rows, Some(json!({"owner": "sde", "release": "11.3.0"})), None);
+        assert_eq!(result["layers"], json!(["sde.Mains", "sde.Valves", "dbo.Parcels"]));
+        assert_eq!(result["count"], 3);
+        assert_eq!(result["geodatabase"]["owner"], "sde");
+        assert!(result.get("geodatabaseProblem").is_none());
+        let plain = super::super::connection_use::listing_result(&[table("public", "roads")], None, Some("no permission".into()));
+        assert_eq!(plain["layers"], json!(["public.roads"]));
+        assert_eq!(plain["geodatabaseProblem"], "no permission");
+    }
+
+    /// A listing that fails for any reason but a refused login is kept as the problem, so the
+    /// database browses as plain SQL Server and says why.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_listing_that_fails_is_kept_as_the_problem_and_a_refused_login_ends_it() {
+        use super::super::connection_use::listing_or_problem;
+        use rustgis_data::DataError;
+        assert_eq!(listing_or_problem(Ok(Some(1))).unwrap(), (Some(1), None));
+        assert_eq!(listing_or_problem::<u8>(Ok(None)).unwrap(), (None, None));
+        let (listing, problem) = listing_or_problem::<u8>(Err(DataError::Format("the server took longer than 120 s".into()))).unwrap();
+        assert!(listing.is_none());
+        assert!(problem.is_some_and(|why| why.contains("took longer than 120 s")));
+        assert!(matches!(listing_or_problem::<u8>(Err(DataError::Login("refused".into()))), Err(DataError::Login(_))));
+    }
+
+    /// A spatial table the catalog doesn't register carries every field the others do.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn an_unregistered_spatial_table_has_every_item_field() {
+        use rustgis_data::source::sqlserver::{GdbListing, Table};
+        let parcels = Table {
+            schema: "dbo".into(),
+            name: "Parcels".into(),
+            column: "geom".into(),
+            kind: "geometry".into(),
+            current: false,
+            several: false,
+            alias: None,
+            dataset: None,
+            short: None,
+        };
+        let listing = GdbListing { datasets: Vec::new(), classes: Vec::new(), tables: Vec::new(), other: vec![parcels], cut: false };
+        let rows = super::super::connection_use::geodatabase_rows(listing);
+        let row = rows.first().and_then(Value::as_object).unwrap();
+        assert_eq!(row["item"], "other");
+        for field in ["dataset", "alias", "versioning"] {
+            assert!(row.get(field).is_some_and(Value::is_null), "{field}: {row:?}");
+        }
+        // Its display is what the tree shows: the name with its schema, as two schemas may hold
+        // a table of one name.
+        assert_eq!(row["display"], "dbo.Parcels");
+        assert_eq!(row["label"], "dbo.Parcels");
+        let tree = super::geodatabase_tree(&rows, "mssql://gis-db/utility", None);
+        assert_eq!(tree.children[0]["children"][0]["name"], row["display"]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_class_without_a_spatial_table_is_listed_but_is_not_a_layer() {
+        use rustgis_data::source::geodatabase::{Item, ItemKind, Versioning};
+        use rustgis_data::source::sqlserver::{GdbListing, Table};
+        let item = |name: &str, kind| Item {
+            name: format!("utility.sde.{name}"),
+            schema: "sde".into(),
+            table: name.to_uppercase(),
+            kind,
+            dataset: None,
+            alias: None,
+            shape_column: Some("Shape".into()),
+            field_aliases: Vec::new(),
+            versioning: Versioning::Unversioned,
+            definition_ok: true,
+            family: None,
+            archived: false,
+            rowid_column: None,
+            srid: None,
+        };
+        let valves = Table {
+            schema: "sde".into(),
+            name: "VALVES".into(),
+            column: "Shape".into(),
+            kind: "geometry".into(),
+            current: false,
+            several: false,
+            alias: None,
+            dataset: None,
+            short: Some("Valves".into()),
+        };
+        let listing = GdbListing {
+            datasets: Vec::new(),
+            classes: vec![(item("Valves", ItemKind::FeatureClass), Some(valves)), (item("Orphans", ItemKind::FeatureClass), None)],
+            tables: vec![item("Readings", ItemKind::Table)],
+            other: Vec::new(),
+            cut: false,
+        };
+        let rows = super::super::connection_use::geodatabase_rows(listing);
+        // A class's kind of geometry is its definition's; one that doesn't say has none.
+        let valves = rows.iter().find(|r| r["name"] == "VALVES").unwrap();
+        assert!(valves["geometry"].is_null());
+        let mut lines = item("Mains", ItemKind::FeatureClass);
+        lines.family = Some(rustgis_data::source::Family::Lines);
+        let listing = GdbListing { datasets: Vec::new(), classes: vec![(lines, None)], tables: Vec::new(), other: Vec::new(), cut: false };
+        assert_eq!(super::super::connection_use::geodatabase_rows(listing)[0]["geometry"], "lines");
+        let orphans = rows.iter().find(|r| r["name"] == "ORPHANS").unwrap();
+        assert!(orphans["column"].is_null() && orphans["kind"].is_null());
+        assert_eq!(orphans["label"], "sde.ORPHANS");
+        let result = super::super::connection_use::listing_result(&rows, None, None);
+        assert_eq!(result["layers"], json!(["sde.VALVES"]));
+        assert_eq!(result["count"], 1);
+        // Even a hand-built row that names a shape column isn't a layer without a geometry kind.
+        let named = [json!({"label": "sde.Orphans", "column": "Shape", "kind": null, "item": "featureClass"})];
+        assert!(super::super::connection_use::listing_result(&named, None, None)["layers"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_cut_or_unread_catalog_is_noted() {
+        let cut = json!({"owner": "sde", "release": "11.3.0", "note": "only the first 10000 are shown"});
+        assert_eq!(super::listing_note(Some(&cut), None).as_deref(), Some("only the first 10000 are shown"));
+        assert_eq!(super::listing_note(Some(&json!({"owner": "sde"})), None), None);
+        let unread = super::listing_note(None, Some("no permission")).unwrap();
+        assert!(unread.contains("couldn't be read") && unread.contains("no permission"), "{unread}");
+    }
+
+    #[test]
+    fn a_plain_database_still_browses_schemas() {
+        let tables = vec![table("tiger", "addr"), table("public", "roads")];
+        assert!(!super::is_geodatabase(&tables));
+        assert!(super::is_geodatabase(&geodatabase_rows()));
+        assert_eq!(names(&super::schemas(&tables)), ["public", "tiger"]);
     }
 }

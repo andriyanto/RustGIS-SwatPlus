@@ -2,6 +2,11 @@
 //! answers in `reference/cases.json`, worked out by GEOS (the geometry engine of QGIS and PostGIS)
 //! with `reference/generate.py`. Every case runs and every difference is reported together.
 //!
+//! A case marked `known` fails for a reason with an open issue. It must still agree within the
+//! mark's looser tolerance, so it fails the test only if it gets worse; its differences are printed
+//! (`cargo test --test reference -- --nocapture` shows them). Once it agrees within the case's own
+//! tolerance, the test fails until the mark is removed from `generate.py`.
+//!
 //! When a case fails, fix the tool with RustGIS's own code. Don't translate GEOS's source to make
 //! it pass: GEOS is LGPL-2.1, and RustGIS is Apache-2.0 with no third-party code.
 
@@ -99,7 +104,7 @@ fn polygons(gs: &[Geometry]) -> MultiPolygon<f64> {
     MultiPolygon::new(gs.iter().filter_map(to_multipolygon).flat_map(|m| m.0).collect())
 }
 
-/// The lines among `gs`, together, in Web Mercator metres.
+/// The lines among `gs`, together, in the analysis plane.
 fn lines(gs: &[Geometry]) -> MultiLineString<f64> {
     MultiLineString::new(gs.iter().filter_map(to_multiline).flat_map(|m| m.0).collect())
 }
@@ -119,8 +124,9 @@ fn kinds(gs: &[Geometry]) -> Vec<&'static str> {
     out
 }
 
-/// How one geometry differs from the reference, if it does beyond the tolerances.
-fn compare_geometry(got: &[Geometry], want: &[Geometry]) -> Option<String> {
+/// How one geometry differs from the reference, if it does beyond the tolerances; `area_tolerance`
+/// is the fraction of a polygon's area the two may not share.
+fn compare_geometry(got: &[Geometry], want: &[Geometry], area_tolerance: f64) -> Option<String> {
     // The comparisons below look only at the reference's kind of geometry, so another kind in the
     // output would go unseen.
     if kinds(got) != kinds(want) {
@@ -131,7 +137,7 @@ fn compare_geometry(got: &[Geometry], want: &[Geometry]) -> Option<String> {
         // The area the two don't share, not vertex positions: GEOS keeps vertices partway along a
         // straight edge that other engines drop, with the same shape.
         let (area, off) = (w.unsigned_area(), g.xor(&w).unsigned_area());
-        (off > AREA_TOLERANCE * area)
+        (off > area_tolerance * area)
             .then(|| format!("area {:.1} m² vs {area:.1} m²; {off:.1} m² ({:.2e} of it) not shared", g.unsigned_area(), off / area))
     } else {
         let (g, w) = (lines(got), lines(want));
@@ -167,10 +173,12 @@ fn check(case: &Json, layers: &Layers) -> Vec<String> {
         let id = ["id".to_string()];
         let want = by_key(&read_layer(&dir().join(path), "expected"), key.as_ref().map(|_| id.as_slice()));
         let got = by_key(&ds, key.as_deref());
+        // A case may loosen the area tolerance, for a tool that approximates curves (Buffer).
+        let tolerance = expect["tolerance"].as_f64().unwrap_or(AREA_TOLERANCE);
         for (k, w) in &want {
             match got.get(k) {
                 None => problems.push(format!("{k}: missing (the reference has it)")),
-                Some(g) => problems.extend(compare_geometry(g, w).map(|d| format!("{k}: {d}"))),
+                Some(g) => problems.extend(compare_geometry(g, w, tolerance).map(|d| format!("{k}: {d}"))),
             }
         }
         for k in got.keys().filter(|k| !want.contains_key(*k)) {
@@ -223,6 +231,32 @@ fn check(case: &Json, layers: &Layers) -> Vec<String> {
             let (got, want) = (text(&ds, row, field), values.get(&id).and_then(json_text));
             if got != want {
                 problems.push(format!("{id}: {field} {got:?}, the reference {want:?}"));
+            }
+        }
+    } else if let Some(numbers) = expect["numbers"].as_object() {
+        // Measurements per feature by id, each within a fraction `tolerance` of the reference.
+        let Some(ds) = layer_of(result.output) else { return vec!["no layer came out".into()] };
+        let tolerance = expect["tolerance"].as_f64().unwrap_or(0.0);
+        let mut ids: Vec<String> = (0..ds.features.len()).map(|row| text(&ds, row, "id").unwrap_or_default()).collect();
+        let mut want_ids: Vec<String> = numbers.keys().cloned().collect();
+        ids.sort();
+        want_ids.sort();
+        if ids != want_ids {
+            problems.push(format!("features {ids:?}, the reference {want_ids:?}"));
+        }
+        for row in 0..ds.features.len() {
+            let id = text(&ds, row, "id").unwrap_or_default();
+            let Some(fields) = numbers.get(&id).and_then(Json::as_object) else {
+                problems.push(format!("{id}: no measurements in the reference"));
+                continue;
+            };
+            for (field, want) in fields {
+                let want = want.as_f64().unwrap_or(f64::NAN);
+                let got = ds.field_index(field).and_then(|fi| ds.value(row, fi).as_f64());
+                match got {
+                    Some(got) if (got - want).abs() <= tolerance * want.abs() => {}
+                    got => problems.push(format!("{id}: {field} {got:?}, the reference {want} (±{:.1e})", tolerance * want.abs())),
+                }
             }
         }
     } else if let Some(pairs) = expect["pairs"].as_array() {
@@ -283,18 +317,108 @@ fn tools_agree_with_the_reference() {
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let cases: Json = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let layers = Layers(
-        ["parcels", "zones", "points", "roads", "stations"]
+        ["parcels", "zones", "points", "roads", "stations", "long"]
             .into_iter()
             .map(|n| (n.to_string(), read_layer(&dir().join(format!("layers/{n}.geojson")), n)))
             .collect(),
     );
     let mut report = Vec::new();
     for case in cases["cases"].as_array().expect("cases.json has a \"cases\" list") {
+        let name = case["name"].as_str().unwrap_or("?");
         let problems = check(case, &layers);
-        if !problems.is_empty() {
-            report.push(format!("{}:\n    {}", case["name"].as_str().unwrap_or("?"), problems.join("\n    ")));
+        let known = &case["known"];
+        match (known["issue"].as_str(), problems.is_empty()) {
+            (Some(issue), false) => {
+                // Within the known bound: the case as written, with the mark's tolerance.
+                let mut loose = case.clone();
+                loose["expect"]["tolerance"] = known["tolerance"].clone();
+                let worse = check(&loose, &layers);
+                if worse.is_empty() {
+                    eprintln!("{name}: still differs ({issue}):\n    {}", problems.join("\n    "));
+                } else {
+                    report.push(format!("{name}: differs beyond its known bound ({issue}):\n    {}", worse.join("\n    ")));
+                }
+            }
+            (Some(issue), true) => report.push(format!("{name}: agrees now; remove its `known` mark ({issue}) from generate.py")),
+            (None, false) => report.push(format!("{name}:\n    {}", problems.join("\n    "))),
+            (None, true) => {}
         }
     }
     let n = cases["cases"].as_array().map_or(0, Vec::len);
     assert!(report.is_empty(), "{} of {n} cases differ from the reference:\n{}", report.len(), report.join("\n"));
+}
+
+/// The generated oracle uses the exact projected inputs the tool sees. Return each polygon's
+/// rings in that plane for Shapely, including the actual output after RustGIS's round trip.
+fn overlay_coordinates(g: &Geometry) -> Json {
+    let Some(polygons) = to_multipolygon(g) else { return serde_json::json!("non-polygon") };
+    let rings: Vec<_> = polygons
+        .0
+        .iter()
+        .map(|p| {
+            std::iter::once(p.exterior())
+                .chain(p.interiors())
+                .map(|ring| ring.0.iter().map(|c| [c.x, c.y]).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    serde_json::json!(rings)
+}
+
+/// A batch from generate.py. Test-harness output and tool diagnostics stay off the reply file.
+#[test]
+#[ignore = "driven by generate.py --overlay with a batch and reply path"]
+fn generated_overlay_batch() {
+    let batch: Json = serde_json::from_reader(std::io::stdin().lock()).expect("overlay batch");
+    let mut replies = Vec::new();
+    for case in batch.as_array().expect("list of overlay cases") {
+        let layers = Layers(
+            ["a", "b"]
+                .into_iter()
+                .map(|name| {
+                    let features: Vec<_> = case[name]
+                        .as_array()
+                        .expect("input features")
+                        .iter()
+                        .enumerate()
+                        .map(|(i, g)| serde_json::json!({"type": "Feature", "geometry": g, "properties": {"id": i.to_string()}}))
+                        .collect();
+                    let collection = serde_json::json!({"type": "FeatureCollection", "features": features});
+                    let ds = rustgis_data::io::read_geojson(&collection.to_string(), name).expect("generated polygon layer").0;
+                    (name.to_string(), ds)
+                })
+                .collect(),
+        );
+        let projected = |name: &str| {
+            layers.0[name].features.iter().map(|f| overlay_coordinates(f.geometry.as_ref().expect("generated polygon"))).collect::<Vec<_>>()
+        };
+        let mut reply = serde_json::json!({"a": projected("a"), "b": projected("b")});
+        for tool in case["tools"].as_array().expect("overlay tools").iter().map(|t| t.as_str().expect("tool id")) {
+            let mask = match tool {
+                "clip" | "erase" => tool,
+                _ => "overlay",
+            };
+            let params = serde_json::json!({"input": "a", (mask): "b"});
+            reply[tool] = match rustgis_analysis::run(tool, &layers, &params) {
+                Ok(result) => {
+                    let ds = layer_of(result.output).expect("overlay layer");
+                    let keys = if mask == "overlay" { vec!["id".into(), "id_2".into()] } else { vec!["id".into()] };
+                    let rows: Vec<_> = ds
+                        .features
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| {
+                            let key = key_text(&ds, i, Some(&keys));
+                            serde_json::json!([key, f.geometry.as_ref().map(overlay_coordinates)])
+                        })
+                        .collect();
+                    serde_json::json!(rows)
+                }
+                Err(e) => serde_json::json!(e),
+            };
+        }
+        replies.push(reply);
+    }
+    let path = std::env::var_os("RUSTGIS_OVERLAY_REPLY").expect("reply path from generate.py");
+    serde_json::to_writer(std::fs::File::create(path).expect("create overlay reply"), &replies).expect("write overlay reply");
 }

@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::mapview::Toast;
 use crate::theme::{Tokens, regular, semibold};
-use crate::widgets::{row_button, small, text_w, why_disabled};
+use crate::widgets::{row_button, selectable_menu_row, small, text_w, why_disabled};
 use crate::{RustGisApp, icons};
 
 /// The native title bar the header is drawn into (macOS: a transparent title bar over a
@@ -78,6 +78,7 @@ pub fn header_layout(titlebar: Option<TitlebarMetrics>) -> HeaderLayout {
     }
 }
 
+/// Draws the project controls and command search, giving the toolbar priority when the window narrows.
 pub fn header(app: &mut RustGisApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let layout = header_layout(app.ui.titlebar);
@@ -112,51 +113,17 @@ pub fn header(app: &mut RustGisApp, ui: &mut Ui) {
             }
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
-                let (r, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
-                app.paint_logo(ui, r);
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(tl!("RustGIS")).font(semibold(13.0)).color(t.text));
-                ui.add_space(10.0);
-                // Quick Access Toolbar.
-                small(ui, app, "new", "", "New project", "project.new", Value::Null, false);
-                small(ui, app, "open", "", "Open project", "ui.open", Value::Null, false);
-                small(ui, app, "save", "", "Save project", "ui.save", Value::Null, false);
-                small(
-                    ui,
-                    app,
-                    "undo",
-                    "",
-                    app.session
-                        .undo_label()
-                        .map(|l| crate::i18n::fmt("Undo {action}", &[("action", tl_raw!(l))]))
-                        .unwrap_or(tl!("Undo").into())
-                        .as_str(),
-                    "edit.undo",
-                    Value::Null,
-                    false,
-                );
-                small(
-                    ui,
-                    app,
-                    "redo",
-                    "",
-                    app.session
-                        .redo_label()
-                        .map(|l| crate::i18n::fmt("Redo {action}", &[("action", tl_raw!(l))]))
-                        .unwrap_or(tl!("Redo").into())
-                        .as_str(),
-                    "edit.redo",
-                    Value::Null,
-                    false,
-                );
-                for id in app.ui.quick_access.clone() {
-                    let label = crate::ribbon::QUICK.iter().find(|q| q.0 == id).map_or(id.as_str(), |q| q.1).to_string();
-                    small(ui, app, crate::ribbon::quick_icon(&id), "", &label, &id, Value::Null, false);
+                let separate_search =
+                    full.max.x - ui.cursor().min.x >= COMPACT_SEARCH_WIDTH + TOOLBAR_GAP + crate::widgets::SMALL_ICON_BUTTON_WIDTH;
+                header_branding(ui, app, full.max.x, &t);
+                quick_access(ui, app, full.max.x, separate_search);
+                if !separate_search {
+                    return;
                 }
                 // Everything right of the Quick Access Toolbar is laid out by measuring, so on a
                 // narrow window the search box shrinks to an icon and the title shortens or hides
                 // instead of overlapping other controls.
-                let qat_end = ui.cursor().min.x + 8.0;
+                let qat_end = ui.cursor().min.x + TOOLBAR_GAP;
                 // Command search on the right: full width when there is room, a round icon button
                 // otherwise. It never reaches into the toolbar.
                 let label = tl!("Command Search");
@@ -172,7 +139,7 @@ pub fn header(app: &mut RustGisApp, ui: &mut Ui) {
                 } else if room >= 150.0 + reserve {
                     (room - reserve).clamp(150.0, full_w)
                 } else {
-                    26.0
+                    COMPACT_SEARCH_WIDTH
                 };
                 let sr = Rect::from_min_max(pos2(right - sw, full.center().y - 12.0), pos2(right, full.center().y + 12.0));
                 let resp = ui.interact(sr, egui::Id::unique("command_search_box"), Sense::click());
@@ -222,6 +189,188 @@ pub fn header(app: &mut RustGisApp, ui: &mut Ui) {
         });
 }
 
+const HISTORY: &str = "ui.undoHistory";
+const COMPACT_SEARCH_WIDTH: f32 = 26.0;
+const TOOLBAR_GAP: f32 = 8.0;
+const HISTORY_MENU_WIDTH: f32 = 260.0;
+
+/// Gives the overflow and search buttons priority over branding on a narrow canvas.
+fn header_branding(ui: &mut Ui, app: &mut RustGisApp, right: f32, tokens: &Tokens) {
+    let spacing = ui.spacing().item_spacing.x;
+    let controls = COMPACT_SEARCH_WIDTH + TOOLBAR_GAP + crate::widgets::SMALL_ICON_BUTTON_WIDTH + spacing;
+    let room = right - ui.cursor().min.x - controls;
+    let logo = 24.0;
+    let gutter = 10.0;
+    if room < logo + gutter + spacing {
+        return;
+    }
+    let (rect, _) = ui.allocate_exact_size(vec2(logo, logo), Sense::hover());
+    app.paint_logo(ui, rect);
+    let name = tl!("RustGIS");
+    let font = semibold(13.0);
+    let name_gap = 6.0;
+    if right - ui.cursor().min.x - controls >= gutter + name_gap + text_w(ui, name, font.clone()) + spacing {
+        ui.add_space(name_gap);
+        ui.label(egui::RichText::new(name).font(font).color(tokens.text));
+    }
+    ui.add_space(gutter);
+}
+
+/// Fits as many toolbar items as the header has room for. At the narrowest width, search joins the overflow.
+fn quick_access(ui: &mut Ui, app: &mut RustGisApp, right: f32, separate_search: bool) {
+    let pinned = app.ui.quick_access.clone();
+    let mut items = vec![
+        ("project.new", "new", "New project"),
+        ("ui.open", "open", "Open project"),
+        ("ui.save", "save", "Save project"),
+        ("edit.undo", "undo", "Undo"),
+        ("edit.redo", "redo", "Redo"),
+        (HISTORY, "history", "Undo History"),
+    ];
+    items.extend(pinned.iter().map(|id| {
+        let label = crate::ribbon::QUICK.iter().find(|q| q.0 == id).map_or(id.as_str(), |q| q.1);
+        (id.as_str(), crate::ribbon::quick_icon(id), label)
+    }));
+    if !separate_search && !pinned.iter().any(|id| id == "ui.commandSearch") {
+        items.push(("ui.commandSearch", "search", "Command Search"));
+    }
+    let spacing = ui.spacing().item_spacing.x;
+    let width = crate::widgets::SMALL_ICON_BUTTON_WIDTH + spacing;
+    // The spacing between toolbar buttons does not need another slot after the last button.
+    let search_space = if separate_search { COMPACT_SEARCH_WIDTH + TOOLBAR_GAP } else { 0.0 };
+    let slots = ((right - search_space - ui.cursor().min.x + spacing) / width).max(0.0) as usize;
+    let direct = if items.len() <= slots { items.len() } else { slots.saturating_sub(1) };
+    let (visible, overflow) = items.split_at(direct);
+    for &(id, icon, label) in visible {
+        if id == HISTORY {
+            let button = small(ui, app, icon, "", label, "ui.menu", Value::Null, false);
+            history_popup(&button).show(|ui| undo_history_rows(ui, app, button.clicked()));
+        } else {
+            let tooltip = match id {
+                "edit.undo" => app.session.undo_label().map(|action| crate::i18n::fmt("Undo {action}", &[("action", tl_raw!(action))])),
+                "edit.redo" => app.session.redo_label().map(|action| crate::i18n::fmt("Redo {action}", &[("action", tl_raw!(action))])),
+                _ => None,
+            };
+            small(ui, app, icon, "", tooltip.as_deref().unwrap_or(label), id, Value::Null, false);
+        }
+    }
+    if slots > 0 && !overflow.is_empty() {
+        let button = small(ui, app, "chevron_down", "", "More Quick Access commands", "ui.menu", Value::Null, false);
+        use egui::containers::menu::MenuConfig;
+        let close = egui::PopupCloseBehavior::CloseOnClickOutside;
+        let info = egui::UiStackInfo::new(egui::UiKind::Menu)
+            .with_tag_value(MenuConfig::MENU_CONFIG_TAG, MenuConfig::default().close_behavior(close));
+        egui::Popup::menu(&button).close_behavior(close).info(info).show(|ui| {
+            for &(id, icon, label) in overflow {
+                if id == HISTORY {
+                    crate::widgets::submenu_row(ui, icon, tl!(label), |ui| undo_history_rows(ui, app, false));
+                } else if crate::widgets::menu_row(ui, icon, tl!(label), "", crate::widgets::enabled(app, id)).clicked() {
+                    let _ = app.run_by_user(id, Value::Null);
+                    ui.close();
+                }
+            }
+        });
+    }
+}
+
+/// Creates a popup where clicks on the scrollbar keep the history list open.
+fn history_popup(button: &egui::Response) -> egui::Popup<'_> {
+    egui::Popup::menu(button).width(HISTORY_MENU_WIDTH).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+}
+
+/// Shows all retained states. Activating a row queues the steps that lead to that state.
+fn undo_history_rows(ui: &mut Ui, app: &mut RustGisApp, opening: bool) {
+    ui.set_width(HISTORY_MENU_WIDTH);
+    ui.strong(tl!("Undo History"));
+    if !app.session.can_undo() && !app.session.can_redo() {
+        ui.label(tl!("No project changes to undo or redo."));
+        return;
+    }
+    let current = app.session.undo_depth();
+    let position = app.session.history_position();
+    // A step labels the state reached by applying it. The oldest state precedes all the
+    // retained steps, including when the stack has reached its limit.
+    let changes = app.session.undo_labels().chain(app.session.redo_labels());
+    let states: Vec<_> = std::iter::once(None).chain(changes.map(Some)).collect();
+    // Invalidate pointer gestures when commands change the history or its current position.
+    ui.push_id(position, |ui| {
+        egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, true]).show(ui, |ui| {
+            for (index, action) in states.into_iter().enumerate().rev() {
+                let (icon, command) = match index.cmp(&current) {
+                    std::cmp::Ordering::Less => ("undo", Some("edit.undo")),
+                    std::cmp::Ordering::Equal => ("history", None),
+                    std::cmp::Ordering::Greater => ("redo", Some("edit.redo")),
+                };
+                let selected = command.is_none();
+                let label = if selected {
+                    let action = action.map_or_else(|| tl_raw!("Earliest available state"), crate::i18n::t_raw);
+                    crate::i18n::fmt("Current: {action}", &[("action", action)])
+                } else {
+                    action.map_or_else(|| tl!("Earliest available state"), crate::i18n::t).into()
+                };
+                let row = selectable_menu_row(ui, icon, &label, selected);
+                if selected && opening {
+                    row.scroll_to_me(Some(egui::Align::Center));
+                }
+                if row.clicked()
+                    && let Some(command) = command
+                {
+                    let total = index.abs_diff(current);
+                    app.ui.history_jump = Some(HistoryJump { command, position, total, done: 0, cancel_pressed: false });
+                    ui.ctx().request_repaint();
+                    ui.close();
+                }
+            }
+        });
+    });
+}
+
+/// The remaining steps and the project history they were selected from.
+pub(crate) struct HistoryJump {
+    command: &'static str,
+    position: (u64, u64),
+    total: usize,
+    done: usize,
+    cancel_pressed: bool,
+}
+
+/// Advances a jump within the frame budget. Each step uses the UI's normal undo/redo cleanup.
+/// A step already in progress finishes before yielding. Project changes invalidate the rest.
+pub(crate) fn advance_history_jump(app: &mut RustGisApp, ctx: &egui::Context) {
+    if app.ui.backstage
+        || crate::saveprompt::waiting(app)
+        || app.save_prompt.closing
+        || app.dialogs.open.is_some()
+        || ctx.memory(|memory| memory.top_modal_layer()).is_some()
+        || ctx.current_pass_index() != 0
+    {
+        return;
+    }
+    let Some(mut jump) = app.ui.history_jump.take() else { return };
+    if jump.cancel_pressed {
+        app.ui.history_jump = Some(jump);
+        return;
+    }
+    if app.session.history_position() != jump.position {
+        app.session.notify(tl!("The history jump stopped because the project changed."), false);
+        return;
+    }
+    ctx.request_repaint();
+    let start = web_time::Instant::now();
+    while jump.done < jump.total {
+        if app.run_by_user(jump.command, Value::Null).is_err() {
+            return;
+        }
+        jump.done += 1;
+        if jump.done < jump.total && start.elapsed() >= std::time::Duration::from_millis(8) {
+            jump.position = app.session.history_position();
+            app.ui.history_jump = Some(jump);
+            return;
+        }
+    }
+}
+
+/// Shows map readouts and progress controls for work the user can cancel.
 pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     egui::Panel::bottom("status")
@@ -233,6 +382,20 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
             ui.painter().line_segment([pos2(r.min.x - 10.0, r.min.y), pos2(r.max.x + 10.0, r.min.y)], Stroke::new(1.0, t.border));
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing = vec2(10.0, 0.0);
+                if let Some(jump) = &mut app.ui.history_jump {
+                    let action = if jump.command == "edit.undo" { tl_raw!("Undo") } else { tl_raw!("Redo") };
+                    ui.label(crate::i18n::fmt(
+                        "{action} {done} of {total}",
+                        &[("action", action), ("done", &jump.done.to_string()), ("total", &jump.total.to_string())],
+                    ));
+                    let cancel = ui.small_button(tl!("Cancel")).on_hover_text(tl!("Stop at the state reached so far"));
+                    // A press and its release may arrive in different frames.
+                    jump.cancel_pressed = cancel.is_pointer_button_down_on();
+                    if cancel.clicked() {
+                        app.ui.history_jump = None;
+                    }
+                    sep(ui, &t);
+                }
                 // Scale: typed (1:12,345, 12345, 25k, …) and set with Enter, or picked from the
                 // list. Esc, or clicking away, leaves the map's scale as it was.
                 let scale = app.session.scale();
@@ -303,16 +466,20 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                 }
                 sep(ui, &t);
                 // Pointer coordinates.
-                let coord = app
-                    .map
-                    .pointer_lonlat
-                    .map(|c| if app.map.dms { rustgis_engine::geom::format_dms(c) } else { rustgis_engine::geom::format_lonlat(c) });
+                let format = app.map.coord_format;
+                let earth = app.session.map().body().is_earth();
+                // Kept after the pointer leaves the map, so a click here still shows the position;
+                // dimmed then, to tell it from a live one.
+                let kept = app.map.kept_pointer_lonlat(app.session.map().instance_id(), app.session.opened);
+                let live = app.map.pointer_lonlat.is_some();
                 let resp = ui.add(
-                    egui::Label::new(egui::RichText::new(coord.unwrap_or_else(|| "—".into())).monospace().size(11.5).color(t.text_dim))
-                        .sense(Sense::click()),
+                    egui::Label::new(
+                        egui::RichText::new(format.readout(kept, earth, crate::coordreadout::MapSystem::of(app.session.map()).as_ref())).monospace().size(11.5).color(if live { t.text_dim } else { t.text_disabled }),
+                    )
+                    .sense(Sense::click()),
                 );
-                if resp.on_hover_text(tl!("Click to switch between decimal degrees and DMS")).clicked() {
-                    app.map.dms = !app.map.dms;
+                if resp.on_hover_text(format.hover()).clicked() {
+                    let _ = app.run("ui.coordinateFormat", Value::Null);
                 }
                 let projection = match &app.session.map().projection {
                     rustgis_engine::map::Projection::Globe => tl!("WGS 84 / Globe").to_string(),
@@ -338,6 +505,26 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                     if resp.on_hover_text(tl!("Clear selection")).clicked() {
                         let _ = app.run("select.clear", Value::Null);
                     }
+                }
+                // An export writing its file: its progress and Cancel.
+                #[cfg(not(target_arch = "wasm32"))]
+                if app.export_job.is_some() {
+                    sep(ui, &t);
+                    crate::exportjob::status(app, ui, &t);
+                }
+                // A file read for Add Data, or a layer's features for Load All.
+                #[cfg(not(target_arch = "wasm32"))]
+                if crate::readjob::showing(app) {
+                    sep(ui, &t);
+                    crate::readjob::status(app, ui, &t);
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                source_open_status(app, ui, &t);
+                crate::geocodeui::status(app, ui);
+                // Downloads and windows being read off the frame, each with its Cancel.
+                if !app.ui.downloads.is_empty() || window_reads_under_way(app) {
+                    sep(ui, &t);
+                    downloads_status(app, ui, &t);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // The CPU/GPU backend toggle, then the frame rate (live while the map moves,
@@ -416,18 +603,157 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                             sep(ui, &t);
                         }
                     }
-                    // Cut to the room left (the whole notice on hover), so a long one doesn't run
-                    // over the selection count and coordinates.
-                    if let Some(n) = app.session.notices.last() {
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(&n.text).size(11.5).color(if n.error { t.red } else { t.text_dim }))
+                    if ui.small_button(tl!("Messages")).on_hover_text(tl!("Review messages and failed network requests")).clicked() {
+                        app.ui.open_right(crate::RightPane::DiagnosticLog);
+                    }
+                    // Cut to the room left (the whole notice on hover), so it doesn't run
+                    // over the selection count and coordinates. A click opens its history.
+                    if let Some(running) = crate::pluginstart::running(app) {
+                        ui.add(egui::Label::new(egui::RichText::new(running).size(11.5).color(t.accent)).truncate());
+                    } else if let Some(waiting) = crate::pluginpanel::pick_hint(app) {
+                        // A plugin's pick says what it waits for on the map.
+                        ui.add(egui::Label::new(egui::RichText::new(waiting).size(11.5).color(t.accent)).truncate());
+                    } else if let Some((n, text)) = app.session.notices.last().map(|n| (n, notice_text(n)))
+                        && ui.add(
+                            egui::Button::new(egui::RichText::new(&text).size(11.5).color(if n.error { t.red } else { t.text_dim }))
+                                .frame(false)
+                                .small()
                                 .truncate(),
                         )
-                        .on_hover_text(&n.text);
+                        .on_hover_text(notice_hover(n))
+                        .clicked() {
+                        app.ui.open_right(crate::RightPane::DiagnosticLog);
                     }
                 });
             });
         });
+}
+
+/// Restored local FlatGeobuf layers classify dates off the frame, including hidden maps.
+/// This status keeps progress and Cancel available until those scans finish.
+#[cfg(not(target_arch = "wasm32"))]
+fn source_open_status(app: &RustGisApp, ui: &mut Ui, t: &Tokens) {
+    let sources: Vec<_> = app
+        .session
+        .project
+        .maps
+        .iter()
+        .flat_map(|m| &m.layers)
+        .filter_map(|l| l.source.as_ref())
+        .filter_map(|s| s.opening_progress().map(|p| (s, p)))
+        .collect();
+    if sources.is_empty() {
+        return;
+    }
+    sep(ui, t);
+    ui.spinner();
+    ui.label(egui::RichText::new(tl!("Reading dates…")).size(11.5).color(t.text_dim));
+    let (done, total) =
+        sources.iter().fold((0u64, 0u64), |(done, total), (_, (d, n, _))| (done.saturating_add(*d), total.saturating_add(*n)));
+    if total > 0 && sources.iter().all(|(_, (_, n, _))| *n > 0) {
+        ui.add(egui::ProgressBar::new((done as f32 / total as f32).min(1.0)).show_percentage().desired_width(120.0).desired_height(12.0));
+    }
+    if ui.add_enabled(sources.iter().any(|(_, (_, _, cancelled))| !cancelled), egui::Button::new(tl!("Cancel")).small()).clicked() {
+        for (source, _) in sources {
+            source.cancel_opening();
+        }
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+}
+
+/// Whether work is running that the status bar shows with its progress and Cancel: an export, a
+/// file or a layer being read, a download.
+pub(crate) fn background_busy(app: &RustGisApp) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    if app.export_job.is_some() || crate::readjob::showing(app) || sources_opening(app) {
+        return true;
+    }
+    !app.ui.downloads.is_empty() || window_reads_under_way(app)
+}
+
+/// That work's progress and Cancel, as the status bar draws them, for a shell without one.
+pub(crate) fn background_status(app: &mut RustGisApp, ui: &mut Ui) {
+    let t = Tokens::get(ui.ctx());
+    #[cfg(not(target_arch = "wasm32"))]
+    if app.export_job.is_some() {
+        crate::exportjob::status(app, ui, &t);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::readjob::showing(app) {
+        crate::readjob::status(app, ui, &t);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    source_open_status(app, ui, &t);
+    if !app.ui.downloads.is_empty() || window_reads_under_way(app) {
+        downloads_status(app, ui, &t);
+    }
+}
+
+/// Whether a restored layer's dates are still being read ([`source_open_status`] shows them).
+#[cfg(not(target_arch = "wasm32"))]
+fn sources_opening(app: &RustGisApp) -> bool {
+    app.session.project.maps.iter().flat_map(|m| &m.layers).filter_map(|l| l.source.as_ref()).any(|s| s.opening_progress().is_some())
+}
+
+/// Whether windows or PDF pages are being read off the frame (none in the browser).
+fn window_reads_under_way(app: &RustGisApp) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    return !app.ui.window_reads.is_empty() || !app.ui.page_reads.is_empty() || !app.ui.page_queue.is_empty();
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = app;
+        false
+    }
+}
+
+/// The downloads under way in the status bar, each with how far it has come and its Cancel
+/// (`RustGisApp::cancel_download`): one in the bar itself, several as a menu of them.
+fn downloads_status(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
+    let under_way = app.downloads_under_way();
+    let mut cancel = None;
+    ui.spinner();
+    match under_way.as_slice() {
+        [] => {}
+        [one] => download_row(ui, t, one, &mut cancel),
+        many => {
+            ui.menu_button(crate::i18n::fmt("{n} downloads", &[("n", &many.len().to_string())]), |ui| {
+                for d in many {
+                    ui.horizontal(|ui| download_row(ui, t, d, &mut cancel));
+                }
+            });
+        }
+    }
+    // The bar moves while the bytes come in on their threads.
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+    if let Some(id) = cancel {
+        app.cancel_download(id);
+    }
+}
+
+/// One download in the status bar: what it is doing, its address (cut short, whole on hover), its
+/// progress and its Cancel. A file's whole download shows a bar once the server said its size and
+/// the megabytes read before; a window's read ("Reading…", as its start notice says) isn't
+/// counted, nor is a download in the browser.
+fn download_row(ui: &mut Ui, t: &Tokens, d: &crate::UnderWay, cancel: &mut Option<u64>) {
+    let received = d.progress.as_ref().map_or(0, |p| p.received());
+    let fraction = d.progress.as_ref().and_then(|p| p.fraction());
+    let doing = match (&d.progress, fraction) {
+        (None, _) => tl!("Reading…").to_string(),
+        (Some(_), None) if received > 0 => {
+            crate::i18n::fmt("Downloading… {mb} MB", &[("mb", &format!("{:.1}", received as f64 / 1_048_576.0))])
+        }
+        (Some(_), _) => tl!("Downloading…").to_string(),
+    };
+    ui.label(egui::RichText::new(doing).size(11.5).color(t.text_dim));
+    let short: String =
+        if d.shown.chars().count() > 48 { format!("{}…", d.shown.chars().take(47).collect::<String>()) } else { d.shown.clone() };
+    ui.label(egui::RichText::new(short).size(11.5)).on_hover_text(&d.shown);
+    if let Some(f) = fraction {
+        ui.add(egui::ProgressBar::new(f).show_percentage().desired_width(120.0).desired_height(12.0));
+    }
+    if ui.small_button(tl!("Cancel")).on_hover_text(tl!("Stop this download; nothing is added")).clicked() {
+        *cancel = Some(d.id);
+    }
 }
 
 fn sep(ui: &mut Ui, t: &Tokens) {
@@ -489,13 +815,26 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
     // Behind a dialog (Save changes?, Recover unsaved work?, Command Search…) the keys are the
     // dialog's: Escape answers it rather than switching tools, and Ctrl+N can't start what it
     // asks about.
-    if ctx.memory(|m| m.top_modal_layer()).is_some() || app.ui.shortcut_editor.capturing() {
+    if crate::saveprompt::waiting(app) || ctx.memory(|m| m.top_modal_layer()).is_some() || app.ui.shortcut_editor.capturing() {
         return;
     }
+    if app.ui.history_jump.is_some()
+        && app.dialogs.open.is_none()
+        && !crate::crspicker::list_is_open(ctx)
+        && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
+    {
+        app.ui.history_jump = None;
+    }
     crate::modelbuilder::shortcuts(app, ctx);
-    // The search box was typed in until egui took its focus away on Escape: that Escape clears
-    // the box, not the tool.
-    let typing = ctx.egui_wants_keyboard_input() || crate::searchbox::had_focus(&app.ui.search, ctx.cumulative_pass_nr());
+    // The search box (or a table cell) was typed in until egui took its focus away on Escape:
+    // that Escape clears the box (leaves the cell as it was), not the tool. An open list (a
+    // clause's Functions) keeps the same keys as a box, those without Ctrl (⌘): Escape closes it.
+    let pass = ctx.cumulative_pass_nr();
+    let typing = ctx.egui_wants_keyboard_input()
+        || crate::completion::menu_is_open(ctx)
+        || crate::crspicker::list_is_open(ctx)
+        || crate::searchbox::had_focus(&app.ui.search, pass)
+        || crate::table::had_focus(&app.table, pass);
     // A text field focused, not any widget (a button reached with Tab): it has an undo of its own.
     let text_field = ctx.text_edit_focused();
     // An element selected in the open layout, for the layout's own keys.
@@ -591,6 +930,23 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
             }
             continue;
         }
+        // Esc cancels a held box gesture before leaving the drawing tool on another press.
+        if id == "tool.set"
+            && p.get("tool").and_then(serde_json::Value::as_str) == Some("explore")
+            && app.session.tool == rustgis_engine::Tool::RotatedBox
+            && crate::boxedit::drawing(app)
+        {
+            crate::boxedit::cancel(app);
+            continue;
+        }
+        if id == "tool.set"
+            && p.get("tool").and_then(serde_json::Value::as_str) == Some("explore")
+            && app.session.tool == rustgis_engine::Tool::Circle
+            && crate::circleedit::drawing(app)
+        {
+            crate::circleedit::cancel(app);
+            continue;
+        }
         // With Edit Vertices, Delete removes the chosen vertex rather than the feature.
         if id == "edit.delete"
             && app.session.active_layout.is_none()
@@ -628,6 +984,11 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
         if id == "edit.paste" && !p.get("text").and_then(Value::as_str).is_some_and(|t| t.trim_start().starts_with('{')) {
             continue;
         }
+        // Exhausted undo/redo shortcuts are inert, like their disabled toolbar buttons.
+        // Do not dispatch them: a failed command is retained by Diagnostics.
+        if (id == "edit.undo" && !app.session.can_undo()) || (id == "edit.redo" && !app.session.can_redo()) {
+            continue;
+        }
         // A command that can't run now says why, as its greyed ribbon button does (#456).
         // Running out of undo or redo needs no word.
         if !matches!(id, "edit.undo" | "edit.redo")
@@ -641,20 +1002,40 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
             }
             continue;
         }
+        // Rename with no name given (F2) opens the Rename dialog for the active layer, as Command
+        // Search does: the name is typed there. One naming another layer runs the command, which
+        // says the name is missing, rather than renaming the active layer instead.
+        if id == "layer.rename" && p.get("name").is_none() && p.get("layer").is_none() {
+            let _ = app.run("ui.dialog", json!({"name": "renameLayer"}));
+            continue;
+        }
         let _ = app.run_by_user(id, p);
     }
 }
 
 /// Whether a UI command is available on the current platform.
 pub(crate) fn command_available(id: &str, web: bool) -> bool {
-    !web || !matches!(id, "ui.checkUpdate" | "ui.mcpRelay")
+    !web || !matches!(
+        id,
+        "ui.checkUpdate"
+            | "ui.mcpRelay"
+            | "ui.themeLoad"
+            | "ui.themeReload"
+            | "ui.reloadData"
+            | "layer.reloadData"
+            | "map.reloadTiles"
+            | "map.repairTiles"
+    )
 }
 
 /// The `ui.*` commands Command Search lists: (id, label, ribbon location).
 pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
+    ("ui.shortcuts.import", "Import Keyboard Shortcuts…", "Settings › Customize › Keyboard Shortcuts"),
+    ("ui.shortcuts.export", "Export Keyboard Shortcuts…", "Settings › Customize › Keyboard Shortcuts"),
     ("ui.customizeShortcuts", "Keyboard Shortcuts", "Settings › Customize"),
     ("ui.addData", "Add Data…", "Home › Add"),
     ("ui.addDelimited", "Add Delimited Text…", "Home › Add › Add Data"),
+    ("ui.addDxf", "Import DXF…", "Home › Add › Add Data"),
     ("ui.addUrl", "Add Data From URL…", "Home › Add › Add Data"),
     ("ui.addZarr", "Add Zarr Variable…", "Home › Add › Add Data"),
     ("ui.addService", "Add From Service…", "Home › Add › Add Data"),
@@ -666,21 +1047,34 @@ pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
     ("ui.stac.usgsLidar", "USGS LiDAR…", "Home › Add › Web Data › United States"),
     ("ui.pane.sources", "Data Sources", "Home › Add"),
     ("ui.plugins", "Plugin Manager…", "Plugins"),
+    ("ui.extensions", "Extensions…", "Plugins › Extensions"),
     ("ui.mcpRelay", "MCP Relay", "Help › Help"),
     ("ui.pane.geoprocessing", "Tools Pane", "View › Windows"),
     ("ui.pane.symbology", "Symbology Pane", "Style › Drawing"),
+    ("ui.pane.annotation", "Annotate", "Analyze › Annotate"),
     ("ui.pane.labeling", "Labeling Pane", "View › Windows"),
+    ("ui.pane.layerProperties", "Layer Properties Pane", "View › Windows"),
+    ("ui.pane.diagnosticLog", "Messages", "View › Windows"),
     ("ui.pane.assistant", "AI Assistant", "Analyze › AI"),
     ("ui.pane.sql", "SQL Pane", "Analyze › Workflows"),
     ("ui.pane.directions", "Directions", "Home › Navigate"),
     ("ui.pane.bookmarks", "Bookmarks Pane", "Home › Navigate › Bookmarks"),
-    ("ui.theme", "Toggle Dark Mode", "View"),
+    ("ui.theme", "Toggle Dark Mode", "Settings › Theme"),
+    ("ui.themeFile", "Follow the System", "Settings › Theme"),
+    ("ui.themeLoad", "Load a Theme from File…", "Settings › Theme"),
+    ("ui.themeReload", "Reload Themes", "Settings › Theme"),
+    ("ui.scale", "Reset Interface Scale", "Settings › Theme"),
+    ("ui.datumGrids", "Toggle Downloading Datum Grids", "Settings › Datum Grids"),
+    ("ui.sharpTiles", "Toggle Sharp Tiles on HiDPI Displays", "Settings › Map Tiles"),
     ("ui.map.gpu", "Toggle GPU Rendering", "View"),
     ("ui.importShapefile", "Import Shapefile with Projection…", "Home › Add"),
     ("ui.measurementUnits", "Toggle Imperial Measurements", "Home › Inspect › Measure"),
+    ("ui.coordinateFormat", "Next Coordinate Format", "View"),
     ("ui.moveSharedVertices", "Shared Vertices", "Edit › Features"),
+    ("ui.traceEdges", "Trace", "Edit › Features"),
     ("ui.exportMap", "Export Map…", "Publish › Output"),
     ("ui.checkUpdate", "Check for Updates…", "Help › Help"),
+    ("ui.touchInterface", "Use the Touch Interface", "View › Interface"),
 ];
 
 /// Command Search's interactive entry points. These collect input without changing the engine API.
@@ -691,16 +1085,19 @@ enum SearchAction {
     OpenItem(&'static str),
     SaveItem(&'static str),
     Pane(crate::RightPane),
+    /// A tab of the Layer Properties pane, by its `ui.pane.layerProperties` name.
+    PropertiesTab(&'static str),
     Workflow(&'static str),
 }
 
 /// Routes commands requiring user input to their dialogs rather than executing empty params.
 fn search_action(id: &str) -> Option<SearchAction> {
     use crate::RightPane;
-    use SearchAction::{Command, Dialog, OpenItem, Pane, SaveItem, Workflow};
+    use SearchAction::{Command, Dialog, OpenItem, Pane, PropertiesTab, SaveItem, Workflow};
     Some(match id {
         "project.open" => Command("ui.open"),
         "project.save" => Command("ui.save"),
+        "edit.previewShapeConversion" => Command("ui.convertShape"),
         "project.saveAs" => Command("ui.saveAs"),
         "project.addFolder" => Command("ui.addFolder"),
         "project.fromTemplate" => OpenItem("template"),
@@ -709,8 +1106,10 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "map.import" => OpenItem("map"),
         "map.save" => SaveItem("map"),
         "map.package" => SaveItem("mapPackage"),
+        "project.coordinateSystem" => Dialog("projectProperties"),
         "map.rename" => Dialog("renameMap"),
         "map.goToXY" => Dialog("goToXY"),
+        "map.exportOrbit" => Dialog("exportOrbit"),
         "map.findPlace" => Dialog("findPlace"),
         "map.camera" | "map.setScale" => Dialog("camera"),
         "map.basemap" => Dialog("basemap"),
@@ -744,8 +1143,9 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "layer.rename" => Dialog("renameLayer"),
         "layer.defineProjection" => Dialog("defineProjection"),
         "layer.repairSource" => Dialog("repairSource"),
+        "layer.reloadData" => Command("ui.reloadData"),
         "ui.importShapefile" => Dialog("addShapefile"),
-        "layer.definitionQuery" => Dialog("definitionQuery"),
+        "layer.definitionQuery" => PropertiesTab("query"),
         "layer.symbology" | "raster.symbology" | "layer.color" | "layer.outline" | "layer.lineStrokes" | "layer.fillLayers"
         | "layer.ramp" => Pane(RightPane::Symbology),
         "select.byAttributes" => Dialog("selectByAttributes"),
@@ -822,10 +1222,11 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "osm.download" => Dialog("osm"),
         "overture.add" => Dialog("overture"),
         "boundaries.add" => Dialog("boundaries"),
-        "embeddings.add" | "embeddings.search" => Dialog("embeddings"),
+        "embeddings.add" | "embeddings.addCube" | "embeddings.search" => Dialog("embeddings"),
         "cube.catalog" | "cube.open" => Dialog("dataCubes"),
         "nationalMap.add" => Dialog("nationalMap"),
         "fieldsOfTheWorld.add" => Dialog("fieldsOfTheWorld"),
+        "copernicus.login" | "copernicus.logout" | "copernicus.status" => Dialog("copernicus"),
         "portal.add" | "portal.search" => Command("ui.searchOpenData"),
         "stac.addAsset" | "stac.addFootprints" | "stac.search" => Command("ui.stac"),
         _ => return None,
@@ -863,17 +1264,56 @@ fn search_disabled(app: &RustGisApp, id: &str) -> Option<&'static str> {
     })
 }
 
-/// Whether the query matches a registry command's search row.
-fn command_matches(c: &rustgis_engine::CommandSpec, ql: &str) -> bool {
-    ql.is_empty() || c.label.to_lowercase().contains(ql) || c.id.to_lowercase().contains(ql) || c.location.to_lowercase().contains(ql)
+/// Matches registry and UI command rows against the same lowercased query.
+fn command_matches(id: &str, label: &str, location: &str, ql: &str) -> bool {
+    ql.is_empty()
+        || label.to_lowercase().contains(ql)
+        || id.to_lowercase().contains(ql)
+        || location.to_lowercase().contains(ql)
+        || tl_raw!(label).to_lowercase().contains(ql)
+        || crate::i18n::location_raw(location).to_lowercase().contains(ql)
 }
 
-/// The command palette: type to filter every command, Enter runs the first.
+/// The row the arrow keys have picked in Command Search, kept between frames while the palette
+/// stays open on the same query.
+#[derive(Clone, Default)]
+struct SearchCursor {
+    /// The query the row was picked for: a new query starts again from the first row.
+    query: String,
+    /// Position among the rows that can run now (greyed-out rows are skipped).
+    row: usize,
+    /// The pass the palette was last shown in: a palette opened again starts from the first row.
+    pass: u64,
+}
+
+/// Moves the picked row down or up among `count` rows, stopping at the first and the last.
+fn step_row(row: usize, count: usize, down: bool, up: bool) -> usize {
+    let last = count.saturating_sub(1);
+    match (down, up) {
+        (true, false) => (row + 1).min(last),
+        (false, true) => row.saturating_sub(1).min(last),
+        _ => row.min(last),
+    }
+}
+
+/// The keys that, with Ctrl (⌘), run the first ten rows of Command Search that can run.
+pub(crate) const NUMBER_KEYS: [Key; 10] =
+    [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9, Key::Num0];
+
+/// The command palette: type to filter every command, Up and Down pick a row, Enter runs it, and
+/// Ctrl (⌘) with 1 … 9 and 0 runs one of the first ten.
 pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
     let Some(mut q) = app.ui.command_search.take() else { return };
     let t = Tokens::get(ctx);
     let mut keep = true;
     let mut chosen: Option<String> = None;
+    let cursor_id = egui::Id::unique("command_search_cursor");
+    let pass = ctx.cumulative_pass_nr();
+    let cursor: Option<SearchCursor> = ctx.data(|d| d.get_temp(cursor_id));
+    // The arrows are the list's, taken before the text box sees them (it would move its caret).
+    let (down, up) = ctx.input_mut(|i| (i.consume_key(Modifiers::NONE, Key::ArrowDown), i.consume_key(Modifiers::NONE, Key::ArrowUp)));
+    // Ctrl (⌘) and a digit run one of the first ten rows that can run: 1 the first, 0 the tenth.
+    let jump = ctx.input_mut(|i| NUMBER_KEYS.iter().position(|&key| i.consume_key(Modifiers::COMMAND, key)));
     // Fits small screens: never wider or taller than the window allows.
     let screen = ctx.content_rect();
     let width = (screen.width() - 48.0).clamp(220.0, 520.0);
@@ -913,7 +1353,7 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
             if !ql.is_empty()
                 && (tool.name.to_lowercase().contains(&ql)
                     || tool.id.to_lowercase().contains(&ql)
-                    || tl!(tool.name).to_lowercase().contains(&ql))
+                    || tl_raw!(tool.name).to_lowercase().contains(&ql))
             {
                 hits.push((
                     format!("gp:{}", tool.id),
@@ -925,12 +1365,15 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
         // Workflow titles are searchable even when they differ from the engine command's label.
         // A command with the same title that routes to the workflow is listed instead, if it matches.
         if !ql.is_empty() {
-            for &(section, label) in crate::analysispane::SECTIONS {
-                if (label.to_lowercase().contains(&ql) || section.to_lowercase().contains(&ql) || tl!(label).to_lowercase().contains(&ql))
+            for &(section, label) in crate::analysispane::SECTIONS.iter().filter(|s| crate::analysispane::section_shown(&app.session, s.0))
+            {
+                if (label.to_lowercase().contains(&ql)
+                    || section.to_lowercase().contains(&ql)
+                    || tl_raw!(label).to_lowercase().contains(&ql))
                     && !app.session.registry.commands.iter().any(|c| {
                         c.label == label
                             && matches!(search_action(c.id), Some(SearchAction::Workflow(s)) if s == section)
-                            && command_matches(c, &ql)
+                            && command_matches(c.id, c.label, c.location, &ql)
                     })
                 {
                     hits.push((format!("pane:{section}"), tl!(label).to_string(), crate::i18n::location("Workflows")));
@@ -938,7 +1381,11 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
             }
         }
         for c in &app.session.registry.commands {
-            if command_matches(c, &ql) {
+            // A command of an extension that is off isn't offered (#1752).
+            if command_available(c.id, cfg!(target_arch = "wasm32"))
+                && app.session.extensions().blocks(c.id).is_none()
+                && command_matches(c.id, c.label, c.location, &ql)
+            {
                 hits.push((c.id.to_string(), tl!(c.label).to_string(), crate::i18n::location(c.location)));
             }
         }
@@ -969,31 +1416,62 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
             }
         }
         for &(id, label, loc) in UI_COMMANDS {
-            // The web app always serves the latest release (no Check for Updates button) and is
-            // one process a loopback relay could not reach (`ui.mcpRelay` is desktop only).
+            // Match the platform availability used by the shortcut editor, including desktop
+            // theme files and the loopback relay.
             if !command_available(id, cfg!(target_arch = "wasm32")) {
                 continue;
             }
-            if ql.is_empty() || label.to_lowercase().contains(&ql) || tl!(label).to_lowercase().contains(&ql) {
+            // Only a shell with a touch interface (a phone's) has one to go back to.
+            if id == "ui.touchInterface" && app.touch.is_none() {
+                continue;
+            }
+            if command_matches(id, label, loc, &ql) {
                 hits.push((id.into(), tl!(label).into(), crate::i18n::location(loc)));
             }
+        }
+        // A command whose label is the query comes first, so Enter runs it rather than one that
+        // matched only by its ribbon location ("Annotate" before Original Image Grid). The sort
+        // is stable: the rest keep their order.
+        if !ql.is_empty() {
+            hits.sort_by_key(|h| h.1.to_lowercase() != ql);
         }
         // The ribbon location is dropped when the palette is too narrow to show it.
         let show_loc = width >= 400.0;
         // A solid scroll bar takes its own gutter instead of floating over the locations.
         ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+        // Unavailable commands stay listed, greyed out, with the reason on hover; the arrows,
+        // Enter and the number keys pass over them.
+        let shown: Vec<_> = hits.iter().take(40).map(|h| (h, search_disabled(app, &h.0))).collect();
+        let runnable = shown.iter().filter(|(_, why)| why.is_none()).count();
+        let row = match &cursor {
+            Some(c) if c.query == q && c.pass + 1 >= pass => c.row,
+            _ => 0,
+        };
+        let row = step_row(row, runnable, down, up);
+        ui.ctx().data_mut(|d| d.insert_temp(cursor_id, SearchCursor { query: q.clone(), row, pass }));
         // The modal's area starts from its last size, so after a short result list the scroll
         // area would get only that room back (egui's 64 px floor): ask for the full height
         // whenever the list scrolls. A few hits still shrink the palette to fit.
         egui::ScrollArea::vertical().max_height(list_h).min_scrolled_height(list_h).show(ui, |ui| {
             let row_w = ui.available_width();
-            // Enter runs the first command that is available now.
-            let mut first = true;
-            for (id, label, loc) in hits.iter().take(40) {
-                // Unavailable commands stay listed, greyed out, with the reason on hover.
-                let why = search_disabled(app, id);
+            // The number keys' column: as wide as the widest, so the hints line up.
+            let number_w = NUMBER_KEYS
+                .iter()
+                .map(|&key| text_w(ui, &ui.ctx().format_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, key)), regular(11.0)))
+                .fold(0.0, f32::max);
+            // Enter runs the picked row: the first that is available now until an arrow moves it.
+            let mut position = 0;
+            for ((id, label, loc), why) in shown {
                 let on = why.is_none();
-                let mut b = egui::Button::new(egui::RichText::new(label).size(13.0)).frame(false).min_size(vec2(row_w, 26.0));
+                let picked = on && position == row;
+                // The number key that runs this row, for the first ten that can run.
+                let number = NUMBER_KEYS.get(position).filter(|_| on).copied();
+                let jumped = on && jump == Some(position);
+                position += usize::from(on);
+                // A frameless button has no padding of its own: room between the highlight's edges and
+                // the text in it.
+                let pad = || egui::Atom::paint(vec2(4.0, 0.0), |_, _| {});
+                let mut b = egui::Button::new((pad(), egui::RichText::new(label).size(13.0))).frame(false).min_size(vec2(row_w, 26.0));
                 // The command's shortcut after its location.
                 let keys = if id.contains(':') && !id.starts_with("plugin:") {
                     String::new()
@@ -1005,11 +1483,29 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
                     (true, true) => loc.clone(),
                     (false, _) => keys,
                 };
-                if !right.is_empty() {
-                    b = b.right_text(egui::RichText::new(right).size(11.0).weak());
-                }
+                // The number key in a column of its own after the location and shortcut, right
+                // aligned, left empty on the rows past the tenth and those that can't run.
+                let number = number.map(|key| ui.ctx().format_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, key)));
+                let color = t.text_dim;
+                let column = egui::Atom::paint(vec2(number_w, 0.0), move |ui, args| {
+                    if let Some(n) = &number {
+                        ui.painter().text(args.rect.right_center(), Align2::RIGHT_CENTER, n, regular(11.0), color);
+                    }
+                });
+                let gap = egui::Atom::paint(vec2(8.0, 0.0), |_, _| {});
+                b = b.right_text((egui::RichText::new(right).size(11.0).weak(), gap, column, pad()));
                 // The scroll area would clip a fill wider than the row.
+                let under = ui.painter().add(egui::Shape::Noop);
                 let mut resp = row_button(ui, on, b, 0.0);
+                if picked {
+                    // Under the pointer's own fill, so a hovered row still shows it is hovered.
+                    if !resp.hovered() {
+                        ui.painter().set(under, egui::Shape::rect_filled(resp.rect, CornerRadius::same(5), t.selection));
+                    }
+                    if down || up {
+                        resp.scroll_to_me(None);
+                    }
+                }
                 if let Some(why) = why {
                     resp = resp.on_disabled_hover_text(crate::i18n::fmt("Unavailable: {reason}", &[("reason", tl_raw!(why))]));
                 }
@@ -1027,9 +1523,8 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
                     app.ui.shortcut_editor.filter = id.clone();
                     keep = false;
                 }
-                let enter = on && first && ui.input(|i| i.key_pressed(Key::Enter));
-                first &= !on;
-                if resp.clicked() || enter {
+                let enter = picked && ui.input(|i| i.key_pressed(Key::Enter));
+                if resp.clicked() || enter || jumped {
                     chosen = Some(id.clone());
                 }
             }
@@ -1056,6 +1551,7 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
                 SearchAction::Dialog(name) => app.run("ui.dialog", json!({"name": name})),
                 SearchAction::OpenItem(kind) => app.run("ui.openItem", json!({"kind": kind})),
                 SearchAction::SaveItem(kind) => app.run("ui.saveItem", json!({"kind": kind})),
+                SearchAction::PropertiesTab(tab) => app.run("ui.pane.layerProperties", json!({"tab": tab})),
                 SearchAction::Workflow(section) => app.run("ui.pane.workflows", json!({"section": section})),
                 SearchAction::Pane(pane) => {
                     app.ui.open_right(pane);
@@ -1188,19 +1684,43 @@ pub fn about(app: &mut RustGisApp, ctx: &egui::Context) {
     }
 }
 
+/// Translates deferred engine text in logical order, then shapes the completed message once.
+/// The file-size refusal travels as an English command error and is translated on display.
+fn notice_text(notice: &rustgis_engine::Notice) -> String {
+    notice
+        .translated(crate::i18n::fmt_raw)
+        .map(|message| crate::i18n::fmt("{message}", &[("message", &message)]))
+        .or_else(|| crate::i18n::file_size_error(&notice.text, crate::i18n::fmt))
+        .unwrap_or_else(|| notice.text.clone())
+}
+
+/// A deferred message stays in logical order until the complete tooltip is shaped, including
+/// its translated action label. Feeding status-bar display text back into fmt would shape twice.
+fn notice_hover(notice: &rustgis_engine::Notice) -> String {
+    let message = notice
+        .translated(crate::i18n::fmt_raw)
+        .or_else(|| crate::i18n::file_size_error(&notice.text, crate::i18n::fmt_raw))
+        .unwrap_or_else(|| notice.text.clone());
+    crate::i18n::fmt("{message}\n{open}", &[("message", &message), ("open", tl_raw!("Open Messages"))])
+}
+
+/// Makes a toast for each notice the session still holds that was given since the last call.
+/// Counted by the session's notice mark, not by its list, which keeps only the last 200 notices
+/// and so stops growing (#1755); more than 200 between two frames toast only the 200 kept.
+fn toast_new_notices(app: &mut RustGisApp, now: f64) {
+    for n in app.session.notices_since(app.map.notices_seen) {
+        app.map.toasts_made += 1;
+        app.map.toasts.push(Toast { text: notice_text(n), error: n.error, at: now, id: app.map.toasts_made });
+    }
+    app.map.notices_seen = app.session.notice_mark();
+}
+
 /// Toasts for recent notices (errors stay longer, and any stays while the pointer is on it, so
 /// its text can be selected and copied).
 pub fn notices(app: &mut RustGisApp, ctx: &egui::Context) {
     let t = Tokens::get(ctx);
     let now = ctx.input(|i| i.time);
-    let total = app.session.notices.len();
-    if total > app.map.notices_seen {
-        for n in app.session.notices.iter().skip(app.map.notices_seen) {
-            app.map.toasts_made += 1;
-            app.map.toasts.push(Toast { text: n.text.clone(), error: n.error, at: now, id: app.map.toasts_made });
-        }
-        app.map.notices_seen = total;
-    }
+    toast_new_notices(app, now);
     app.map.toasts.retain(|toast| now - toast.at < if toast.error { 6.0 } else { 3.0 });
     if app.map.toasts.is_empty() {
         return;
@@ -1237,9 +1757,169 @@ pub fn notices(app: &mut RustGisApp, ctx: &egui::Context) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_search_matches_localized_labels_and_locations() {
+        let app = RustGisApp::with_sample();
+        let new_project = app.session.registry.get("project.new").unwrap();
+        let zoom_in = app.session.registry.get("map.zoomIn").unwrap();
+        let previous = crate::i18n::current();
+        crate::i18n::set_current(crate::i18n::lang_from_tag("zh").unwrap());
+        let labels = ["新建工程", "new project", "project.new"]
+            .map(|query| command_matches(new_project.id, new_project.label, new_project.location, query));
+        let location = command_matches(zoom_in.id, zoom_in.label, zoom_in.location, "主页 › 导航");
+        crate::i18n::set_current(previous);
+        assert_eq!(labels, [true; 3]);
+        assert!(location, "the Zoom In command is searchable by its translated ribbon location");
+    }
+
+    #[test]
+    fn command_search_matches_mixed_direction_labels_in_logical_order() {
+        let app = RustGisApp::with_sample();
+        let add_postgis = app.session.registry.get("pg.addLayer").unwrap();
+        let previous = crate::i18n::current();
+        crate::i18n::set_current(crate::i18n::lang_from_tag("fa").unwrap());
+        let query = "افزودن لایه postgis";
+        let matches = command_matches(add_postgis.id, add_postgis.label, add_postgis.location, query);
+        let display_matches = tl!(add_postgis.label).to_lowercase().contains(query);
+        crate::i18n::set_current(previous);
+        assert!(!display_matches, "the display label reverses the Latin run");
+        assert!(matches, "the typed label matches in logical order");
+    }
+
+    #[test]
+    fn command_search_matches_ui_command_id_and_location() {
+        use egui_kittest::kittest::Queryable;
+
+        let lang = crate::i18n::lang_from_tag("zh").unwrap();
+        // This test checks accessibility labels and works on runners without Chinese fonts.
+        let mut h = egui_kittest::Harness::builder().allow_missing_glyphs().with_size(vec2(800.0, 600.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                let previous = crate::i18n::current();
+                crate::i18n::set_current(lang);
+                command_search(app, ui.ctx());
+                crate::i18n::set_current(previous);
+            },
+            RustGisApp::with_sample(),
+        );
+        // The label contains neither the stable ID nor the full ribbon location.
+        for query in ["UI.DatumGrids", "Settings › Datum Grids", "设置 › 基准转换格网"] {
+            h.state_mut().ui.command_search = Some(query.into());
+            h.run_steps(3);
+            h.get_by_label_contains("开关基准转换格网下载");
+        }
+    }
+
+    #[test]
+    fn step_row_stops_at_the_ends() {
+        assert_eq!(step_row(0, 3, true, false), 1);
+        assert_eq!(step_row(2, 3, true, false), 2, "Down stops at the last row");
+        assert_eq!(step_row(0, 3, false, true), 0, "Up stops at the first row");
+        assert_eq!(step_row(5, 3, false, false), 2, "a shorter list keeps the row in it");
+        assert_eq!(step_row(0, 0, true, false), 0, "no rows");
+        assert_eq!(step_row(1, 3, true, true), 1, "both arrows at once cancel out");
+    }
+
+    /// Up and Down pick a row in Command Search and Enter runs the picked row, not always the first.
+    #[test]
+    fn command_search_arrows_pick_the_row_enter_runs() {
+        use crate::RightPane;
+        // The query matches two UI commands by id, in this order: Labeling, then Layer Properties.
+        let cases: [(&[Key], RightPane); 4] = [
+            (&[], RightPane::Labeling),
+            (&[Key::ArrowDown], RightPane::LayerProperties),
+            (&[Key::ArrowDown, Key::ArrowDown, Key::ArrowDown], RightPane::LayerProperties),
+            (&[Key::ArrowDown, Key::ArrowUp], RightPane::Labeling),
+        ];
+        for (keys, pane) in cases {
+            let mut app = RustGisApp::with_sample();
+            app.session.run("layer.select", &json!({"layer": "Cities"})).unwrap();
+            app.ui.command_search = Some("ui.pane.la".into());
+            let mut h = egui_kittest::Harness::builder()
+                .with_size(vec2(800.0, 600.0))
+                .build_ui_state(|ui, app: &mut RustGisApp| command_search(app, ui.ctx()), app);
+            h.run();
+            for &key in keys {
+                h.key_press(key);
+                h.run();
+                assert!(h.state().ui.command_search.is_some(), "{keys:?}: an arrow keeps the palette open");
+            }
+            h.key_press(Key::Enter);
+            h.run();
+            assert!(h.state().ui.command_search.is_none(), "{keys:?}: Enter closes the palette");
+            assert_eq!(h.state().ui.right, Some(pane), "{keys:?}");
+        }
+    }
+
+    /// Ctrl (⌘) with a digit runs that row of Command Search; one past the list does nothing.
+    #[test]
+    fn command_search_number_keys_run_their_row() {
+        use crate::RightPane;
+        // The query matches two UI commands by id, in this order: Labeling, then Layer Properties.
+        for (key, pane) in [(Key::Num1, Some(RightPane::Labeling)), (Key::Num2, Some(RightPane::LayerProperties)), (Key::Num3, None)] {
+            let mut app = RustGisApp::with_sample();
+            app.session.run("layer.select", &json!({"layer": "Cities"})).unwrap();
+            app.ui.command_search = Some("ui.pane.la".into());
+            let mut h = egui_kittest::Harness::builder()
+                .with_size(vec2(800.0, 600.0))
+                .build_ui_state(|ui, app: &mut RustGisApp| command_search(app, ui.ctx()), app);
+            h.run();
+            h.key_press_modifiers(Modifiers::COMMAND, key);
+            h.run();
+            assert_eq!(h.state().ui.command_search.is_none(), pane.is_some(), "{key:?}: a row run closes the palette");
+            if pane.is_some() {
+                assert_eq!(h.state().ui.right, pane, "{key:?}");
+            }
+        }
+    }
+
+    /// In a browser, Command Search keeps ⌘1 … ⌘0 from switching tabs, only while it is open.
+    #[test]
+    fn the_browser_number_keys_are_command_searchs_while_it_is_open() {
+        let mut app = RustGisApp::with_sample();
+        let closed = app.shortcuts_fingerprint();
+        let takes_one = |app: &RustGisApp| RustGisApp::takes_browser_key(&app.command_keys(), "1", "Digit1", true, false, false);
+        assert!(!takes_one(&app), "closed: ⌘1 is the browser's");
+        app.ui.command_search = Some(String::new());
+        assert!(takes_one(&app), "open: ⌘1 runs the first row");
+        assert_ne!(app.shortcuts_fingerprint(), closed, "the web app rebuilds its keys when the palette opens");
+    }
+
+    /// Command Search's Definition Query opens the Layer Properties pane on its Query tab (#1803),
+    /// the dialog it opened being gone.
+    #[test]
+    fn definition_query_is_found_on_the_query_tab() {
+        assert!(matches!(search_action("layer.definitionQuery"), Some(SearchAction::PropertiesTab("query"))));
+        let mut app = RustGisApp::with_sample();
+        app.session.run("layer.select", &json!({"layer": "Cities"})).unwrap();
+        assert!(super::search_disabled(&app, "layer.definitionQuery").is_none(), "offered for a feature layer");
+    }
+
+    /// Past the 200 notices the session keeps, each new notice it holds still makes one toast (#1755).
+    #[test]
+    fn each_kept_notice_makes_one_toast_past_the_200th() {
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        toast_new_notices(&mut app, 0.0);
+        app.map.toasts.clear();
+        for i in 0..205 {
+            app.session.notify(format!("notice {i}"), false);
+            toast_new_notices(&mut app, 0.0);
+            toast_new_notices(&mut app, 0.0);
+            let texts: Vec<&str> = app.map.toasts.iter().map(|t| t.text.as_str()).collect();
+            assert_eq!(texts, [format!("notice {i}")], "notice {i} is toasted once");
+            app.map.toasts.clear();
+        }
+        // Several notices between two frames each make their toast, in order.
+        for i in 0..3 {
+            app.session.notify(format!("batch {i}"), true);
+        }
+        toast_new_notices(&mut app, 0.0);
+        let texts: Vec<&str> = app.map.toasts.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(texts, ["batch 0", "batch 1", "batch 2"]);
+        assert!(app.map.toasts.iter().all(|t| t.error));
+    }
 
     #[test]
     fn desktop_only_search_actions_are_disabled_only_on_the_web() {
@@ -1295,6 +1975,175 @@ mod tests {
         ] {
             assert_eq!(parse_scale(text), None, "{text}");
         }
+    }
+
+    /// Runs the real toolbar and advances queued history steps on the following frames.
+    fn history_toolbar(app: RustGisApp, width: f32) -> egui_kittest::Harness<'static, RustGisApp> {
+        egui_kittest::Harness::builder()
+            .with_size(vec2(width, 700.0))
+            .with_context_setup(|ctx| crate::theme::install_fonts(ctx, &[], None))
+            .build_ui_state(
+                |ui, app| {
+                    header(app, ui);
+                    status_bar(app, ui);
+                    advance_history_jump(app, ui.ctx());
+                },
+                app,
+            )
+    }
+
+    /// The toolbar can jump over several states in either direction, including to the saved state.
+    #[test]
+    fn undo_history_jumps_back_and_forward() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        let saved = app.session.state();
+        app.run("layer.rename", json!({"layer": "Cities", "name": "Places"})).unwrap();
+        app.run("labels.style", json!({"layer": "Places", "size": 20})).unwrap();
+        let latest = app.session.state();
+        let mut h = history_toolbar(app, 800.0);
+        h.run();
+
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Undo History").click();
+        h.run();
+        h.get_by_label("Current: Text Symbol");
+        h.get_by_label("Earliest available state").click();
+        h.run();
+        assert_eq!(h.state().session.state(), saved);
+        assert!(!h.state().session.dirty());
+
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Undo History").click();
+        h.run();
+        h.get_by_label("Current: Earliest available state");
+        h.get_by_label("Text Symbol").click();
+        h.run();
+        assert_eq!(h.state().session.state(), latest);
+        assert!(!h.state().session.can_redo());
+    }
+
+    /// A new redo row can appear between press and release even at the same current state.
+    #[test]
+    fn undo_history_ignores_a_click_when_the_redo_branch_changes() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let mut app = RustGisApp::with_sample();
+        app.run("labels.style", json!({"layer": "Cities", "size": 20})).unwrap();
+        app.run("layer.rename", json!({"layer": "Cities", "name": "Places"})).unwrap();
+        let current = app.session.state();
+        let mut h = history_toolbar(app, 800.0);
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Undo History").click();
+        h.run();
+        let row = h.get_by_label("Earliest available state");
+        let pressed_id = row.accesskit_node().locate();
+        let pos = row.rect().center();
+        h.event(egui::Event::PointerMoved(pos));
+        let pointer =
+            |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        h.event(pointer(true));
+        h.run();
+        h.state_mut().run("layer.rename", json!({"layer": "Places", "name": "Towns"})).unwrap();
+        h.state_mut().run("edit.undo", Value::Null).unwrap();
+        h.run();
+        assert!(h.state().session.can_redo());
+        let replacement = h.get_by_label("Text Symbol");
+        assert!(replacement.rect().contains(pos));
+        assert_ne!(pressed_id, replacement.accesskit_node().locate(), "the row at the pressed position needs a new identity");
+        h.event(pointer(false));
+        h.run();
+        assert_eq!(h.state().session.state(), current);
+        assert!(h.state().session.can_redo());
+    }
+
+    /// Narrow windows reserve room for search and keep the hidden history reachable.
+    #[test]
+    fn undo_history_is_reachable_in_quick_access_overflow() {
+        use egui_kittest::kittest::Queryable;
+        for width in [315.0, 150.0, 100.0] {
+            let mut app = RustGisApp::with_sample();
+            app.ui.quick_access.push("map.zoomFull".into());
+            let mut h = history_toolbar(app, width);
+            h.run();
+            let overflow = h.get_by_label("More Quick Access commands");
+            assert!(overflow.rect().max.x < width - HEADER_PAD - COMPACT_SEARCH_WIDTH);
+            overflow.click();
+            h.run();
+            h.get_by_label_contains("Full Extent");
+            h.get_by_label("Undo History").click();
+            h.run();
+            h.get_by_label("No project changes to undo or redo.");
+        }
+    }
+
+    /// When the canvas fits just one button, its menu includes Search and Undo History.
+    #[test]
+    fn undo_history_and_search_share_the_last_toolbar_slot() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = history_toolbar(RustGisApp::with_sample(), 70.0);
+        h.run();
+        h.get_by_label("More Quick Access commands").click();
+        h.run();
+        h.get_by_label("Undo History");
+        h.get_by_label("Command Search").click_accesskit();
+        h.run();
+        assert!(h.state().ui.command_search.is_some());
+    }
+
+    /// Test fixture with a single pending step, as if a longer jump yielded.
+    fn with_pending_history_step() -> RustGisApp {
+        let mut app = RustGisApp::with_sample();
+        app.run("layer.rename", json!({"layer": "Cities", "name": "Places"})).unwrap();
+        app.ui.history_jump =
+            Some(HistoryJump { command: "edit.undo", position: app.session.history_position(), total: 2, done: 1, cancel_pressed: false });
+        app
+    }
+
+    /// Cancel gets the last step while the project still sits at the state previously shown.
+    #[test]
+    fn undo_history_cancel_precedes_the_last_step() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = with_pending_history_step();
+        app.ui.backstage = true;
+        let current = app.session.state();
+        let mut h = history_toolbar(app, 1000.0);
+        h.run();
+        let cancel = h.get_by_label("Cancel");
+        let pos = cancel.rect().center();
+        cancel.hover();
+        h.run();
+        h.state_mut().ui.backstage = false;
+        let pointer =
+            |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        h.event(pointer(true));
+        h.step();
+        assert!(h.state().ui.history_jump.is_some());
+        h.event(pointer(false));
+        h.run();
+        assert!(h.state().ui.history_jump.is_none());
+        assert_eq!(h.state().session.state(), current);
+    }
+
+    /// A save prompt owns Escape and keeps the project stable until it is answered.
+    #[test]
+    fn undo_history_pauses_for_the_save_prompt() {
+        let mut app = with_pending_history_step();
+        let current = app.session.state();
+        crate::saveprompt::ask(&mut app, crate::saveprompt::Discard::Quit);
+        let mut h = history_toolbar(app, 1000.0);
+        h.run();
+        h.key_press(Key::Escape);
+        h.run();
+        assert!(h.state().ui.history_jump.is_some());
+        assert_eq!(h.state().session.state(), current);
+    }
+
+    /// A successful web Save As rename stops a jump that would restore the old project name.
+    #[test]
+    fn undo_history_stops_after_browser_save_as_renames_the_project() {
+        let mut app =
+            with_pending_history_step().with_services(crate::Services { download: Some(Box::new(|_, _| Ok(()))), ..Default::default() });
+        app.save_download("new-name.rgis").unwrap();
+        assert!(app.ui.history_jump.is_none());
+        assert_eq!(app.session.project.name, "new-name");
     }
 
     /// With a text field focused, Ctrl/⌘+Z undoes its typing, not the project; with none, the

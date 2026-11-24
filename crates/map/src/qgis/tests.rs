@@ -4,6 +4,16 @@ use super::*;
 use crate::layout::TextAlign;
 use crate::symbology::{Glyph, LabelPlacement, LineCap, LineMark, Marker, Placements};
 
+/// [`super::read_project`] given no image file (the tests of raster image markers give theirs).
+fn read_project(text: &str, dir: &str, report: &mut Report) -> Result<Project, String> {
+    super::read_project(text, dir, &mut |_| Err("whose image file doesn't open"), report)
+}
+
+/// [`super::read_style`] given no image file and no folder.
+fn read_style(text: &str, layer: &str, report: &mut Report) -> Result<Style, String> {
+    super::read_style(text, layer, "", &mut |_| Err("whose image file doesn't open"), report)
+}
+
 const PROJECT: &str = r#"<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
 <qgis projectname="Towns" version="3.42.0-Münster">
   <title>Towns</title>
@@ -42,7 +52,7 @@ const PROJECT: &str = r#"<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTE
         </symbols>
       </renderer-v2>
       <layerOpacity>0.75</layerOpacity>
-      <blendMode>13</blendMode>
+      <blendMode>6</blendMode>
       <labeling type="simple">
         <settings><text-style fieldName="name" fontSize="12" fontSizeUnit="Point" textColor="20,40,60,255" namedStyle="Bold Italic" fontFamily="Liberation Sans Narrow">
           <text-buffer bufferDraw="1"/></text-style><placement placement="1" quadOffset="2"/></settings>
@@ -167,16 +177,19 @@ fn a_project_reads_into_layers_in_tree_order_with_their_styles() {
     let by = |n: &str| l.classes.iter().find(|c| c.name == n).unwrap();
     assert_eq!((by("Motorways").where_.as_deref(), by("Motorways").placement), (Some("\"class\" = 'motorway'"), LabelPlacement::Curved));
     let rest = by("Rest");
-    assert_eq!(rest.where_.as_deref(), Some("(\"lanes\" > 1) AND (NOT ((\"kind\" = 'x')))"));
+    assert_eq!(rest.where_.as_deref(), Some("(\"lanes\" > 1) AND (NOT coalesce(((\"kind\" = 'x')), FALSE))"));
     assert_eq!(rest.placement, LabelPlacement::Parallel);
     assert!((rest.min_scale.unwrap() - 50_000.0 * QGIS_SCALE).abs() < 1e-6);
-    assert_eq!(l.classes.len(), 3, "the function filter's rule is left out");
+    // A filter with a function is kept for the expression language (checked against the layer's
+    // fields where the layer is added).
+    assert_eq!(l.classes.len(), 4);
+    assert_eq!(l.classes[3].where_.as_deref(), Some("length(\"name\") > 3"));
 
     // Towns: XYZ tiles as the source; rules on one field read as categories.
     let towns = &p.layers[0];
     assert_eq!(
         towns.source,
-        Source::Xyz { url: "https://tile.example.org/{z}/{x}/{y}.png".into(), zmin: None, zmax: Some(19), vector: false }
+        Source::Xyz { url: "https://tile.example.org/{z}/{x}/{y}.png".into(), zmin: None, zmax: Some(19), vector: false, style: None }
     );
     let Some(Renderer::Unique { field, classes, other, .. }) = &towns.style.renderer else { panic!() };
     assert_eq!((field.as_str(), classes.len()), ("rank", 2));
@@ -190,6 +203,7 @@ fn a_project_reads_into_layers_in_tree_order_with_their_styles() {
     // Its second class's line pattern fill: hatch lines of its blue line, 2 mm apart, at QGIS's
     // 45°, half see-through as the symbol is; read, not noted.
     assert!(!said("Land", NoteKind::Approximated, "line pattern"));
+    assert!(said("Land", NoteKind::Approximated, "letter case"));
     let Some(Renderer::Graduated { class_fills, .. }) = &land.style.renderer else { panic!() };
     let hatch = class_fills.get(&1).and_then(|f| f.first()).copied().unwrap();
     assert_eq!(hatch.color, Some(Rgba::new(0, 0, 255, 128)));
@@ -202,7 +216,7 @@ fn a_project_reads_into_layers_in_tree_order_with_their_styles() {
     assert!(said("Roads", NoteKind::Approximated, "dashed"));
     // A marker line without the symbol it places draws nothing, in QGIS too: nothing to say.
     assert!(!said("Roads", NoteKind::Skipped, "markers"));
-    assert!(said("Roads", NoteKind::Skipped, "length("));
+    assert!(!said("Roads", NoteKind::Skipped, "length("));
     assert!(!report.notes.iter().any(|n| n.layer == "Towns" && n.text.contains("font markers")), "drawn as characters: {:?}", report.notes);
     // A switched-off label rule is never drawn, so its filter isn't noted.
     assert!(!report.notes.iter().any(|n| n.text.contains("Switched off")), "{:?}", report.notes);
@@ -263,13 +277,35 @@ fn hostile_files_are_refused_or_bounded() {
     for i in 0..(MAX_NOTES + 500) {
         r.approximated("a", format!("note {i}"));
     }
-    assert_eq!(r.notes.len(), MAX_NOTES);
+    // Those past it are counted in a closing note of their kind, after the kept ones.
+    assert_eq!(r.notes.len(), MAX_NOTES + 1);
+    let last = r.notes.last().unwrap();
+    assert_eq!((last.text.as_str(), last.kind, last.layer.as_str()), ("501 more note(s) not listed", NoteKind::Approximated, ""));
     r.approximated("a", "note 7");
     r.approximated("b", "note 7");
     r.skipped("a", "note 7");
     let at = r.notes.iter().position(|n| n.text == "note 7").unwrap();
     assert_eq!((r.notes[at].count, r.notes[at].kind), (2, NoteKind::Approximated));
     assert!(!r.notes.iter().any(|n| n.layer == "b"), "past the cap, a new note isn't kept");
+    // "b"'s approximation joins the approximated closing note; the skipped one has its own.
+    let closing = |kind| r.notes.iter().rev().take(2).find(|n| n.kind == kind).map(|n| (n.text.clone(), n.count));
+    assert_eq!(closing(NoteKind::Approximated), Some(("502 more note(s) not listed".to_string(), 502)));
+    assert_eq!(closing(NoteKind::Skipped), Some(("1 more note(s) not listed".to_string(), 1)));
+    assert_eq!(r.notes.len(), MAX_NOTES + 2);
+    // A note withdrawn below the cap moves the closing notes up; a later overflow still finds its
+    // kind's one closing note.
+    for i in 9..12 {
+        r.forget("a", NoteKind::Approximated, &format!("note {i}"));
+    }
+    r.approximated("a", "fresh below the cap");
+    r.approximated("a", "past the cap again");
+    let closers = r.notes.iter().filter(|n| n.text.ends_with(" more note(s) not listed")).count();
+    assert_eq!(closers, 2, "one closing note a kind");
+    let approximated = r.notes.iter().find(|n| n.kind == NoteKind::Approximated && n.text.ends_with(" more note(s) not listed"));
+    assert_eq!(approximated.map(|n| (n.text.as_str(), n.count)), Some(("503 more note(s) not listed", 503)));
+    let mut few = Report::default();
+    few.skipped("a", "one");
+    assert!(!few.notes.iter().any(|n| n.text.contains("not listed")), "under the cap, nothing is counted apart");
 }
 
 #[test]
@@ -661,6 +697,17 @@ fn files_of_qgis_1_and_2_read_by_their_old_names() {
     assert_eq!(p.crs.as_deref(), Some("EPSG:21781"), "the canvas's");
     let names: Vec<(&str, bool)> = p.layers.iter().map(|l| (l.name.as_str(), l.visible)).collect();
     assert_eq!(names, [("roads", true), ("land", false)], "the legend's order; land's group is unchecked");
+    assert!(!report.notes.iter().any(|n| n.text.contains("layer order")), "the legend's own order: {:?}", report.notes);
+    // A legend keeping a drawing order of its own: noted, as it isn't read.
+    let own = qgs
+        .replace(r#"<legend updateDrawingOrder="true">"#, r#"<legend updateDrawingOrder="false">"#)
+        .replace(r#"name="land">"#, r#"name="land" drawingOrder="0">"#);
+    let mut own_report = Report::default();
+    read_project(&own, "", &mut own_report).unwrap();
+    assert!(own_report.notes.iter().any(|n| n.text.contains("set apart from the legend")), "{:?}", own_report.notes);
+    let base = p.groups.iter().map(|g| (g.name.as_str(), g.checked, g.expanded)).collect::<Vec<_>>();
+    assert_eq!(base, [("base", false, true)], "the legend's group");
+    assert_eq!((p.layers[1].group, p.layers[1].checked), (Some(0), true));
     let (roads, land) = (&p.layers[0].style, &p.layers[1].style);
     // maximumScale was the out-beyond limit, minimumScale the in-beyond.
     let (min, max) = (land.min_scale.flatten().unwrap(), land.max_scale.flatten().unwrap());
@@ -706,6 +753,7 @@ fn what_rustgis_has_no_place_for_is_noted() {
         </maplayer>
       </projectlayers>
       <main-annotation-layer><items><item type="pointtext"/><item type="linetext"/></items></main-annotation-layer>
+      <Annotations><TextAnnotationItem/></Annotations>
       <Layouts><Layout name="One"/></Layouts>
       <Bookmarks><Bookmark name="Here"/></Bookmarks>
       <visibility-presets><visibility-preset name="Only points"/></visibility-presets>
@@ -713,13 +761,20 @@ fn what_rustgis_has_no_place_for_is_noted() {
     </qgis>"#
     );
     let mut report = Report::default();
-    read_project(&qgs, "", &mut report).unwrap();
+    let p = read_project(&qgs, "", &mut report).unwrap();
     let said = |layer: &str, part: &str| report.notes.iter().any(|n| n.layer == layer && n.text.contains(part));
-    for part in ["print layouts (1)", "annotations (2", "bookmarks (1)", "map themes (1)", "relations between layers (1)"] {
+    for part in [
+        "print layouts (1)",
+        "annotations of QGIS's older kind (1",
+        "bookmarks whose place doesn't read (1: Here)",
+        "map themes (1)",
+        "relations that name no layers or fields (1: r)",
+    ] {
         assert!(said("", part), "{part}: {:?}", report.notes);
     }
+    // The main annotation layer's items, placed nowhere, are noted on it.
+    assert!(said("Annotations", "2 annotations whose geometry doesn't read"), "{:?}", report.notes);
     for part in [
-        "time settings",
         "other styles (night)",
         "joins",
         "virtual fields",
@@ -737,6 +792,9 @@ fn what_rustgis_has_no_place_for_is_noted() {
     assert_eq!(report.notes.iter().find(|n| n.text.contains("draw effects")).map(|n| n.count), Some(1));
     // Wrapping and repeats along lines are read now, not noted.
     assert!(!said("A", "wrapped") && !said("A", "repeated"), "{:?}", report.notes);
+    // Its time by a date field is read now, not noted.
+    assert!(!said("A", "time settings"), "{:?}", report.notes);
+    assert_eq!(p.layers.iter().find(|l| l.name == "A").and_then(|l| l.style.time.as_deref()), Some("day"));
 }
 
 /// A raster style file with `renderer` as its renderer and `pipe` after it in the pipe.
@@ -842,7 +900,19 @@ fn raster_renderers_read_as_rustgis_raster_styles() {
     );
     assert_eq!(
         s.raster.unwrap().renderer,
-        RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 300.0, altitude: 35.0, z_factor: 2.0 }
+        RasterRenderer::ShadedRelief {
+            band: 0,
+            ramp: None,
+            azimuth: 300.0,
+            altitude: 35.0,
+            z_factor: 2.0,
+            shadow: 0.0,
+            sky: 0.0,
+            fill: 0.0,
+            rock: None,
+            ambient: None,
+            balanced: false,
+        }
     );
     assert!(report.notes.iter().any(|n| n.text.contains("saturation")));
     let (s, report) = read(r#"<rasterrenderer type="contour" band="1"/>"#, "");
@@ -854,9 +924,184 @@ fn raster_renderers_read_as_rustgis_raster_styles() {
     }
 }
 
+/// QGIS's annotation items come in as graphics, in z order, with their look; what RustGIS draws
+/// differently or not at all is noted.
+#[test]
+fn annotations_carry_over_as_graphics() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qgs");
+    let text = std::fs::read_to_string(root.join("annotations-styled.qgs")).unwrap();
+    let mut report = Report::default();
+    let project = read_project(&text, "/p/qgs", &mut report).unwrap();
+    let layer = project.layers.iter().find(|l| l.kind == "annotation").unwrap();
+    assert_eq!((layer.name.as_str(), layer.crs.as_deref()), ("styled annotations", Some("EPSG:2056")));
+    let kinds: Vec<&str> = layer.annotations.iter().map(|a| a.graphic.kind).collect();
+    // The polygon (z -1) first, the bold text (z 5) last; the box of the centred text under it.
+    assert_eq!(kinds.first(), Some(&"polygon"), "{kinds:?}");
+    assert_eq!(layer.annotations.last().and_then(|a| a.graphic.text.as_deref()), Some("right, bold, red"));
+    // Switched off and SVG: left out.
+    let texts: Vec<&str> = layer.annotations.iter().filter_map(|a| a.graphic.text.as_deref()).collect();
+    assert!(!texts.contains(&"switched off"), "{texts:?}");
+    assert!(texts.contains(&"html text"), "HTML read as plain text: {texts:?}");
+    assert_eq!(kinds.iter().filter(|k| **k == "picture").count(), 1, "{kinds:?}");
+
+    let bold = layer.annotations.last().unwrap().graphic.clone();
+    assert!(bold.bold && !bold.italic, "{bold:?}");
+    assert_eq!((bold.fill, bold.align, bold.font_size), (Some(Rgba::rgb(200, 0, 0)), Some(TextAlign::Right), Some(14.0)));
+    assert_eq!(bold.geometry, rustgis_data::Geometry::Point(rustgis_geom::Coord::new(2697000.0, 1261800.0)));
+    let italic = layer.annotations.iter().find(|a| a.graphic.text.as_deref() == Some("turned, italic")).unwrap();
+    // 4 mm in typographic points.
+    assert!(italic.graphic.italic && !italic.graphic.bold && (italic.graphic.font_size.unwrap() - 4.0 * 72.0 / 25.4).abs() < 1e-3);
+    let square = layer.annotations.iter().find(|a| a.graphic.kind == "point" && a.graphic.fill == Some(Rgba::rgb(255, 0, 0))).unwrap();
+    assert!((square.graphic.size.unwrap() - 4.0 * 96.0 / 25.4).abs() < 1e-3, "{square:?}");
+    let line = layer.annotations.iter().find(|a| a.graphic.outline == Some(Rgba::rgb(0, 0, 255))).unwrap();
+    assert_eq!(line.graphic.kind, "line");
+    let Some(rustgis_data::Geometry::Polygon(rings)) = layer.annotations.first().map(|a| &a.graphic.geometry) else { panic!() };
+    assert_eq!(rings[0].len(), 2, "the hole is kept");
+    // The centred text's box: its background with its frame's outline, under the text.
+    let at = layer.annotations.iter().position(|a| a.graphic.text.as_deref() == Some("centred in a box")).unwrap();
+    let boxed = &layer.annotations[at - 1].graphic;
+    assert_eq!((boxed.kind, boxed.fill, boxed.outline), ("rectangle", Some(Rgba::rgb(255, 255, 180)), Some(Rgba::rgb(200, 0, 0))));
+    // The picture: its file from the project's folder, fitted keeping its aspect; its frame over it.
+    let pic = layer.annotations.iter().position(|a| a.picture.is_some()).unwrap();
+    assert_eq!(layer.annotations[pic].picture.as_deref(), Some("/p/qgs/../data/picture.png"));
+    assert!(layer.annotations[pic].keep_aspect);
+    assert_eq!(layer.annotations[pic + 1].graphic.kind, "rectangle");
+    // The main annotation layer, over the others.
+    let main = project.main_annotations.as_ref().unwrap();
+    assert_eq!((main.name.as_str(), main.annotations.len()), ("Annotations", 1));
+
+    let said = |part: &str| report.notes.iter().any(|n| n.layer == "styled annotations" && n.text.contains(part));
+    for part in [
+        "a switched-off annotation",
+        "an SVG picture annotation",
+        "4 text annotations, centred on their points",
+        "a turned text annotation, drawn level",
+        "a text annotation in HTML",
+        "sized at a reference scale",
+        "a text along a line, drawn level",
+        "a rectangle text aligned to a side of its box",
+        "a rectangle text of a fixed size",
+        "marker annotation of another shape, drawn as a circle",
+        "symbol of dashes",
+        "text annotations in DejaVu Sans",
+        "rectangle texts, drawn on their own lines rather than wrapped",
+    ] {
+        assert!(said(part), "{part}: {:#?}", report.notes);
+    }
+}
+
+/// A point text without an alignment (a file from before QGIS wrote one) is left aligned, as
+/// QGIS reads it; a picture naming no file and a huge font are noted.
+#[test]
+fn annotation_defaults_and_limits() {
+    let qgs = r#"<qgis><projectCrs><spatialrefsys><authid>EPSG:3857</authid></spatialrefsys></projectCrs><projectlayers>
+      <maplayer type="annotation"><id>a</id><layername>N</layername><items>
+        <item type="pointtext" text="old" x="1" y="2"/>
+        <item type="pointtext" text="huge" x="1" y="2"><pointTextFormat><text-style fontSize="900" fontSizeUnit="Point"/></pointTextFormat></item>
+        <item type="picture" path="" xMin="0" yMin="0" xMax="1" yMax="1"/>
+      </items></maplayer></projectlayers></qgis>"#;
+    let mut report = Report::default();
+    let p = read_project(qgs, "", &mut report).unwrap();
+    let a = &p.layers[0].annotations;
+    assert_eq!(a[0].graphic.align, Some(TextAlign::Left));
+    let said = |part: &str| report.notes.iter().any(|n| n.text.contains(part));
+    assert!(said("a picture annotation that names no picture"), "{:?}", report.notes);
+    assert!(said("an annotation with a text longer, a font"), "{:?}", report.notes);
+}
+
+/// An HTML text's tags are dropped (and its head, as QGIS's editor writes it), but a `<` that
+/// opens no tag (`a < b`, or one never closed) is kept as text, with what follows it; white
+/// space and entities are read as HTML reads them.
+#[test]
+fn html_annotation_texts_keep_a_lone_less_than() {
+    for (html, plain) in [
+        ("<b>a</b> &lt; b", "a < b"),
+        ("x < 3 and y > 2", "x < 3 and y > 2"),
+        ("1 <2 <b>bold</b>", "1 <2 bold"),
+        ("left<br>right", "left\nright"),
+        ("never closed <b", "never closed <b"),
+        // As QGIS's text editor writes it (Qt's `toHtml`): the head and its style aren't text,
+        // the source's line breaks and indents are white space, paragraphs are lines.
+        (
+            "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0//EN\" \"http://www.w3.org/TR/REC-html40/strict.dtd\">\n<html><head><meta name=\"qrichtext\" content=\"1\" /><style type=\"text/css\">\np, li { white-space: pre-wrap; }\n</style></head><body style=\" font-family:'Sans'; font-size:10pt;\">\n<p style=\" margin-top:0px;\">Hello   <b>bold</b></p>\n<p style=\" margin-top:0px;\">World &#233;&#xE9;&nbsp;!</p></body></html>",
+            "Hello bold\nWorld éé !",
+        ),
+        ("&unknown; &amp;lt;", "&unknown; &lt;"),
+        // Qt's empty paragraph is one blank line; blocks left open still break lines; table cells
+        // stay apart; a comment holding a `>` is dropped; a control character isn't text.
+        ("<p>a</p>\n<p style=\"-qt-paragraph-type:empty;\"><br /></p>\n<p>b</p>", "a\n\nb"),
+        ("<p>one<p>two<ul><li>x<li>y</ul>", "one\ntwo\nx\ny"),
+        ("<table><tr><td>a</td><td>b</td></tr></table>", "a b"),
+        ("a<!-- x > y -->b", "ab"),
+        ("bell&#7;&#+65;&#0;", "bell&#7;&#+65;&#0;"),
+    ] {
+        let qgs = format!(
+            r#"<qgis><projectCrs><spatialrefsys><authid>EPSG:3857</authid></spatialrefsys></projectCrs><projectlayers>
+      <maplayer type="annotation"><id>a</id><layername>N</layername><items>
+        <item type="pointtext" text="{}" x="1" y="2"><pointTextFormat><text-style allowHtml="1"/></pointTextFormat></item>
+      </items></maplayer></projectlayers></qgis>"#,
+            html.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\n', "&#10;")
+        );
+        let mut report = Report::default();
+        let p = read_project(&qgs, "", &mut report).unwrap();
+        assert_eq!(p.layers[0].annotations[0].graphic.text.as_deref(), Some(plain), "{html}");
+    }
+    // Many a `<` with no `>` after it: read in linear time (a quadratic scan of 200,000 would
+    // take minutes), each kept.
+    // As many an `&` with no `;`.
+    for lone in ["<".repeat(200_000), "&".repeat(200_000)] {
+        let qgs = format!(
+            r#"<qgis><projectCrs><spatialrefsys><authid>EPSG:3857</authid></spatialrefsys></projectCrs><projectlayers>
+      <maplayer type="annotation"><id>a</id><layername>N</layername><items>
+        <item type="pointtext" text="{}" x="1" y="2"><pointTextFormat><text-style allowHtml="1"/></pointTextFormat></item>
+      </items></maplayer></projectlayers></qgis>"#,
+            lone.replace('&', "&amp;").replace('<', "&lt;")
+        );
+        let started = std::time::Instant::now();
+        let p = read_project(&qgs, "", &mut Report::default()).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(p.layers[0].annotations[0].graphic.text.as_ref().map(String::len), Some(200_000));
+    }
+}
+
+/// What `push` clamps, `cut` says it cuts (and so the import notes it): a negative width or size,
+/// and letter spacing outside its range, as well as the limits above.
+#[test]
+fn graphics_cut_counts_every_clamp() {
+    let point = rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0));
+    let with = |f: &dyn Fn(&mut crate::graphics::Graphic)| {
+        let mut g = crate::graphics::Graphic::new("point", point.clone());
+        f(&mut g);
+        crate::graphics::cut(&g)
+    };
+    assert!(!with(&|g| g.width = Some(2.0)));
+    assert!(with(&|g| g.width = Some(-1.0)));
+    assert!(with(&|g| g.size = Some(-0.5)));
+    assert!(with(&|g| g.letter_spacing = 60.0));
+    assert!(with(&|g| g.letter_spacing = -60.0));
+    assert!(!with(&|g| g.letter_spacing = 2.0));
+    assert!(with(&|g| g.letter_spacing = f32::INFINITY));
+    assert!(with(&|g| g.letter_spacing = f32::NAN));
+}
+
+/// QGIS 4 (on Qt 6) weighs fonts from 100 to 1000, QGIS 3 from 0 to 99: a normal weight in
+/// either isn't bold.
+#[test]
+fn font_weights_read_on_both_scales() {
+    for (weight, bold) in [("50", false), ("75", true), ("400", false), ("600", true), ("700", true)] {
+        let qml = format!(
+            r#"<qgis><labeling type="simple"><settings><text-style fieldName="name" fontWeight="{weight}"/></settings></labeling></qgis>"#
+        );
+        let mut report = Report::default();
+        let s = read_style(&qml, "layer", &mut report).unwrap();
+        assert_eq!(s.labels.unwrap().default.bold, bold, "weight {weight}");
+    }
+}
+
 /// Every generated style and project in `testdata/qgis` reads, each project with its layers.
 #[test]
 fn every_corpus_file_reads() {
+    const PASSWORD: &str = "qgis-corpus-private-password-73194";
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis");
     let files = |dir: &str, extensions: &[&str]| {
         let mut paths: Vec<_> = std::fs::read_dir(root.join(dir)).unwrap().map(|e| e.unwrap().path()).collect();
@@ -866,14 +1111,32 @@ fn every_corpus_file_reads() {
     };
     // Pin the corpus sizes so a regeneration cannot silently drop fixtures.
     let styles = files("generated/qml", &["qml"]);
-    assert_eq!(styles.len(), 90, "style corpus changed: {styles:?}");
+    assert_eq!(styles.len(), 110, "style corpus changed: {styles:?}");
+    // Raster image markers' files are found from the style's folder and the project's.
+    let mut read = |source: &str| {
+        use base64::Engine;
+        let b64 = match source.strip_prefix("base64:") {
+            Some(b64) => b64.to_string(),
+            None => base64::engine::general_purpose::STANDARD.encode(std::fs::read(source).map_err(|_| "whose image file doesn't open")?),
+        };
+        Ok((b64, 0.5))
+    };
     for path in &styles {
         let text = std::fs::read_to_string(path).unwrap();
+        let dir = path.parent().unwrap().to_string_lossy().to_string();
         let mut report = Report::default();
-        read_style(&text, "layer", &mut report).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        super::read_style(&text, "layer", &dir, &mut read, &mut report).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        if path.to_string_lossy().contains("symbol-raster-marker-") {
+            assert!(
+                !report.notes.iter().any(|n| n.text.starts_with("raster image markers whose")),
+                "{}: {:?}",
+                path.display(),
+                report.notes
+            );
+        }
     }
     let projects = files("generated/qgs", &["qgs", "qgz"]);
-    assert_eq!(projects.len(), 21, "project corpus changed: {projects:?}");
+    assert_eq!(projects.len(), 37, "project corpus changed: {projects:?}");
     for path in &projects {
         let bytes = std::fs::read(path).unwrap();
         let text = if path.extension().is_some_and(|e| e == "qgz") {
@@ -882,12 +1145,15 @@ fn every_corpus_file_reads() {
         } else {
             String::from_utf8(bytes).unwrap()
         };
+        // The worktree path itself may contain "secret"; use a distinct credential sentinel.
+        let text = text.replace("password='secret'", &format!("password='{PASSWORD}'"));
         let dir = path.parent().unwrap().to_string_lossy().to_string();
         let mut report = Report::default();
-        let project = read_project(&text, &dir, &mut report).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let project = super::read_project(&text, &dir, &mut read, &mut report).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert!(!report.notes.iter().any(|n| n.text.starts_with("raster image markers whose")), "{}: {:?}", path.display(), report.notes);
         assert!(!project.layers.is_empty(), "{}: no layers", path.display());
         // The PostGIS and SQL Server projects' made-up password reaches neither the layers nor the notes.
-        assert!(!format!("{project:?} {report:?}").contains("secret"), "{}: the password came through", path.display());
+        assert!(!format!("{project:?} {report:?}").contains(PASSWORD), "{}: the password came through", path.display());
     }
 }
 
@@ -1060,12 +1326,13 @@ fn marker_symbols_of_several_layers_carry_over_as_marks_turned_by_their_field() 
     let Some(Renderer::Single(sym)) = &s.renderer else { panic!() };
     assert_eq!(sym.marker, Marker::Star);
 
-    // An angle from any other expression is noted, and turns nothing.
+    // An angle from any other expression turns the markers by that expression.
     let other = qml.replace("</layer>", &format!("{}</layer>", dd("&quot;A&quot; * 2")));
     let mut report = Report::default();
     let s = read_style(&other, "Signs", &mut report).unwrap();
     assert_eq!(s.marker_rotation, Some(None));
-    assert!(report.notes.iter().any(|n| n.text.contains("data-defined")), "{:?}", report.notes);
+    assert_eq!(s.symbol_by.and_then(|b| b.angle).as_deref(), Some(r#""A" * 2"#));
+    assert!(!report.notes.iter().any(|n| n.text.contains("data-defined")), "{:?}", report.notes);
 
     // Classes of one layer: an antenna that keeps still where a cliff turns by the field. The
     // antenna's single plain character becomes a mark that doesn't turn; the cliff's turns.
@@ -1114,6 +1381,158 @@ fn marker_symbols_of_several_layers_carry_over_as_marks_turned_by_their_field() 
     let mut report = Report::default();
     read_style(old, "Signs", &mut report).unwrap();
     assert!(report.notes.iter().any(|n| n.text.contains("data-defined")), "{:?}", report.notes);
+}
+
+/// A raster image marker layer showing `file`, 4 mm wide, with `extra` settings.
+fn raster_marker(file: &str, extra: &str) -> String {
+    format!(
+        r#"<layer class="RasterMarker" enabled="1"><Option type="Map"><Option name="imageFile" value="{file}"/><Option name="size" value="4"/>
+        <Option name="size_unit" value="MM"/>{extra}</Option></layer>"#
+    )
+}
+
+/// A style of one marker symbol of `layers`, at `alpha`.
+fn marker_qml(alpha: &str, layers: &str) -> String {
+    format!(
+        r#"<qgis version="4.2.3"><renderer-v2 type="singleSymbol"><symbols><symbol type="marker" name="0" alpha="{alpha}">{layers}</symbol></symbols></renderer-v2></qgis>"#
+    )
+}
+
+#[test]
+fn raster_image_markers_draw_their_image_read_once_from_the_style_folder() {
+    use crate::symbology::Picture;
+    let mm = 96.0 / 25.4;
+    let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+    // A file relative to the style's folder; the reader gives the image and its height over width.
+    let mut asked = Vec::new();
+    let mut read = |source: &str| {
+        asked.push(source.to_string());
+        Ok((format!("image of {source}"), 0.5))
+    };
+    let mut report = Report::default();
+    let s = super::read_style(&marker_qml("1", &raster_marker("./pins/a.png", "")), "Pins", "/styles", &mut read, &mut report).unwrap();
+    assert_eq!(asked, ["/styles/pins/a.png"]);
+    let Some(Renderer::Single(sym)) = &s.renderer else { panic!("{:?}", s.renderer) };
+    assert_eq!(sym.marker, Marker::Picture(Picture::new("image of /styles/pins/a.png")));
+    assert!(near(sym.size, 4.0 * mm), "its width: {}", sym.size);
+    assert_eq!(s.line_strokes, Some(Vec::new()), "centred and upright, it is the symbol itself");
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+
+    // One file, however its path is written, is read once.
+    asked.clear();
+    let mut read = |source: &str| {
+        asked.push(source.to_string());
+        Ok((format!("image of {source}"), 0.5))
+    };
+    let twice = format!("{}{}", raster_marker("./pins/a.png", ""), raster_marker("pins/a.png", ""));
+    super::read_style(&marker_qml("1", &twice), "Pins", "/styles", &mut read, &mut Report::default()).unwrap();
+    assert_eq!(asked, ["/styles/pins/a.png"]);
+
+    // Two layers of one image read it once, and anchored at their top left they sit half their
+    // width right of the point and half their height (the image's, not their width) below it.
+    asked.clear();
+    let mut read = |source: &str| {
+        asked.push(source.to_string());
+        Ok((format!("image of {source}"), 0.5))
+    };
+    let anchored = r#"<Option name="horizontal_anchor_point" value="0"/><Option name="vertical_anchor_point" value="0"/>"#;
+    let qml = marker_qml("1", &format!("{}{}", raster_marker("base64:QUJD", ""), raster_marker("base64:QUJD", anchored)));
+    let mut report = Report::default();
+    let s = super::read_style(&qml, "Pins", "", &mut read, &mut report).unwrap();
+    assert_eq!(asked, ["base64:QUJD"], "read once, a folder or none");
+    let marks = s.line_strokes.unwrap();
+    let picture = LineMark::Marker(Marker::Picture(Picture::new("image of base64:QUJD")));
+    assert!(marks.iter().all(|m| m.markers.is_some_and(|k| k.mark == picture)), "{marks:?}");
+    let top = marks.iter().find(|m| m.offset != 0.0).unwrap();
+    assert!(near(top.offset, mm) && near(top.markers.unwrap().offset_along, 2.0 * mm), "{top:?}");
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+
+    // Along a line, the image is the mark.
+    let line = format!(
+        r#"<qgis version="4.2.3"><renderer-v2 type="singleSymbol"><symbols><symbol type="line" name="0" alpha="1">
+        <layer class="MarkerLine" enabled="1"><Option type="Map"><Option name="placements" value="Interval"/><Option name="interval" value="5"/></Option>
+        <symbol type="marker" name="@0@0" alpha="1">{}</symbol></layer></symbol></symbols></renderer-v2></qgis>"#,
+        raster_marker("base64:QUJD", "")
+    );
+    let mut read = |source: &str| Ok((format!("image of {source}"), 0.5));
+    let mut report = Report::default();
+    let s = super::read_style(&line, "Road", "", &mut read, &mut report).unwrap();
+    assert_eq!(s.line_strokes.unwrap()[0].markers.map(|m| m.mark), Some(picture));
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    // Its marker symbol see-through: drawn opaque, noted.
+    let mut report = Report::default();
+    let faded = line.replace(r#"name="@0@0" alpha="1""#, r#"name="@0@0" alpha="0.5""#);
+    super::read_style(&faded, "Road", "", &mut read, &mut report).unwrap();
+    assert_eq!(report.notes.iter().map(|n| n.text.as_str()).collect::<Vec<_>>(), ["see-through raster image markers, drawn opaque"]);
+    // The line see-through as well: one symbol, one note.
+    let mut report = Report::default();
+    let both = faded.replace(r#"type="line" name="0" alpha="1""#, r#"type="line" name="0" alpha="0.5""#);
+    assert_ne!(both, faded);
+    super::read_style(&both, "Road", "", &mut read, &mut report).unwrap();
+    let notes: Vec<_> = report.notes.iter().map(|n| (n.text.as_str(), n.count)).collect();
+    assert_eq!(notes, [("see-through raster image markers, drawn opaque", 1)]);
+}
+
+#[test]
+fn raster_image_markers_that_cant_be_drawn_are_circles_saying_why() {
+    // Each kind of image the reader isn't asked for, or can't give, with what the note says.
+    let mut asked = Vec::new();
+    let mut read = |source: &str| {
+        asked.push(source.to_string());
+        if source.ends_with("gone.png") { Err("whose image file doesn't open") } else { Ok(("QUJD".to_string(), 1.0)) }
+    };
+    let cases = [
+        ("", "raster image markers with no image, drawn as circles"),
+        (
+            "https://example.invalid/pin.png",
+            "raster image markers whose image is at a web address, which RustGIS doesn't fetch, drawn as circles",
+        ),
+        ("pins/a.png", "raster image markers whose image file is relative to a folder the import wasn't given, drawn as circles"),
+        (
+            "C:pins\\a.png",
+            "raster image markers whose image file is relative to a drive's working folder, which no project folder tells, drawn as circles",
+        ),
+        (
+            "attachment:///abc_a.png",
+            "raster image markers whose image is kept inside the .qgz project, which RustGIS doesn't read it from, drawn as circles",
+        ),
+        ("\\\\host\\share\\a.png", "raster image markers whose image is on a network share, which RustGIS doesn't open, drawn as circles"),
+        ("//host/share/a.png", "raster image markers whose image is on a network share, which RustGIS doesn't open, drawn as circles"),
+        ("/data/gone.png", "raster image markers whose image file doesn't open, drawn as circles"),
+    ];
+    for (file, note) in cases {
+        let mut report = Report::default();
+        let s = super::read_style(&marker_qml("1", &raster_marker(file, "")), "Pins", "", &mut read, &mut report).unwrap();
+        let Some(Renderer::Single(sym)) = &s.renderer else { panic!() };
+        assert_eq!(sym.marker, Marker::Circle, "{file}");
+        assert_eq!(report.notes.iter().map(|n| n.text.as_str()).collect::<Vec<_>>(), [note], "{file}");
+    }
+    assert_eq!(asked, ["/data/gone.png"], "neither a web address, a network share nor a relative path without a folder is looked for");
+
+    // Drawn, but not as QGIS draws it: a ratio of its own, see-through (the layer's or the symbol's).
+    let mut read = |_: &str| Ok(("QUJD".to_string(), 0.5));
+    let own = r#"<Option name="fixedAspectRatio" value="1"/><Option name="alpha" value="0.5"/>"#;
+    let mut report = Report::default();
+    super::read_style(&marker_qml("0.5", &raster_marker("base64:QUJD", own)), "Pins", "", &mut read, &mut report).unwrap();
+    let notes: Vec<_> = report.notes.iter().map(|n| (n.text.as_str(), n.count)).collect();
+    assert_eq!(
+        notes,
+        [
+            ("raster image markers of a fixed aspect ratio, drawn in their image's own", 1),
+            ("see-through raster image markers, drawn opaque", 1)
+        ]
+    );
+    // A ratio that is the image's own is no change; a switched-off layer's image isn't read.
+    let mut asked = 0;
+    let mut read = |_: &str| {
+        asked += 1;
+        Ok(("QUJD".to_string(), 0.5))
+    };
+    let off = raster_marker("/data/off.png", "").replace(r#"enabled="1""#, r#"enabled="0""#);
+    let qml = marker_qml("1", &format!("{off}{}", raster_marker("base64:QUJD", r#"<Option name="fixedAspectRatio" value="0.5"/>"#)));
+    let mut report = Report::default();
+    super::read_style(&qml, "Pins", "", &mut read, &mut report).unwrap();
+    assert_eq!((asked, report.notes.len()), (1, 0), "{:?}", report.notes);
 }
 
 /// Gradient and shapeburst fills carry over: their two colours (or their ramp's, with its stops,
@@ -1204,4 +1623,1727 @@ fn gradient_and_shapeburst_fills_carry_over() {
     // Without the setting, QGIS's default: over the whole shape.
     let (fills, _) = read(&burst.replace(r#"<prop k="use_whole_shape" v="0"/>"#, ""));
     assert!(matches!(fills[0].pattern, FillPattern::Shapeburst { distance: None, .. }), "{fills:?}");
+}
+
+/// A label text that is an expression, and data-defined label size, colour and rotation, carry
+/// over as the label class's expressions; sizes in another unit are turned into points, and
+/// what isn't drawn by expression is noted by name.
+#[test]
+fn label_expressions_and_data_defined_label_settings_carry_over() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qml");
+    let read = |text: &str| {
+        let mut report = Report::default();
+        let s = read_style(text, "points", &mut report).unwrap();
+        (s.labels.unwrap().default, report)
+    };
+    let (c, report) = read(&std::fs::read_to_string(dir.join("label-expression-text.qml")).unwrap());
+    assert_eq!(c.by.text.as_deref(), Some(r#""name" || ' (' || to_string("value") || ')'"#));
+    assert!(c.field.is_empty());
+    assert!(!report.notes.iter().any(|n| n.text.contains("expression")), "{:?}", report.notes);
+    let (c, report) = read(&std::fs::read_to_string(dir.join("label-data-defined.qml")).unwrap());
+    assert_eq!(c.field, "name");
+    assert_eq!(
+        (c.by.size.as_deref(), c.by.color.as_deref(), c.by.angle.as_deref()),
+        (Some(r#""value" / 5 + 6"#), Some(r#""kind""#), Some(r#""angle""#))
+    );
+    assert!(!report.notes.iter().any(|n| n.text.contains("data-defined")), "{:?}", report.notes);
+    // A size in millimetres, QGIS 2's counterclockwise rotation, and one RustGIS has no place for.
+    let qml = |unit: &str, props: &str| {
+        format!(
+            r#"<qgis version="3.40.0"><labeling type="simple"><settings><text-style fieldName="name" fontSize="3" fontSizeUnit="{unit}"/>
+            <dd_properties><Option type="Map"><Option name="properties" type="Map">{props}</Option></Option></dd_properties></settings></labeling></qgis>"#
+        )
+    };
+    let dd = |name: &str, expr: &str| {
+        format!(
+            r#"<Option name="{name}" type="Map"><Option name="active" type="bool" value="true"/><Option name="expression" value="{expr}"/><Option name="type" type="int" value="3"/></Option>"#
+        )
+    };
+    let (c, report) =
+        read(&qml("MM", &[dd("Size", "2 + 1"), dd("Rotation", "&quot;deg&quot;"), dd("Show", "1"), dd("Family", "'Arial'")].concat()));
+    assert_eq!((c.by.size.as_deref(), c.by.angle.as_deref()), (Some("(2 + 1) * 2.834646"), Some(r#"-("deg")"#)));
+    assert!(report.notes.iter().any(|n| n.text.contains("data-defined label settings (Family, Show)")), "{:?}", report.notes);
+    // Past twelve names, how many more.
+    let many: String = (1..=14).map(|i| dd(&format!("Unknown{i:02}"), "1")).collect();
+    let (_, report) = read(&qml("Point", &many));
+    assert!(report.notes.iter().any(|n| n.text.contains("Unknown12, and 2 more)")), "{:?}", report.notes);
+    // Both rotations: the first is kept, the other noted.
+    let (c, report) = read(&qml("Point", &[dd("LabelRotation", "10"), dd("Rotation", "20")].concat()));
+    assert_eq!(c.by.angle.as_deref(), Some("10"));
+    assert!(report.notes.iter().any(|n| n.text.contains("data-defined label settings (Rotation)")), "{:?}", report.notes);
+    // An empty expression labels nothing: the class is left out, said.
+    for empty in ["", "&quot;&quot;", "&quot; &quot;", "  "] {
+        let qml = format!(
+            r#"<qgis version="3.40.0"><labeling type="simple"><settings><text-style isExpression="1" fieldName="{empty}"/></settings></labeling></qgis>"#
+        );
+        let mut report = Report::default();
+        let s = read_style(&qml, "points", &mut report);
+        assert!(!s.is_ok_and(|s| s.labels.is_some()), "{empty:?}");
+        assert!(report.notes.iter().any(|n| n.text.contains("an empty expression")), "{empty:?}: {:?}", report.notes);
+    }
+    // An expression too long to read: the class is left out, said.
+    let long = format!(
+        r#"<qgis version="3.40.0"><labeling type="simple"><settings><text-style isExpression="1" fieldName="'{}'"/></settings></labeling></qgis>"#,
+        "x".repeat(20_000)
+    );
+    let mut report = Report::default();
+    let s = read_style(&long, "points", &mut report);
+    assert!(!s.is_ok_and(|s| s.labels.is_some()));
+    assert!(report.notes.iter().any(|n| n.text.contains("too long")), "{:?}", report.notes);
+}
+
+/// Data-defined size, colours, outline width and angle carry over as the layer's expressions:
+/// a field's quoted, sizes in millimetres turned into points; an angle that is a field still
+/// turns the markers by it, as before.
+#[test]
+fn data_defined_symbol_settings_carry_over_as_expressions() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qml/datadefined-size-angle-color.qml");
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut report = Report::default();
+    let s = read_style(&text, "points", &mut report).unwrap();
+    let by = s.symbol_by.clone().unwrap();
+    assert_eq!(by.size.as_deref(), Some(r#"("value") * 3.779528"#));
+    assert_eq!(by.fill.as_deref(), Some(r#"CASE WHEN "kind" = 'a' THEN '#ff0000' ELSE '#0000ff' END"#));
+    assert_eq!(by.angle, None, "a field's angle turns by the field");
+    assert_eq!(s.marker_rotation.clone().flatten().map(|r| r.field), Some("angle".into()));
+    assert!(!report.notes.iter().any(|n| n.text.contains("data-defined")), "{:?}", report.notes);
+    // Applied to a point layer with those fields, each reads and draws per feature.
+    let fields = ["value", "angle"].map(|f| rustgis_data::Field::new(f, rustgis_data::FieldType::Double));
+    let mut ds = rustgis_data::Dataset::new("points", rustgis_data::GeometryType::Point, fields.to_vec());
+    ds.fields.push(rustgis_data::Field::new("kind", rustgis_data::FieldType::Text));
+    ds.push(
+        Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0))),
+        vec![rustgis_data::Value::Float(2.0), rustgis_data::Value::Float(0.0), rustgis_data::Value::Text("a".into())],
+    );
+    let mut layer = crate::Layer::new(1, ds);
+    s.apply(&mut layer);
+    let sym = layer.styler(None).symbol(0);
+    assert!((sym.size - 2.0 * 96.0 / 25.4).abs() < 1e-3 && sym.fill == Rgba::rgb(255, 0, 0), "{sym:?}");
+
+    // A line's colour and width; an outline width in points; what isn't drawn by expression is noted.
+    let dd = |props: &[(&str, &str)]| {
+        let one = |(name, expr): &(&str, &str)| {
+            format!(
+                r#"<Option type="Map" name="{name}"><Option value="true" type="bool" name="active"/><Option value="{expr}" type="QString" name="expression"/>
+                <Option value="3" type="int" name="type"/></Option>"#
+            )
+        };
+        format!(
+            r#"<data_defined_properties><Option type="Map"><Option value="" type="QString" name="name"/><Option type="Map" name="properties">{}</Option>
+            <Option value="collection" type="QString" name="type"/></Option></data_defined_properties>"#,
+            props.iter().map(one).collect::<String>()
+        )
+    };
+    let line = format!(
+        r#"<qgis version="3.40.0"><renderer-v2 type="singleSymbol"><symbols><symbol type="line" name="0" alpha="1">
+        <layer class="SimpleLine" enabled="1"><Option type="Map"><Option name="line_width" value="0.5"/><Option name="line_width_unit" value="Point"/></Option>{}</layer>
+        </symbol></symbols></renderer-v2></qgis>"#,
+        dd(&[("outlineWidth", "if(@map_scale &lt; 4656581, 1.0, 0)"), ("outlineColor", "color_rgb(255, 0, 0)")])
+    );
+    let mut report = Report::default();
+    let s = read_style(&line, "roads", &mut report).unwrap();
+    let by = s.symbol_by.unwrap();
+    // QGIS's map scale read as RustGIS's.
+    let k = QGIS_SCALE;
+    assert_eq!(by.stroke_width.as_deref(), Some(format!("(if((@map_scale / {k}) < 4656581, 1.0, 0)) * 1.333333").as_str()), "{by:?}");
+    assert_eq!(by.stroke.as_deref(), Some("color_rgb(255, 0, 0)"));
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    // A line of two strokes draws each with its own: left out, said.
+    let stroke =
+        r#"<layer class="SimpleLine" enabled="1"><Option type="Map"><Option name="line_color" value="0,0,0,255"/></Option></layer>"#;
+    let doubled = line.replace("</symbol>", &format!("{stroke}{stroke}</symbol>"));
+    let mut report = Report::default();
+    let s = read_style(&doubled, "roads", &mut report).unwrap();
+    assert!(s.symbol_by.is_none_or(|b| b.stroke.is_none() && b.stroke_width.is_none()));
+    assert!(report.notes.iter().any(|n| n.text.contains("line of several strokes")), "{:?}", report.notes);
+    // Classes: one sized by expression, one not; left out (applied to every feature, they would
+    // change the other's), said. A see-through symbol's expression colour is drawn opaque, said.
+    let marker = |name: &str, props: &str| {
+        format!(
+            r#"<symbol type="marker" name="{name}" alpha="0.5"><layer class="SimpleMarker" enabled="1"><Option type="Map"/>{props}</layer></symbol>"#
+        )
+    };
+    let classes = format!(
+        r#"<qgis version="3.40.0"><renderer-v2 type="categorizedSymbol" attr="kind"><categories>
+          <category value="a" symbol="0" label="a" render="true"/><category value="b" symbol="1" label="b" render="true"/></categories>
+          <symbols>{}{}</symbols></renderer-v2></qgis>"#,
+        marker("0", &dd(&[("size", "&quot;v&quot;"), ("fillColor", "'red'")])),
+        marker("1", "")
+    );
+    let mut report = Report::default();
+    let s = read_style(&classes, "points", &mut report).unwrap();
+    assert!(s.symbol_by.is_none_or(|b| b.is_empty()));
+    let said = |t: &str| report.notes.iter().any(|n| n.text.contains(t));
+    assert!(said("differ between its classes") && said("see-through symbol"), "{:?}", report.notes);
+    // Both classes alike: theirs. With a class switched off besides, which they would paint: left
+    // out, said.
+    let same = dd(&[("size", "&quot;v&quot;")]);
+    let alike =
+        classes.replace(&marker("1", ""), &marker("1", &same)).replace(&dd(&[("size", "&quot;v&quot;"), ("fillColor", "'red'")]), &same);
+    let mut report = Report::default();
+    let s = read_style(&alike, "points", &mut report).unwrap();
+    assert_eq!(s.symbol_by.unwrap().size.as_deref(), Some(r#"("v") * 3.779528"#));
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    let off = alike.replace("</categories>", r#"<category value="c" symbol="1" label="c" render="false"/></categories>"#);
+    let mut report = Report::default();
+    let s = read_style(&off, "points", &mut report).unwrap();
+    assert!(s.symbol_by.is_none_or(|b| b.is_empty()));
+    assert!(report.notes.iter().any(|n| n.text.contains("a class switched off")), "{:?}", report.notes);
+    // A marker of two layers (the Training Manual's world places): a white disc sized by
+    // expression, a black dot sized in proportion on top. The marks scale with the top layer's
+    // size; their colours stay their own, the outline colour by expression is left out.
+    let layer_of = |color: &str, size: &str, props: &[(&str, &str)]| {
+        format!(
+            r#"<layer class="SimpleMarker" enabled="1"><Option type="Map"><Option name="color" value="{color}"/><Option name="size" value="{size}"/></Option>{}</layer>"#,
+            dd(props)
+        )
+    };
+    let places = format!(
+        r#"<qgis version="3.10.4"><renderer-v2 type="singleSymbol"><symbols><symbol type="marker" name="0" alpha="1">{}{}</symbol></symbols></renderer-v2></qgis>"#,
+        layer_of(
+            "255,255,255,255",
+            "2.4",
+            &[
+                ("outlineColor", "IF(pop_max &gt; 5000000, color_rgb(255,0,0), color_rgb(0,0,0))"),
+                ("size", "scale_linear(pop_max, 7026, 35676000, 8, 18)")
+            ]
+        ),
+        layer_of("0,0,0,255", "0.5", &[("size", "0.208333*(scale_linear(pop_max, 7026, 35676000, 8, 18))")])
+    );
+    let mut report = Report::default();
+    let s = read_style(&places, "places", &mut report).unwrap();
+    let by = s.symbol_by.unwrap();
+    // Turned into the largest layer's (the symbol's) size: 2.4 / 0.5 times the dot's.
+    assert_eq!(by.size.as_deref(), Some("((0.208333*(scale_linear(pop_max, 7026, 35676000, 8, 18))) * 3.779528) * 4.8"));
+    assert!(by.stroke.is_none(), "{by:?}");
+    assert_eq!(s.line_strokes.map(|m| m.len()), Some(2));
+    let said = |t: &str| report.notes.iter().any(|n| n.text.contains(t));
+    // Both layers sized by expression scale together as QGIS scales them: nothing to say of that.
+    assert!(!said("scaled with its size") && said("colours and outline widths of a marker drawn as marks"), "{:?}", report.notes);
+    // A layer of a fixed size scales with the rest: said.
+    let fixed = places.replace(&dd(&[("size", "0.208333*(scale_linear(pop_max, 7026, 35676000, 8, 18))")]), "");
+    let mut report = Report::default();
+    read_style(&fixed, "places", &mut report).unwrap();
+    assert!(report.notes.iter().any(|n| n.text.contains("scaled with its size")), "{:?}", report.notes);
+    assert!(!report.notes.iter().any(|n| n.text.contains("drawn with the first's")), "{:?}", report.notes);
+
+    let dashed = line.replace("outlineColor", "customDash");
+    let mut report = Report::default();
+    let s = read_style(&dashed, "roads", &mut report).unwrap();
+    assert!(s.symbol_by.unwrap().stroke.is_none());
+    assert!(report.notes.iter().any(|n| n.text.contains("data-defined")), "{:?}", report.notes);
+}
+
+/// A layer of points with the fields QGIS's generated rule-based style filters by.
+fn rule_points(rows: &[(&str, i64, &str)]) -> crate::Layer {
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value};
+    let fields = vec![Field::new("kind", FieldType::Text), Field::new("value", FieldType::Integer), Field::new("name", FieldType::Text)];
+    let mut ds = Dataset::new("points", GeometryType::Point, fields);
+    for (kind, value, name) in rows {
+        let g = Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0));
+        ds.push(Some(g), vec![Value::Text((*kind).into()), Value::Int(*value), Value::Text((*name).into())]);
+    }
+    crate::Layer::new(1, ds)
+}
+
+/// The class each row of `l` draws with at 1:`scale`: its key, or `None` for the rest.
+fn rule_classes(l: &crate::Layer, scale: Option<f64>) -> Vec<Option<String>> {
+    let c = l.renderer.classer(&l.dataset, scale);
+    let Renderer::Unique { classes, .. } = &l.renderer else { panic!("{:?}", l.renderer) };
+    (0..l.dataset.features.len()).map(|r| l.renderer.unique_class(&l.dataset, r, &c).map(|i| classes[i].0.clone())).collect()
+}
+
+#[test]
+fn a_rule_based_renderer_classes_each_feature_by_the_first_rule_it_meets() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qml/renderer-RuleRenderer.qml");
+    let mut report = Report::default();
+    let s = read_style(&std::fs::read_to_string(path).unwrap(), "points", &mut report).unwrap();
+    let Some(Renderer::Unique { field, classes, expression: Some(e), .. }) = &s.renderer else { panic!("{:?}", s.renderer) };
+    assert!(field.is_empty(), "by expression, not a field");
+    let keys: Vec<&str> = classes.iter().map(|c| c.0.as_str()).collect();
+    assert_eq!(keys, ["a", "big", "fn", "inner"], "each rule a class, the else rule the rest");
+    assert!(e.starts_with("CASE WHEN (\"kind\" = 'a') THEN 'a' WHEN "), "{e}");
+    assert!(e.contains("(length(\"name\") > 3) THEN 'fn'"), "kept as QGIS wrote it: {e}");
+    assert!(e.contains("(\"value\" < 50) AND (\"kind\" = 'c') THEN 'inner'"), "the parent's filter too: {e}");
+    assert!(!report.notes.iter().any(|n| n.text.contains("rules") && !n.text.contains("letter case")), "{:?}", report.notes);
+    assert_eq!(letter_case_notes(&report, "points"), 1, "{:?}", report.notes);
+    assert_eq!(s.rules.len(), 4);
+
+    let mut l = rule_points(&[("a", 10, "ab"), ("b", 60, "xy"), ("c", 20, "abcd"), ("c", 20, "ab"), ("z", 99, "ab")]);
+    s.apply(&mut l);
+    // "big" is drawn between 1:50,000 and 1:1,000 the wrong way round: at no scale in QGIS, at
+    // every one without a map (an export).
+    let at = |scale| rule_classes(&l, scale);
+    let named = |v: &[Option<&str>]| v.iter().map(|k| k.map(str::to_string)).collect::<Vec<_>>();
+    assert_eq!(at(Some(5000.0)), named(&[Some("a"), None, Some("fn"), Some("inner"), None]));
+    assert_eq!(at(None), named(&[Some("a"), Some("big"), Some("fn"), Some("inner"), None]));
+}
+
+/// A categorized renderer by an expression is Unique Values by that expression (as RustGIS reads
+/// it), each category a class; graduated ranges by an expression are still left out, noted.
+#[test]
+fn a_categorized_renderer_by_an_expression_classes_by_it() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qml");
+    let mut report = Report::default();
+    let qml = std::fs::read_to_string(dir.join("renderer-categorizedSymbol-expression.qml")).unwrap();
+    let s = read_style(&qml, "points", &mut report).unwrap();
+    let Some(Renderer::Unique { field, classes, expression: Some(e), .. }) = &s.renderer else { panic!("{:?}", s.renderer) };
+    assert!(field.is_empty(), "by expression, not a field");
+    assert_eq!(e, "upper(\"kind\")");
+    assert_eq!(classes.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(), ["A"]);
+    assert!(!report.notes.iter().any(|n| n.text.contains("expression")), "{:?}", report.notes);
+    let mut l = rule_points(&[("a", 1, "x"), ("b", 2, "y"), ("A", 3, "z")]);
+    s.apply(&mut l);
+    let named = |v: &[Option<&str>]| v.iter().map(|k| k.map(str::to_string)).collect::<Vec<_>>();
+    assert_eq!(rule_classes(&l, None), named(&[Some("A"), None, Some("A")]));
+
+    // The map's scale reads as RustGIS's; a field alone (quoted or not) is still a field.
+    let by = |attr: &str| {
+        let qml = format!(
+            r#"<qgis version="3.40.0"><renderer-v2 type="categorizedSymbol" attr="{attr}"><categories><category value="1" symbol="0" label="One"/></categories>
+            <symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"><prop k="color" v="255,0,0,255"/></layer></symbol></symbols></renderer-v2></qgis>"#
+        );
+        let mut report = Report::default();
+        (read_style(&qml, "points", &mut report).unwrap().renderer, report)
+    };
+    let (r, _) = by("if(@map_scale &lt; 10000, 1, 2)");
+    assert_eq!(r.as_ref().and_then(|r| r.expression()), Some(format!("if((@map_scale / {QGIS_SCALE}) < 10000, 1, 2)").as_str()));
+    for attr in ["kind", "&quot;kind&quot;"] {
+        let (r, _) = by(attr);
+        assert!(matches!(&r, Some(Renderer::Unique { field, expression: None, .. }) if field == "kind"), "{r:?}");
+    }
+    // Too long to read: drawn with the first category's symbol, noted.
+    let (r, report) = by(&format!("{}1", "1 + ".repeat(5000)));
+    assert!(matches!(r, Some(Renderer::Single(_))), "{r:?}");
+    assert!(report.notes.iter().any(|n| n.text.contains("too long to read") && n.text.len() < 300), "{:?}", report.notes);
+    // ... passing over a switched-off category.
+    let qml = format!(
+        r#"<qgis version="3.10"><renderer-v2 type="categorizedSymbol" attr="{}1"><categories><category value="1" symbol="0" render="false"/><category value="2" symbol="1"/></categories>
+        <symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"><prop k="color" v="255,0,0,255"/></layer></symbol>
+        <symbol type="marker" name="1"><layer class="SimpleMarker" enabled="1"><prop k="color" v="0,0,255,255"/></layer></symbol></symbols></renderer-v2></qgis>"#,
+        "1 + ".repeat(5000)
+    );
+    let s = read_style(&qml, "points", &mut Report::default()).unwrap();
+    assert!(matches!(s.renderer, Some(Renderer::Single(sym)) if sym.fill == Rgba::rgb(0, 0, 255)), "{:?}", s.renderer);
+    // ... nothing, with no category to draw (rather than the layer's own look).
+    let qml = format!(
+        r#"<qgis version="3.10"><renderer-v2 type="categorizedSymbol" attr="{}1"><categories><category value="1" symbol="0" render="false"/></categories>
+        <symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol></symbols></renderer-v2></qgis>"#,
+        "1 + ".repeat(5000)
+    );
+    let s = read_style(&qml, "points", &mut Report::default()).unwrap();
+    assert!(matches!(s.renderer, Some(Renderer::Single(sym)) if sym.fill.0[3] == 0 && sym.stroke.0[3] == 0), "{:?}", s.renderer);
+    assert_eq!((s.line_strokes.as_deref(), s.fill_layers.as_deref()), (Some(&[][..]), Some(&[][..])));
+    // ... a line category of stacked strokes with them.
+    let long = format!("{}1", "1 + ".repeat(5000));
+    let qml = format!(
+        r#"<qgis version="3.10"><renderer-v2 type="categorizedSymbol" attr="{long}"><categories><category value="1" symbol="0"/></categories>
+        <symbols><symbol type="line" name="0" alpha="1"><layer class="SimpleLine" enabled="1" pass="0"><prop k="line_color" v="90,40,20,255"/><prop k="line_width" v="1.2"/></layer>
+        <layer class="SimpleLine" enabled="1" pass="0"><prop k="line_color" v="240,140,40,255"/><prop k="line_width" v="0.8"/></layer></symbol></symbols></renderer-v2></qgis>"#
+    );
+    let s = read_style(&qml, "roads", &mut Report::default()).unwrap();
+    assert!(matches!(s.renderer, Some(Renderer::Single(_))), "{:?}", s.renderer);
+    assert_eq!(s.line_strokes.as_ref().map(Vec::len), Some(2), "{:?}", s.line_strokes);
+
+    // Boolean categories are recorded, each value once, to be matched where the layer is added;
+    // their classes keep QGIS's values until then.
+    let qml = r#"<qgis version="3.40.0"><renderer-v2 type="categorizedSymbol" attr="&quot;value&quot; &gt; 50"><categories>
+        <category value="true" type="bool" symbol="0"/><category value="false" type="bool" symbol="0"/><category value="true" type="string" symbol="0"/>
+        <category type="bool" symbol="0"><val value="true"/><val value="false"/></category></categories>
+        <symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol></symbols></renderer-v2></qgis>"#;
+    let s = read_style(qml, "points", &mut Report::default()).unwrap();
+    let Some(Renderer::Unique { classes, .. }) = &s.renderer else { panic!("{:?}", s.renderer) };
+    assert_eq!(classes.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(), ["true", "false", "true", "true", "false"]);
+    assert_eq!(s.bool_classes, ["true", "false"]);
+    // A boolean category past the class limit isn't recorded: a text class of its value stays text.
+    let many: String = (0..renderer::MAX_CLASSES).map(|i| format!(r#"<category value="v{i}" type="string" symbol="0"/>"#)).collect();
+    let qml = format!(
+        r#"<qgis version="3.40.0"><renderer-v2 type="categorizedSymbol" attr="&quot;value&quot; &gt; 50"><categories>
+        <category value="true" type="string" symbol="0"/>{many}<category value="true" type="bool" symbol="0"/></categories>
+        <symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol></symbols></renderer-v2></qgis>"#
+    );
+    let s = read_style(&qml, "points", &mut Report::default()).unwrap();
+    assert!(s.bool_classes.is_empty(), "{:?}", s.bool_classes);
+
+    // Renaming a class takes its label, strokes and fills along, and never onto another class.
+    let mut r = Renderer::Unique {
+        field: String::new(),
+        classes: vec![("true".into(), symbol::hidden()), ("x".into(), symbol::hidden())],
+        other: symbol::hidden(),
+        ramp: crate::color::Ramp::default(),
+        class_labels: [("true".to_string(), "Yes".to_string())].into(),
+        other_label: None,
+        class_strokes: [("true".to_string(), Vec::new())].into(),
+        other_strokes: Vec::new(),
+        class_fills: [("true".to_string(), Vec::new())].into(),
+        other_fills: Vec::new(),
+        expression: None,
+    };
+    assert!(!rename_class(&mut r, "true", "x") && !rename_class(&mut r, "nosuch", "y"));
+    assert!(rename_class(&mut r, "true", "True"));
+    let Renderer::Unique { classes, class_labels, class_strokes, class_fills, .. } = &r else { panic!("{r:?}") };
+    assert_eq!(classes.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(), ["True", "x"]);
+    assert_eq!((class_labels.get("True").map(String::as_str), class_strokes.contains_key("True")), (Some("Yes"), true));
+    assert!(!class_labels.contains_key("true"));
+    assert!(class_fills.contains_key("True") && !class_fills.contains_key("true") && !class_strokes.contains_key("true"));
+    assert_eq!((bool_key("TRUE", true), bool_key("false", false), bool_key("yes", true)), (Some("True"), Some("false"), None));
+
+    // By a field, a boolean category matches the field's text as it is.
+    let qml = r#"<qgis version="3.40.0"><renderer-v2 type="categorizedSymbol" attr="kind"><categories>
+        <category value="true" type="bool" symbol="0"/></categories>
+        <symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol></symbols></renderer-v2></qgis>"#;
+    let s = read_style(qml, "points", &mut Report::default()).unwrap();
+    assert!(
+        matches!(&s.renderer, Some(Renderer::Unique { classes, .. }) if classes.first().is_some_and(|c| c.0 == "true")),
+        "{:?}",
+        s.renderer
+    );
+    assert_eq!(s.bool_classes, ["true"]);
+
+    let mut report = Report::default();
+    let qml = std::fs::read_to_string(dir.join("renderer-graduatedSymbol-size-expression.qml")).unwrap();
+    read_style(&qml, "points", &mut report).unwrap();
+    assert!(report.notes.iter().any(|n| n.text.contains("ranges by the expression `value * 2` (only by a field)")), "{:?}", report.notes);
+}
+
+/// A renderer whose only rule is an else rule draws every feature with its symbol: one symbol,
+/// nothing approximated.
+#[test]
+fn a_lone_else_rule_is_one_symbol() {
+    let qml = r#"<qgis version="3.40.0"><renderer-v2 type="RuleRenderer"><rules key="r"><rule filter="ELSE" symbol="0" label="All"/></rules>
+        <symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol></symbols></renderer-v2></qgis>"#;
+    let mut report = Report::default();
+    let s = read_style(qml, "points", &mut report).unwrap();
+    assert!(matches!(s.renderer, Some(Renderer::Single(_))), "{:?}", s.renderer);
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    // Of two top-level else rules, the first draws the rest; the second adds no class.
+    let qml = r#"<qgis version="3.40.0"><renderer-v2 type="RuleRenderer"><rules key="r">
+        <rule filter="&quot;value&quot; &gt;= 20 AND &quot;kind&quot; = 'a'" symbol="0" label="A"/>
+        <rule filter="ELSE" symbol="1" label="First rest"/><rule filter="ELSE" symbol="0" label="Second rest"/></rules>
+        <symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol>
+        <symbol type="marker" name="1"><layer class="SimpleMarker" enabled="1"><prop k="color" v="0,0,255,255"/></layer></symbol></symbols></renderer-v2></qgis>"#;
+    let s = read_style(qml, "points", &mut Report::default()).unwrap();
+    let mut l = rule_points(&[("a", 30, "q"), ("b", 30, "q")]);
+    s.apply(&mut l);
+    assert_eq!(rule_classes(&l, None), [Some("A".to_string()), None]);
+    assert!(
+        matches!(&l.renderer, Renderer::Unique { other, other_label: Some(o), .. } if o == "First rest" && other.fill == crate::Rgba::rgb(0, 0, 255)),
+        "{:?}",
+        l.renderer
+    );
+    // So too beside rules on one field's values (Unique Values on it).
+    let simple = qml.replace(r#"&quot;value&quot; &gt;= 20 AND &quot;kind&quot; = 'a'"#, r#"&quot;kind&quot; = 'a'"#);
+    let mut l = rule_points(&[("a", 30, "q"), ("b", 30, "q")]);
+    read_style(&simple, "points", &mut Report::default()).unwrap().apply(&mut l);
+    assert!(
+        matches!(&l.renderer, Renderer::Unique { field, other, other_label: Some(o), .. } if field == "kind" && o == "First rest" && other.fill == crate::Rgba::rgb(0, 0, 255)),
+        "{:?}",
+        l.renderer
+    );
+}
+
+#[test]
+fn rules_keep_their_scales_else_rules_and_switched_off_groups() {
+    let qml = r#"<qgis version="3.40.0"><renderer-v2 type="RuleRenderer"><rules key="r">
+        <rule filter="&quot;value&quot; &gt;= 50" label="Big" symbol="0" scalemaxdenom="100000"/>
+        <rule filter="&quot;kind&quot; = 'c'" label="C">
+          <rule filter="&quot;value&quot; &lt; 15" symbol="1" label="Small c"/>
+          <rule filter="ELSE" symbol="2" label="Other c" scalemindenom="10000"/>
+        </rule>
+        <rule filter="&quot;kind&quot; = 'a'" active="0"><rule filter="TRUE" symbol="3" label="Never"/></rule>
+        <rule filter="&quot;name&quot; || 'x' = 'abx'" symbol="3" label="Big"/>
+      </rules><symbols>
+        <symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"><prop k="color" v="255,0,0,255"/></layer></symbol>
+        <symbol type="marker" name="1"><layer class="SimpleMarker" enabled="1"><prop k="color" v="0,255,0,255"/></layer></symbol>
+        <symbol type="marker" name="2"><layer class="SimpleMarker" enabled="1"><prop k="color" v="0,0,255,255"/></layer></symbol>
+        <symbol type="marker" name="3"><layer class="SimpleMarker" enabled="1"><prop k="color" v="9,9,9,255"/></layer></symbol>
+      </symbols></renderer-v2></qgis>"#;
+    let mut report = Report::default();
+    let s = read_style(qml, "points", &mut report).unwrap();
+    let Some(Renderer::Unique { classes, other, .. }) = &s.renderer else { panic!("{:?}", s.renderer) };
+    let keys: Vec<&str> = classes.iter().map(|c| c.0.as_str()).collect();
+    // A switched-off rule takes the rules under it; a label used twice is told apart.
+    assert_eq!(keys, ["Big", "Small c", "Other c", "Big (2)"]);
+    assert_eq!(classes[1].1.fill, Rgba::rgb(0, 255, 0));
+    assert_eq!(other.fill.a(), 0, "no else rule at the top: the rest isn't drawn");
+    assert!(!report.notes.iter().any(|n| n.text.contains("scales")), "scales are kept: {:?}", report.notes);
+
+    let mut l = rule_points(&[("z", 80, "q"), ("c", 10, "q"), ("c", 30, "q"), ("a", 1, "ab"), ("a", 1, "q")]);
+    s.apply(&mut l);
+    let named = |v: &[Option<&str>]| v.iter().map(|k| k.map(str::to_string)).collect::<Vec<_>>();
+    // Zoomed in past 1:10,000 (QGIS's), "Other c" is gone; out past 1:100,000, "Big" is.
+    assert_eq!(rule_classes(&l, Some(50_000.0)), named(&[Some("Big"), Some("Small c"), Some("Other c"), Some("Big (2)"), None]));
+    assert_eq!(rule_classes(&l, Some(5_000.0)), named(&[Some("Big"), Some("Small c"), None, Some("Big (2)"), None]));
+    assert_eq!(rule_classes(&l, Some(500_000.0)), named(&[None, Some("Small c"), Some("Other c"), Some("Big (2)"), None]));
+    // A sibling's filter that is unknown for a feature (a null value) isn't met: the else rule
+    // takes it.
+    let mut l = rule_points(&[("c", 0, "q")]);
+    l.dataset.features[0].attrs[1] = rustgis_data::Value::Null;
+    s.apply(&mut l);
+    assert_eq!(rule_classes(&l, None), named(&[Some("Other c")]));
+}
+
+#[test]
+fn rules_past_what_one_expression_holds_are_drawn_with_the_first_and_noted() {
+    let rules: String =
+        (0..300).map(|i| format!(r#"<rule filter="&quot;value&quot; = {i} AND upper(&quot;kind&quot;) = 'A'" symbol="0"/>"#)).collect();
+    let qml = format!(
+        r#"<qgis><renderer-v2 type="RuleRenderer"><rules key="r">{rules}</rules><symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol></symbols></renderer-v2></qgis>"#
+    );
+    let mut report = Report::default();
+    let s = read_style(&qml, "points", &mut report).unwrap();
+    assert!(matches!(s.renderer, Some(Renderer::Single(_))), "{:?}", s.renderer);
+    assert!(report.notes.iter().any(|n| n.text.contains("300 rules")), "{:?}", report.notes);
+    // Rules on one field's values are still Unique Values on that field, as before.
+    let qml = r#"<qgis><renderer-v2 type="RuleRenderer"><rules key="r"><rule filter="&quot;kind&quot; = 'a'" symbol="0"/><rule filter="ELSE" symbol="0"/></rules>
+        <symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol></symbols></renderer-v2></qgis>"#;
+    let s = read_style(qml, "points", &mut Report::default()).unwrap();
+    assert!(matches!(&s.renderer, Some(Renderer::Unique { field, expression: None, .. }) if field == "kind"), "{:?}", s.renderer);
+    assert!(s.rules.is_empty());
+}
+
+#[test]
+fn an_else_rule_takes_what_its_siblings_dont_draw_at_the_scale() {
+    // Under "Big": kind a only zoomed in past 1:10,000 (QGIS's), and the rest.
+    let qml = r#"<qgis version="3.40.0"><renderer-v2 type="RuleRenderer"><rules key="r">
+        <rule filter="&quot;value&quot; &gt;= 20" label="Big">
+          <rule filter="&quot;kind&quot; = 'a'" symbol="0" label="A" scalemaxdenom="10000"/>
+          <rule filter="ELSE" symbol="1" label="Rest of big"/>
+        </rule>
+        <rule label="Group without a filter"><rule filter="ELSE" symbol="1" label="Never"/><rule symbol="0" label="All"/></rule>
+      </rules><symbols>
+        <symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol>
+        <symbol type="marker" name="1"><layer class="SimpleMarker" enabled="1"/></symbol>
+      </symbols></renderer-v2></qgis>"#;
+    let s = read_style(qml, "points", &mut Report::default()).unwrap();
+    let mut l = rule_points(&[("a", 30, "q"), ("b", 30, "q"), ("a", 5, "q")]);
+    s.apply(&mut l);
+    let named = |v: &[Option<&str>]| v.iter().map(|k| k.map(str::to_string)).collect::<Vec<_>>();
+    // Zoomed in, kind a is "A"; zoomed out, the else rule takes it. Beside a rule with no filter
+    // (every feature), an else rule draws nothing.
+    assert_eq!(rule_classes(&l, Some(5_000.0)), named(&[Some("A"), Some("Rest of big"), Some("All")]));
+    assert_eq!(rule_classes(&l, Some(50_000.0)), named(&[Some("Rest of big"), Some("Rest of big"), Some("All")]));
+    // The legend lists what is drawn at the map's scale.
+    let legend = |scale| l.shown_legend(scale).unwrap().into_iter().map(|e| e.label).collect::<Vec<_>>();
+    assert_eq!(legend(5_000.0), ["A", "All", "Rest of big"]);
+    assert_eq!(legend(50_000.0), ["All", "Rest of big"]);
+}
+
+/// A rule under an else rule takes only what the else rule does: what none of its siblings
+/// draws, even before them; a label rule too.
+#[test]
+fn rules_under_an_else_rule_take_only_the_rest() {
+    let qml = r#"<qgis version="3.40.0"><renderer-v2 type="RuleRenderer"><rules key="r">
+        <rule filter="ELSE" label="Rest group"><rule symbol="1" label="Rest"/></rule>
+        <rule filter="&quot;kind&quot; = 'a'" symbol="0" label="A"/>
+      </rules><symbols>
+        <symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol>
+        <symbol type="marker" name="1"><layer class="SimpleMarker" enabled="1"/></symbol>
+      </symbols></renderer-v2>
+      <labeling type="rule-based"><rules key="r">
+        <rule filter="ELSE"><rule description="Rest"><settings><text-style fieldName="name"/></settings></rule></rule>
+        <rule filter="&quot;kind&quot; = 'a'" description="A"><settings><text-style fieldName="name"/></settings></rule>
+        <rule active="0"><rule description="Off"><settings><text-style fieldName="name"/></settings></rule></rule>
+      </rules></labeling></qgis>"#;
+    let mut report = Report::default();
+    let s = read_style(qml, "points", &mut report).unwrap();
+    assert!(!report.notes.iter().any(|n| n.text.contains("past the")), "{:?}", report.notes);
+    let mut l = rule_points(&[("a", 1, "x"), ("b", 1, "y")]);
+    s.apply(&mut l);
+    // Kind a is A's, not the rest's (the rules are Unique Values on kind, the rest the others,
+    // under the else rule's label).
+    assert_eq!(rule_classes(&l, Some(5_000.0)), [Some("a".to_string()), None]);
+    assert!(matches!(&l.renderer, Renderer::Unique { other_label: Some(o), .. } if o == "Rest"), "{:?}", l.renderer);
+    assert!(l.labels.class("Off").is_none(), "a label rule under a switched-off one isn't read");
+    let rest = l.labels.class("Rest").expect("the label rule under the else rule");
+    assert!(rest.where_.as_deref().is_some_and(|w| w.contains("NOT")), "{:?}", rest.where_);
+}
+
+/// A sibling counts against an else rule only where it, or a rule under it, draws (as QGIS has
+/// it): a rule without a symbol or label settings and nothing under it takes nothing, and a group
+/// takes only what the rules under it draw.
+#[test]
+fn else_rules_take_what_siblings_that_draw_nothing_leave() {
+    let qml = r#"<qgis version="3.40.0"><renderer-v2 type="RuleRenderer"><rules key="r"><rule filter="&quot;value&quot; &gt;= 1" label="Outer">
+        <rule filter="&quot;kind&quot; = 'b'" label="Hidden"/>
+        <rule label="Group"><rule filter="&quot;kind&quot; = 'a'" symbol="0" label="A"/></rule>
+        <rule filter="ELSE" symbol="1" label="Rest"/>
+      </rule></rules><symbols>
+        <symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol>
+        <symbol type="marker" name="1"><layer class="SimpleMarker" enabled="1"/></symbol>
+      </symbols></renderer-v2>
+      <labeling type="rule-based"><rules key="r">
+        <rule filter="&quot;kind&quot; = 'b'" description="No settings"/>
+        <rule description="Label group"><rule filter="&quot;kind&quot; = 'a'" description="A"><settings><text-style fieldName="name"/></settings></rule></rule>
+        <rule filter="ELSE" description="Rest"><settings><text-style fieldName="name"/></settings></rule>
+      </rules></labeling></qgis>"#;
+    let s = read_style(qml, "points", &mut Report::default()).unwrap();
+    let mut l = rule_points(&[("a", 1, "x"), ("b", 1, "y"), ("c", 1, "z")]);
+    s.apply(&mut l);
+    // (Kind b, which the hidden rule doesn't draw, is the rest's.)
+    let named = |v: &[&str]| v.iter().map(|k| Some(k.to_string())).collect::<Vec<_>>();
+    assert_eq!(rule_classes(&l, Some(5_000.0)), named(&["A", "Rest", "Rest"]));
+    let names = |row: usize| {
+        crate::LabelMatcher::new(&l.labels, &l.dataset, Some(5_000.0))
+            .classes_of(&l.dataset, row)
+            .filter(|(_, c)| c.visible)
+            .map(|(_, c)| c.name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(0), ["A"]);
+    assert_eq!(names(1), ["Rest"]);
+    assert_eq!(names(2), ["Rest"]);
+}
+
+/// A label else rule beside more siblings than one clause holds is left out, and said so.
+#[test]
+fn a_label_else_rule_too_long_to_read_is_noted() {
+    let long = "x".repeat(200);
+    let rules: String = (0..60)
+        .map(|i| format!(r#"<rule filter="&quot;name&quot; = '{long}{i}'" description="R{i}"><settings><text-style fieldName="name"/></settings></rule>"#))
+        .collect();
+    let qml = format!(
+        r#"<qgis version="3.40.0"><labeling type="rule-based"><rules key="r">{rules}<rule filter="ELSE" description="Rest"><settings><text-style fieldName="name"/></settings></rule></rules></labeling></qgis>"#
+    );
+    let mut report = Report::default();
+    let s = read_style(&qml, "points", &mut report).unwrap();
+    let mut l = rule_points(&[("a", 1, "x")]);
+    s.apply(&mut l);
+    assert!(l.labels.class("Rest").is_none());
+    assert!(l.labels.class("R0").is_some() && l.labels.class("R59").is_some(), "its siblings are kept");
+    assert!(report.notes.iter().any(|n| n.text.contains("\"Rest\"")), "{:?}", report.notes);
+}
+
+/// A label else rule takes what its siblings don't label, as the renderer's else rules do: at
+/// their scales, a feature a sibling's filter is unknown for, and nothing beside a sibling with
+/// no filter.
+#[test]
+fn label_else_rules_take_what_their_siblings_dont_at_their_scales() {
+    let settings = r#"<settings><text-style fieldName="name"/></settings>"#;
+    let read = |rules: &str| {
+        let qml = format!(r#"<qgis version="3.40.0"><labeling type="rule-based"><rules key="r">{rules}</rules></labeling></qgis>"#);
+        let s = read_style(&qml, "points", &mut Report::default()).unwrap();
+        let mut l = rule_points(&[("a", 1, "x"), ("b", 1, "y"), ("c", 1, "z")]);
+        // A feature whose kind is unknown: A's filter is null for it.
+        if let Some(f) = l.dataset.features.get_mut(2).and_then(|f| f.attrs.get_mut(0)) {
+            *f = rustgis_data::Value::Null;
+        }
+        s.apply(&mut l);
+        l
+    };
+    let names = |l: &crate::Layer, scale: f64, row: usize| {
+        crate::LabelMatcher::new(&l.labels, &l.dataset, Some(scale))
+            .classes_of(&l.dataset, row)
+            .filter(|(_, c)| c.visible)
+            .map(|(_, c)| c.name.clone())
+            .collect::<Vec<_>>()
+    };
+    let l = read(&format!(
+        r#"<rule filter="&quot;kind&quot; = 'a'" description="A" scalemaxdenom="10000">{settings}</rule><rule filter="ELSE" description="Rest">{settings}</rule>"#
+    ));
+    // Zoomed in, A labels kind a; zoomed out past its range (kept on its class, which isn't drawn
+    // there), the rest does too. Kind b and the unknown one are the rest's at every scale.
+    assert_eq!(names(&l, 5_000.0, 0), ["A"]);
+    assert_eq!(names(&l, 50_000.0, 0), ["A", "Rest"]);
+    assert!(l.labels.class("A").and_then(|a| a.min_scale).is_some_and(|out| out < 50_000.0));
+    for scale in [5_000.0, 50_000.0] {
+        assert_eq!(names(&l, scale, 1), ["Rest"], "{scale}");
+        assert_eq!(names(&l, scale, 2), ["Rest"], "{scale}");
+    }
+    // Beside a rule with no filter (every feature), an else rule labels nothing.
+    let l = read(&format!(r#"<rule description="All">{settings}</rule><rule filter="ELSE" description="Never">{settings}</rule>"#));
+    for row in 0..3 {
+        assert_eq!(names(&l, 5_000.0, row), ["All"], "{row}");
+    }
+    // A rule inside a group is labelled only within both ranges, as the renderer draws it.
+    let l = read(&format!(
+        r#"<rule description="Group" scalemaxdenom="10000"><rule filter="&quot;kind&quot; = 'a'" description="Inner" scalemaxdenom="50000">{settings}</rule></rule>"#
+    ));
+    assert_eq!(names(&l, 5_000.0, 0), ["Inner"]);
+    assert!(l.labels.class("Inner").and_then(|c| c.min_scale).is_some_and(|out| (out - 10_000.0 * QGIS_SCALE).abs() < 1e-6));
+    // Its settings' own range too keeps within the group's.
+    let l = read(
+        r#"<rule description="Group" scalemaxdenom="10000"><rule description="Own"><settings><text-style fieldName="name"/><rendering scaleVisibility="1" scaleMin="50000"/></settings></rule></rule>"#,
+    );
+    assert!(l.labels.class("Own").and_then(|c| c.min_scale).is_some_and(|out| (out - 10_000.0 * QGIS_SCALE).abs() < 1e-6));
+}
+
+#[test]
+fn many_rules_read_quickly() {
+    // Thousands of rules beside thousands of else rules: bounded, not one sibling list each.
+    // (A switched-off rule past them draws nothing, so it isn't among those said left out.)
+    let rules: String = (0..20_000)
+        .map(|i| format!(r#"<rule filter="a = {i}" symbol="0"/><rule filter="ELSE" symbol="0"/>"#))
+        .chain(std::iter::once(r#"<rule filter="a = 1" symbol="0" active="0"/>"#.to_string()))
+        .collect();
+    let qml = format!(
+        r#"<qgis><renderer-v2 type="RuleRenderer"><rules key="r">{rules}</rules><symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol></symbols></renderer-v2>
+        <labeling type="rule-based"><rules key="r">{}</rules></labeling></qgis>"#,
+        (0..20_000).map(|i| format!(r#"<rule filter="a = {i}"><settings><text-style fieldName="a"/></settings></rule><rule filter="ELSE"><settings><text-style fieldName="a"/></settings></rule>"#)).collect::<String>()
+    );
+    let t = std::time::Instant::now();
+    let mut report = Report::default();
+    let s = read_style(&qml, "points", &mut report).unwrap();
+    assert!(t.elapsed().as_secs_f64() < 10.0, "{:?}", t.elapsed());
+    // Each picks a value of one field: Unique Values on it, its classes bounded.
+    assert!(
+        matches!(&s.renderer, Some(Renderer::Unique { field, classes, .. }) if field == "a" && classes.len() <= 4096),
+        "{:?}",
+        s.renderer.as_ref().map(|r| r.kind_label())
+    );
+    // The rules past those read are said, with how many: 40,000 drawing rules, 4,096 read; 40,000
+    // label rules, 256 read.
+    assert!(report.notes.iter().any(|n| n.text.contains("35904 of its rules, past the")), "{:?}", report.notes);
+    assert!(report.notes.iter().any(|n| n.text.contains("39744 of its label rules, past the")), "{:?}", report.notes);
+}
+
+/// A layer filter (subset string) reading the map's scale can't be a definition query, which has
+/// no scale: it is left out, said, rather than kept to take no feature.
+#[test]
+fn a_subset_string_reading_the_scale_is_left_out() {
+    for (subset, kept) in [("$scale &lt; 5000", false), ("@map_scale &lt; 5000", false), ("&quot;kind&quot; = '$scale'", true)] {
+        let project = format!(
+            r#"<qgis><projectlayers><maplayer type="vector"><id>a</id><datasource>./a.gpkg|layername=a|subset={subset}</datasource><layername>A</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#
+        );
+        let mut report = Report::default();
+        let p = read_project(&project, "/maps", &mut report).unwrap();
+        assert_eq!(p.layers[0].definition_query.is_some(), kept, "{subset}");
+        assert_eq!(report.notes.iter().any(|n| n.text.contains("reads the map's scale")), !kept, "{subset}: {:?}", report.notes);
+    }
+}
+
+#[test]
+fn a_resolved_diagram_note_keeps_other_same_named_layers_notes() {
+    let mut report = Report::default();
+    let styles = ["value", "angle"].map(|field| {
+        let xml = format!(
+            r##"<qgis><LinearlyInterpolatedDiagramRenderer diagramType="Pie" lowerValue="0" upperValue="10" lowerWidth="2" upperWidth="4" classificationField="value"><DiagramCategory enabled="1"><attribute field="{field}" color="#ff0000"/><attribute field="nosuch" color="#00ff00"/></DiagramCategory></LinearlyInterpolatedDiagramRenderer></qgis>"##
+        );
+        read_style(&xml, "same", &mut report).unwrap()
+    });
+    assert_eq!(report.notes.iter().find(|n| n.text.contains("not by")).unwrap().count, 2);
+    for (style, field) in styles.iter().zip(["value", "angle"]) {
+        let mut data = rustgis_data::Dataset::new("same", rustgis_data::GeometryType::Point, Vec::new());
+        data.fields.push(rustgis_data::Field::new(field, rustgis_data::FieldType::Double));
+        let mut layer = crate::Layer::new(1, data);
+        style.apply(&mut layer);
+        style.check_diagram_fields(&mut layer, "same", &mut report);
+    }
+    assert_eq!(report.notes.iter().find(|n| n.text.contains("not by")).unwrap().count, 1, "only one layer's provisional note is withdrawn");
+}
+
+#[test]
+fn diagrams_carry_over_as_pie_diagrams() {
+    use crate::{DiagramKind, DiagramSize};
+    let read = |name: &str| {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("testdata/qgis/generated/qml/diagram-{name}.qml"));
+        let mut report = Report::default();
+        let s = read_style(&std::fs::read_to_string(path).unwrap(), "polygons", &mut report).unwrap();
+        (s, report)
+    };
+    let fields = |d: &crate::DiagramSettings| d.categories.iter().map(|c| c.field.clone()).collect::<Vec<_>>();
+    let mm = |v: f32| v * 96.0 / 25.4;
+    let said = |r: &Report, part: &str| r.notes.iter().any(|n| n.text.contains(part));
+
+    // A pie as QGIS writes it: 12 mm across, its slices counterclockwise from 12 o'clock (drawn
+    // clockwise in reverse order), a white background and a 0.3 mm grey outline. Nothing noted.
+    let (s, report) = read("pie");
+    let d = s.diagram.clone().unwrap();
+    assert_eq!(d.kind, DiagramKind::Pie);
+    assert_eq!(fields(&d), ["angle", "value"]);
+    assert_eq!(d.categories[1].colour, Rgba::rgb(0xe4, 0x1a, 0x1c));
+    assert!(matches!(d.size, DiagramSize::Fixed(r) if (r - mm(6.0)).abs() < 1e-3), "{:?}", d.size);
+    assert_eq!(d.start_angle, 0.0);
+    assert_eq!(d.background, Some(Rgba::rgb(255, 255, 255)));
+    assert_eq!(d.stroke, Rgba::rgb(0x33, 0x33, 0x33));
+    assert!((d.stroke_width - mm(0.3)).abs() < 1e-3);
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    // Applied, the layer draws it.
+    let ds = rustgis_data::Dataset::new("polygons", rustgis_data::GeometryType::Polygon, Vec::new());
+    let mut layer = crate::Layer::new(1, ds);
+    s.apply(&mut layer);
+    assert_eq!(layer.diagram, Some(d));
+    // A style with no diagram RustGIS draws (here a text diagram) leaves the layer's own.
+    read("text").0.apply(&mut layer);
+    assert!(layer.diagram.is_some());
+
+    // A category by an expression is left out, noted once with it.
+    let (s, report) = read("pie-expression");
+    assert_eq!(fields(&s.diagram.unwrap()), ["id", "value"]);
+    assert!(said(&report, r#"1 diagram category by an expression (the first: `"angle" / 2`)"#), "{:?}", report.notes);
+
+    // Sized by its categories, with the zero lower radius raised to the visible minimum: noted.
+    let (s, report) = read("pie-scaled");
+    let DiagramSize::Scaled { min_size, max_size, min, max } = s.diagram.unwrap().size else { panic!("not scaled") };
+    assert!(min_size == crate::diagram::MIN_SIZE && (max_size - mm(10.0)).abs() < 1e-3 && min == 0.0 && max == 400.0);
+    assert!(said(&report, "smaller than RustGIS draws them"), "{:?}", report.notes);
+    assert!(!said(&report, "not by"), "{:?}", report.notes);
+
+    // Histograms and stacked bars are left out, noted: RustGIS's bars draw shares, not values.
+    for (name, part) in [
+        ("histogram", "its histogram diagrams"),
+        ("histogram-scaled", "its histogram diagrams"),
+        ("stackedbar", "its stacked bar diagrams"),
+    ] {
+        let (s, report) = read(name);
+        assert!(s.diagram.is_none(), "{name}");
+        assert!(said(&report, part), "{name}: {:?}", report.notes);
+    }
+    // Sized by a field rather than the sum of its categories: noted.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qml/diagram-pie-scaled.qml");
+    let text = std::fs::read_to_string(path)
+        .unwrap()
+        .replace(r#"classificationAttributeExpression="&quot;value&quot; + &quot;angle&quot;""#, r#"classificationField="value""#);
+    let mut report = Report::default();
+    assert!(read_style(&text, "polygons", &mut report).unwrap().diagram.is_some());
+    assert!(said(&report, "sized by the sum of their categories, not by `value`"), "{:?}", report.notes);
+    // A text diagram has no RustGIS counterpart.
+    let (s, report) = read("text");
+    assert!(s.diagram.is_none());
+    assert!(said(&report, "its diagrams (of the kind Text)"), "{:?}", report.notes);
+
+    // Written by hand: clockwise from 3 o'clock, half opaque, no background, its settings noted.
+    let attrs: String = (0..18).map(|i| format!(r##"<attribute field="f{i}" color="#ff0000" colorOpacity="0.5"/>"##)).collect();
+    let qml = |category: &str, settings: &str| {
+        format!(
+            r#"<qgis version="3.40.0"><SingleCategoryDiagramRenderer diagramType="Pie">{category}</SingleCategoryDiagramRenderer>{settings}</qgis>"#
+        )
+    };
+    let style = |text: &str| {
+        let mut report = Report::default();
+        let s = read_style(text, "A", &mut report).unwrap();
+        (s.diagram, report)
+    };
+    let (d, report) = style(&qml(
+        &format!(
+            r##"<DiagramCategory enabled="1" opacity="0.5" rotationOffset="0" direction="0" width="4" sizeType="Point" backgroundColor="#ffffff" backgroundAlpha="0" penColor="#000000" penWidth="1" lineSizeType="Pixel" scaleBasedVisibility="1">{attrs}</DiagramCategory>"##
+        ),
+        r#"<DiagramLayerSettings dist="3" showAll="0"><properties><Option type="Map"><Option name="properties" type="Map"><Option name="show" type="Map"><Option name="active" type="bool" value="true"/></Option></Option></Option></properties></DiagramLayerSettings>"#,
+    ));
+    let d = d.unwrap();
+    assert_eq!(d.start_angle, 90.0);
+    assert_eq!(fields(&d)[..2], ["f0", "f1"]);
+    assert_eq!(d.categories.len(), crate::diagram::MAX_CATEGORIES);
+    assert_eq!(d.categories[0].colour, Rgba::new(255, 0, 0, 64));
+    assert_eq!(d.background, None);
+    assert!(matches!(d.size, DiagramSize::Fixed(r) if (r - 2.0 * 96.0 / 72.0).abs() < 1e-3));
+    assert_eq!(d.stroke, Rgba::new(0, 0, 0, 128));
+    assert_eq!(d.stroke_width, 1.0);
+    for part in [
+        "2 diagram categories past the first 16",
+        "scale range",
+        "distance from their features",
+        "where they overlap",
+        "data-defined settings",
+    ] {
+        assert!(said(&report, part), "{part}: {:?}", report.notes);
+    }
+    // Switched off: none, and nothing to say.
+    let (d, report) = style(&qml(r##"<DiagramCategory enabled="0"><attribute field="a" color="#ff0000"/></DiagramCategory>"##, ""));
+    assert!(d.is_none() && report.notes.is_empty(), "{:?}", report.notes);
+    // Only categories by expressions: none, noted.
+    let (d, report) =
+        style(&qml(r##"<DiagramCategory enabled="1"><attribute field="&quot;a&quot; * 2" color="#ff0000"/></DiagramCategory>"##, ""));
+    assert!(d.is_none());
+    assert!(said(&report, "no category from a field"), "{:?}", report.notes);
+    // Too large, or too wide an outline: drawn at RustGIS's largest, noted.
+    let (d, report) = style(&qml(
+        r##"<DiagramCategory enabled="1" width="150" penWidth="5"><attribute field="a" color="#ff0000"/></DiagramCategory>"##,
+        "",
+    ));
+    assert!(matches!(d.unwrap().size, DiagramSize::Fixed(r) if r == crate::diagram::MAX_SIZE));
+    assert!(said(&report, "larger than RustGIS draws them") && said(&report, "outline, wider"), "{:?}", report.notes);
+    for (width, floored) in [("0", true), ("0.1", true), ("2", false)] {
+        let (_, report) = style(&qml(
+            &format!(r##"<DiagramCategory enabled="1" width="{width}"><attribute field="a" color="#ff0000"/></DiagramCategory>"##),
+            "",
+        ));
+        assert_eq!(said(&report, "smaller than RustGIS draws them"), floored, "{width}: {:?}", report.notes);
+    }
+    // Between two values: the zero minimum radius is noted independently of the value range.
+    let scaled = |lower: &str| {
+        format!(
+            r##"<qgis version="3.40.0"><LinearlyInterpolatedDiagramRenderer diagramType="Pie" lowerValue="{lower}" upperValue="400" lowerWidth="0" upperWidth="20" classificationField="a"><DiagramCategory enabled="1"><attribute field="a" color="#ff0000"/></DiagramCategory></LinearlyInterpolatedDiagramRenderer></qgis>"##
+        )
+    };
+    let (_, report) = style(&scaled("100"));
+    assert!(said(&report, "from a lower value other than 0"), "{:?}", report.notes);
+    let (_, report) = style(&scaled("0"));
+    assert!(said(&report, "smaller than RustGIS draws them"), "{:?}", report.notes);
+    assert!(!said(&report, "from a lower value other than 0"), "{:?}", report.notes);
+    // Several diagrams of a kind left out: only that is said.
+    let two = r##"<DiagramCategory enabled="1"><attribute field="a" color="#ff0000"/></DiagramCategory><DiagramCategory enabled="1"><attribute field="b" color="#ff0000"/></DiagramCategory>"##;
+    let (d, report) = style(&qml(two, "").replace(r#"diagramType="Pie""#, r#"diagramType="Histogram""#));
+    assert!(d.is_none() && !said(&report, "only the first"), "{:?}", report.notes);
+    let (d, report) = style(&qml(two, ""));
+    assert!(d.is_some() && said(&report, "only the first"), "{:?}", report.notes);
+    // Without a direction, counterclockwise as QGIS draws it (reversed); without an offset, from
+    // 3 o'clock; an older file's angleOffset (sixteenths, counterclockwise) over rotationOffset.
+    let pie = |attrs: &str| {
+        let (d, report) = style(&qml(
+            &format!(
+                r##"<DiagramCategory enabled="1" {attrs}><attribute field="a" color="#ff0000"/><attribute field="b" color="#0000ff"/></DiagramCategory>"##
+            ),
+            "",
+        ));
+        let d = d.unwrap();
+        (d.categories.iter().map(|c| c.field.clone()).collect::<Vec<_>>(), d.start_angle, report)
+    };
+    assert_eq!(pie("").0, ["b", "a"]);
+    assert_eq!(pie(r#"direction="0""#).0, ["a", "b"]);
+    assert_eq!(pie(r#"direction="1""#).0, ["b", "a"]);
+    assert_eq!(pie("").1, 90.0);
+    assert_eq!(pie(r#"rotationOffset="270" angleOffset="2880""#).1, 270.0);
+    assert_eq!(pie(r#"angleOffset="1440""#).1, 0.0);
+    assert_eq!(pie(r#"rotationOffset="-90""#).1, 0.0);
+    assert_eq!(pie(r#"angleOffset="-1440""#).1, 180.0);
+    assert!((0.0..360.0).contains(&pie(r#"rotationOffset="1e300""#).1));
+    // A category QGIS labels other than its field is noted; one labelled by its field isn't.
+    let (_, report) = style(&qml(
+        r##"<DiagramCategory enabled="1"><attribute field="a" label="Apples" color="#ff0000"/><attribute field="b" label="b" color="#0000ff"/></DiagramCategory>"##,
+        "",
+    ));
+    assert!(
+        said(
+            &report,
+            r#"1 diagram category with a label of its own, which RustGIS's legend shows by its field (the first: a as "Apples")"#
+        ),
+        "{:?}",
+        report.notes
+    );
+    let (_, report) = style(&qml(
+        r##"<DiagramCategory enabled="1"><attribute field="a" label="Apples" color="#ff0000"/><attribute field="b" label="Bananas" color="#0000ff"/></DiagramCategory>"##,
+        "",
+    ));
+    assert!(
+        said(&report, "2 diagram categories with a label of their own, which RustGIS's legend shows by their fields"),
+        "{:?}",
+        report.notes
+    );
+    assert!(pie("").2.notes.is_empty());
+}
+
+/// A project's layer tree, as QGIS 4.2 writes it (measured): groups nested, a hidden one, a
+/// collapsed one, one showing a layer at a time, one drawn as one (a group layer, with its
+/// opacity and blending in a `<maplayer type="group">`), and an empty one.
+const GROUPS: &str = r#"<qgis version="4.2.3-Firenze">
+  <layer-tree-group>
+    <layer-tree-group checked="Qt::Checked" expanded="1" groupLayer="" name="Outer">
+      <layer-tree-group checked="Qt::Checked" expanded="1" groupLayer="" name="Inner">
+        <layer-tree-layer checked="Qt::Checked" expanded="1" id="p1" name="pts1"/>
+      </layer-tree-group>
+      <layer-tree-layer checked="Qt::Checked" expanded="1" id="p2" name="pts2"/>
+    </layer-tree-group>
+    <layer-tree-group checked="Qt::Unchecked" expanded="1" groupLayer="" name="Hidden">
+      <layer-tree-layer checked="Qt::Checked" expanded="1" id="p3" name="pts3"/>
+    </layer-tree-group>
+    <layer-tree-group checked="Qt::Checked" expanded="0" groupLayer="" name="Collapsed">
+      <layer-tree-layer checked="Qt::Unchecked" expanded="1" id="p4" name="pts4"/>
+    </layer-tree-group>
+    <layer-tree-group checked="Qt::Checked" expanded="1" groupLayer="" mutually-exclusive="1" mutually-exclusive-child="0" name="Exclusive">
+      <layer-tree-layer checked="Qt::Checked" expanded="1" id="e1" name="ex1"/>
+      <layer-tree-layer checked="Qt::Unchecked" expanded="1" id="e2" name="ex2"/>
+    </layer-tree-group>
+    <layer-tree-group checked="Qt::Checked" expanded="1" groupLayer="AsGroup_1" name="AsGroup">
+      <layer-tree-layer checked="Qt::Checked" expanded="1" id="g1" name="gl1"/>
+    </layer-tree-group>
+    <layer-tree-layer checked="Qt::Checked" expanded="1" id="top" name="top"/>
+    <layer-tree-group checked="Qt::Checked" expanded="1" groupLayer="" name="Empty"/>
+  </layer-tree-group>
+  <projectlayers>
+    <maplayer type="group"><id>AsGroup_1</id><datasource></datasource><layername>AsGroup</layername>
+      <childLayers><child layerid="g1"/></childLayers><layerOpacity>0.5</layerOpacity><blendMode>6</blendMode></maplayer>
+    {LAYERS}
+  </projectlayers>
+</qgis>"#;
+
+fn groups_project() -> String {
+    let layers: String = ["p1", "p2", "p3", "p4", "e1", "e2", "g1", "top"]
+        .iter()
+        .map(|id| format!(r#"<maplayer type="vector"><id>{id}</id><datasource>/d/{id}.shp</datasource><layername>{id}</layername><provider>ogr</provider></maplayer>"#))
+        .collect();
+    GROUPS.replace("{LAYERS}", &layers)
+}
+
+#[test]
+fn layer_tree_groups_carry_over() {
+    let mut report = Report::default();
+    let p = read_project(&groups_project(), "", &mut report).unwrap();
+    let groups: Vec<(&str, bool, bool, Option<usize>, Option<f32>)> =
+        p.groups.iter().map(|g| (g.name.as_str(), g.checked, g.expanded, g.parent, g.transparency)).collect();
+    assert_eq!(
+        groups,
+        [
+            ("Outer", true, true, None, None),
+            ("Inner", true, true, Some(0), None),
+            ("Hidden", false, true, None, None),
+            ("Collapsed", true, false, None, None),
+            ("Exclusive", true, true, None, None),
+            ("AsGroup", true, true, None, Some(50.0)),
+            ("Empty", true, true, None, None),
+        ]
+    );
+    // The group layer is its group's opacity, not a layer.
+    let layers: Vec<(&str, Option<usize>, bool, bool)> =
+        p.layers.iter().map(|l| (l.name.as_str(), l.group, l.checked, l.visible)).collect();
+    assert_eq!(
+        layers,
+        [
+            ("p1", Some(1), true, true),
+            ("p2", Some(0), true, true),
+            ("p3", Some(2), true, false),
+            ("p4", Some(3), false, false),
+            ("e1", Some(4), true, true),
+            ("e2", Some(4), false, false),
+            ("g1", Some(5), true, true),
+            ("top", None, true, true),
+        ],
+        "each in its group, its own box apart from what the groups above add"
+    );
+    let texts: Vec<&str> = report.notes.iter().map(|n| n.text.as_str()).collect();
+    for part in [
+        "one layer at a time (1: Exclusive)",
+        "opacity of groups drawn as one (1: AsGroup)",
+        "blending mode of groups drawn as one (1: AsGroup)",
+    ] {
+        assert!(texts.iter().any(|t| t.contains(part)), "{part}: {texts:?}");
+    }
+    assert!(!texts.iter().any(|t| t.contains("group layers")), "{texts:?}");
+
+    // A group layer's draw effect is noted; a layer order of its own, when it differs from the
+    // tree's, is noted (the tree's is drawn).
+    let effect = r#"<paintEffect><effect enabled="1" type="effectStack"><effect type="dropShadow"><Option type="Map"><Option name="enabled" type="QString" value="1"/></Option></effect><effect type="drawSource"/></effect></paintEffect>"#;
+    let order = r#"<custom-order enabled="1"><item>top</item><item>p1</item></custom-order></layer-tree-group>
+  <projectlayers>"#;
+    let qgs = groups_project().replace("<blendMode>6</blendMode>", effect).replacen("</layer-tree-group>\n  <projectlayers>", order, 1);
+    let mut report = Report::default();
+    read_project(&qgs, "", &mut report).unwrap();
+    let texts: Vec<&str> = report.notes.iter().map(|n| n.text.as_str()).collect();
+    for part in ["draw effects of groups drawn as one (1: AsGroup)", "its layer order (set apart from the layer tree)"] {
+        assert!(texts.iter().any(|t| t.contains(part)), "{part}: {texts:?}");
+    }
+    // The same order as the tree's: nothing to note.
+    let same = groups_project().replacen(
+        "</layer-tree-group>\n  <projectlayers>",
+        &order.replace("<item>top</item><item>p1</item>", "<item>p1</item><item>top</item>"),
+        1,
+    );
+    let mut report = Report::default();
+    read_project(&same, "", &mut report).unwrap();
+    assert!(!report.notes.iter().any(|n| n.text.contains("layer order")), "{:?}", report.notes);
+
+    // A tree of plain groups, all shown, carries over without a note.
+    let mut report = Report::default();
+    let plain = r#"<qgis><layer-tree-group><layer-tree-group checked="Qt::Checked" expanded="1" name="A"><layer-tree-layer checked="Qt::Checked" id="a"/></layer-tree-group></layer-tree-group>
+      <projectlayers><maplayer type="vector"><id>a</id><datasource>/d/a.shp</datasource><layername>a</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#;
+    let p = read_project(plain, "", &mut report).unwrap();
+    assert_eq!((p.groups.len(), p.layers[0].group), (1, Some(0)));
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+}
+
+#[test]
+fn groups_past_the_limits_put_their_layers_in_the_group_holding_them() {
+    // Ten levels: the ninth and tenth aren't kept. The tenth is unchecked, so its layer comes in
+    // unchecked in the eighth.
+    let mut tree = String::new();
+    for level in 1..=10 {
+        let checked = if level == 10 { "Qt::Unchecked" } else { "Qt::Checked" };
+        tree.push_str(&format!(r#"<layer-tree-group checked="{checked}" name="L{level}">"#));
+    }
+    tree.push_str(r#"<layer-tree-layer checked="Qt::Checked" id="a"/>"#);
+    tree.push_str(&"</layer-tree-group>".repeat(10));
+    let qgs = format!(
+        r#"<qgis><layer-tree-group>{tree}</layer-tree-group><projectlayers><maplayer type="vector"><id>a</id><datasource>/d/a.shp</datasource><layername>a</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#
+    );
+    let mut report = Report::default();
+    let p = read_project(&qgs, "", &mut report).unwrap();
+    assert_eq!(p.groups.len(), crate::MAX_GROUP_DEPTH);
+    assert_eq!((p.layers[0].group, p.layers[0].checked, p.layers[0].visible), (Some(crate::MAX_GROUP_DEPTH - 1), false, false));
+    assert!(report.notes.iter().any(|n| n.text.contains("groups past RustGIS's 8 levels") && n.text.contains("(2)")), "{:?}", report.notes);
+
+    // The ninth group drawn as one: its group layer isn't a layer, and its opacity is noted as
+    // left out (its layer went in the eighth group).
+    let drawn = qgs.replace(r#"name="L9">"#, r#"name="L9" groupLayer="gl9">"#).replace(
+        "</projectlayers>",
+        r#"<maplayer type="group"><id>gl9</id><layername>L9</layername><layerOpacity>0.5</layerOpacity></maplayer></projectlayers>"#,
+    );
+    let mut report = Report::default();
+    let p = read_project(&drawn, "", &mut report).unwrap();
+    assert_eq!(p.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["a"]);
+    assert!(
+        report.notes.iter().any(|n| n.text.contains("drawn as one past RustGIS's group limits give their layers (1: L9 (opacity))")),
+        "{:?}",
+        report.notes
+    );
+    // One that gives its layers nothing: no note.
+    let mut report = Report::default();
+    read_project(&drawn.replace("<layerOpacity>0.5</layerOpacity>", "<layerOpacity>1</layerOpacity>"), "", &mut report).unwrap();
+    assert!(!report.notes.iter().any(|n| n.text.contains("drawn as one")), "{:?}", report.notes);
+
+    // A tree deeper than it is walked (64 levels): the layers further in are still read, in the
+    // eighth group, with the boxes of the groups between; noted. The 70th group is unchecked.
+    let mut tree = String::new();
+    for level in 1..=70 {
+        let checked = if level == 70 { "Qt::Unchecked" } else { "Qt::Checked" };
+        tree.push_str(&format!(r#"<layer-tree-group checked="{checked}" name="L{level}">"#));
+    }
+    // An empty group beside it, below 64 levels, counted with the groups not kept.
+    tree.push_str(r#"<layer-tree-layer checked="Qt::Checked" id="a"/><layer-tree-group checked="Qt::Checked" name="E"/>"#);
+    tree.push_str(&"</layer-tree-group>".repeat(70));
+    let qgs = format!(
+        r#"<qgis><layer-tree-group>{tree}<layer-tree-layer checked="Qt::Checked" id="b"/></layer-tree-group><projectlayers><maplayer type="vector"><id>a</id><datasource>/d/a.shp</datasource><layername>a</layername><provider>ogr</provider></maplayer><maplayer type="vector"><id>b</id><datasource>/d/b.shp</datasource><layername>b</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#
+    );
+    let mut report = Report::default();
+    let p = read_project(&qgs, "", &mut report).unwrap();
+    let layers: Vec<(&str, Option<usize>, bool, bool)> =
+        p.layers.iter().map(|l| (l.name.as_str(), l.group, l.checked, l.visible)).collect();
+    assert_eq!(layers, [("a", Some(crate::MAX_GROUP_DEPTH - 1), false, false), ("b", None, true, true)], "a hidden by its 70th group");
+    assert!(report.notes.iter().any(|n| n.text.contains("layers below 64 levels of groups (1)")), "{:?}", report.notes);
+    // Levels 9 to 70 and the empty group: 63 groups not kept.
+    assert!(report.notes.iter().any(|n| n.text.contains("2000 groups (63)")), "{:?}", report.notes);
+
+    // Layer entries past those read (4000) are noted.
+    let entries: String = (0..TREE_LAYERS + 2).map(|i| format!(r#"<layer-tree-layer checked="Qt::Checked" id="x{i}"/>"#)).collect();
+    let mut report = Report::default();
+    read_project(&format!("<qgis><layer-tree-group>{entries}</layer-tree-group></qgis>"), "", &mut report).unwrap();
+    let cut = report.notes.iter().find(|n| n.text.contains("entries past the first 4000 (2)"));
+    assert_eq!(cut.map(|n| n.kind), Some(NoteKind::Approximated), "their layers come in: {:?}", report.notes);
+
+    // Past the most groups a map keeps: the rest aren't kept.
+    let many = r#"<layer-tree-group checked="Qt::Checked" name="G"/>"#.repeat(crate::MAX_GROUPS + 3);
+    let p = read_project(&format!("<qgis><layer-tree-group>{many}</layer-tree-group></qgis>"), "", &mut Report::default()).unwrap();
+    assert_eq!(p.groups.len(), crate::MAX_GROUPS);
+}
+
+#[test]
+fn blending_modes_read_by_the_numbers_qgis_saves() {
+    // QGIS saves its own numbers (measured, QGIS 4.2): 6 is Multiply; Qt's 13 is not one of
+    // RustGIS's modes in them (it is QGIS's "Source"), so it is drawn as Normal with a note.
+    for (number, blend, noted) in [
+        (0, Blend::Normal, false),
+        (1, Blend::Lighten, false),
+        (2, Blend::Screen, false),
+        (5, Blend::Darken, false),
+        (6, Blend::Multiply, false),
+        (8, Blend::Overlay, false),
+        (11, Blend::Difference, false),
+        (13, Blend::Normal, true),
+        (10, Blend::Normal, true),
+    ] {
+        let mut report = Report::default();
+        let s = read_style(&format!("<qgis><blendMode>{number}</blendMode></qgis>"), "L", &mut report).unwrap();
+        assert_eq!(s.blend, Some(blend), "{number}");
+        assert_eq!(report.notes.iter().any(|n| n.text.contains("blending mode")), noted, "{number}");
+    }
+}
+
+/// The corpus's groups, as QGIS wrote them: the tree as groups, the group layer's opacity on its
+/// group (Multiply noted), each layer in its group with its own box.
+#[test]
+fn the_corpus_groups_read_as_qgis_wrote_them() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qgs");
+    let text = std::fs::read_to_string(root.join("groups-nested-hidden-collapsed-drawn-as-one.qgs")).unwrap();
+    let mut report = Report::default();
+    let p = read_project(&text, "/p/qgs", &mut report).unwrap();
+    let groups: Vec<(&str, bool, bool, Option<usize>, Option<f32>)> =
+        p.groups.iter().map(|g| (g.name.as_str(), g.checked, g.expanded, g.parent, g.transparency)).collect();
+    assert_eq!(
+        groups,
+        [
+            ("Outer", true, true, None, None),
+            ("Inner", true, true, Some(0), None),
+            ("Hidden", false, true, None, None),
+            ("Drawn as one", true, false, None, Some(40.0)),
+            ("Empty", true, true, None, None),
+        ]
+    );
+    let layers: Vec<(&str, Option<usize>, bool)> = p.layers.iter().map(|l| (l.name.as_str(), l.group, l.checked)).collect();
+    assert_eq!(layers, [("points", Some(1), true), ("lines", Some(0), false), ("dem", Some(2), true), ("polygons", Some(3), true)]);
+    let texts: Vec<&str> = report.notes.iter().map(|n| n.text.as_str()).collect();
+    assert!(texts.iter().any(|t| t.contains("blending mode of groups drawn as one (1: Drawn as one)")), "{texts:?}");
+    assert!(!texts.iter().any(|t| t.contains("group layers")), "{texts:?}");
+}
+
+/// A temporal element as QGIS 4.2 saves a vector layer's time settings (measured), `set`
+/// taking the place of its defaults.
+fn temporal(mode: &str, set: &[(&str, &str)]) -> String {
+    let defaults = [
+        ("accumulate", "0"),
+        ("durationField", ""),
+        ("durationUnit", "min"),
+        ("endExpression", ""),
+        ("endField", ""),
+        ("fixedDuration", "0"),
+        ("limitMode", "0"),
+        ("startExpression", ""),
+        ("startField", ""),
+    ];
+    let attrs: String =
+        defaults.iter().map(|(k, v)| format!(r#" {k}="{}""#, set.iter().find(|(s, _)| s == k).map_or(*v, |(_, v)| *v))).collect();
+    format!(r#"<temporal enabled="1" mode="{mode}"{attrs}><fixedRange><start></start><end></end></fixedRange></temporal>"#)
+}
+
+/// Bookmarks, relations, the map's rotation and time settings, in the shapes QGIS 4.2 saves
+/// them (measured): each read, and what RustGIS has no place for noted.
+#[test]
+fn bookmarks_relations_and_time_read_as_qgis_saves_them() {
+    let layer = |id: &str, t: &str| {
+        format!(
+            r#"<maplayer type="vector" geometry="Point"><id>{id}</id><datasource>./{id}.gpkg</datasource><layername>{id}</layername><provider>ogr</provider>{t}</maplayer>"#
+        )
+    };
+    let layers = [
+        layer("instant", &temporal("1", &[("startField", "when"), ("accumulate", "1")])),
+        layer("span", &temporal("2", &[("startField", "t0"), ("endField", "t1")])),
+        layer("lasting", &temporal("3", &[("startField", "t0"), ("durationField", "d")])),
+        layer("by_field", &temporal("4", &[("startExpression", "&quot;t0&quot;"), ("endExpression", "&quot;t1&quot;")])),
+        layer("by_expr", &temporal("4", &[("startExpression", "&quot;t&quot; + make_interval(days:=1)")])),
+        layer("fixed", &temporal("0", &[])),
+        layer("redraw", &temporal("5", &[])),
+        layer("closed", &temporal("1", &[("startField", "when"), ("limitMode", "1")])),
+        layer("lasting_events", &temporal("1", &[("startField", "when"), ("fixedDuration", "3"), ("durationUnit", "h")])),
+        layer("piling", &temporal("1", &[("startField", "when"), ("fixedDuration", "3"), ("accumulate", "1")])),
+        layer("unnamed", &temporal("1", &[])),
+        r#"<maplayer type="raster"><id>dem</id><datasource>./dem.tif</datasource><layername>dem</layername><provider>gdal</provider><temporal enabled="1" mode="0"/></maplayer>"#.to_string(),
+    ]
+    .concat();
+    // A ring of 10,001 points: not read in part.
+    let long = vec!["1 2"; 10_001].join(", ");
+    let wgs84 =
+        "<spatialrefsys nativeFormat=\"Wkt\"><proj4>+proj=longlat +datum=WGS84 +no_defs</proj4><authid>EPSG:4326</authid></spatialrefsys>";
+    let qgs = format!(
+        r#"<qgis version="4.2.3-Belém do Pará">
+      <projectCrs><spatialrefsys><authid>EPSG:3857</authid></spatialrefsys></projectCrs>
+      <mapcanvas annotationsVisible="1" name="theMapCanvas"><units>meters</units><extent><xmin>0</xmin><ymin>0</ymin><xmax>10</xmax><ymax>10</ymax></extent><rotation>15</rotation></mapcanvas>
+      <mapcanvas name="mapCanvas2"><rotation>x</rotation></mapcanvas>
+      <projectlayers>{layers}</projectlayers>
+      <relations>
+        <relation id="own" name="Owners of parcel" referencedLayer="parcels_1" referencingLayer="owners_1" strength="Composition"><fieldRef referencedField="id" referencingField="pid"/></relation>
+        <relation id="two" name="two keys" referencedLayer="parcels_1" referencingLayer="owners_1" strength="Association"><fieldRef referencedField="id" referencingField="pid"/><fieldRef referencedField="k2" referencingField="pk2"/></relation>
+        <relation id="none" name="" referencedLayer="parcels_1" referencingLayer="owners_1" strength="Association"/>
+        <relation id="nameless" name="" referencedLayer="parcels_1" referencingLayer="owners_1" strength="Association"><fieldRef referencedField="id" referencingField="pid"/></relation>
+        <relation id="half" name="half pair" referencedLayer="parcels_1" referencingLayer="owners_1" strength="Association"><fieldRef referencedField="id" referencingField="pid"/><fieldRef referencedField="k2"/></relation>
+      </relations>
+      <polymorphicRelations><relation id="poly" name="poly" referencedLayerExpression="@layer_name" referencedLayerField="y" referencedLayerIds="a,b" referencingLayer="events" relationStrength="Association"><fieldRef referencedField="id" referencingField="y"/></relation></polymorphicRelations>
+      <Bookmarks>
+        <Bookmark extent="Polygon ((8.40000000000000036 47.29999999999999716, 8.59999999999999964 47.29999999999999716, 8.59999999999999964 47.45000000000000284, 8.40000000000000036 47.45000000000000284, 8.40000000000000036 47.29999999999999716))" group="Swiss" id="{{0ac0}}" name="Zurich" rotation="0">{wgs84}</Bookmark>
+        <Bookmark extent="Polygon ((900000 5900000, 1000000 5900000, 1000000 6000000, 900000 6000000, 900000 5900000))" group="" id="{{0072}}" name="Web" rotation="30"/>
+        <Bookmark extent="Point (1 2)" group="" id="x" name="Nowhere" rotation="0"/>
+        <Bookmark extent="Polygon ((1 2, 3 2, 3 4, 1 4, 1 2))" group="" id="y" name="Askew" rotation="abc"/>
+        <Bookmark extent="Polygon (({long}))" group="" id="z" name="Long" rotation="0"/>
+        <Bookmark extent="Polygon ((1 2 9, 3 2 9, 3 4 9, 1 4 9, 1 2 9))" group="" id="h" name="High" rotation="0"/>
+        <Bookmark extent="Polygon ((1 2, 3 2, 3 4, 1 4, 1 2))" group="" id="n" name=" " rotation="0"/>
+        <Bookmark extent="Polygon ((1 2, 3 2, 3 4, 1 4, 1 2))" group="Lost" id="u" name="Blank" rotation="x"><spatialrefsys><authid></authid></spatialrefsys></Bookmark>
+      </Bookmarks>
+      <ProjectTimeSettings cumulativeTemporalRange="1" frameRate="5" timeStep="2" timeStepUnit="wk" totalMovieFrames="100">
+        <TemporalRange><start>2020-01-01T00:00:00Z</start><end>2020-12-31T00:00:00Z</end></TemporalRange>
+      </ProjectTimeSettings>
+    </qgis>"#
+    );
+    let mut report = Report::default();
+    let p = read_project(&qgs, "/p", &mut report).unwrap();
+    // The main canvas's (another canvas's unreadable one isn't read).
+    assert_eq!(p.rotation, 15.0);
+    let marks: Vec<(&str, [f64; 4], Option<&str>, f64)> =
+        p.bookmarks.iter().map(|b| (b.name.as_str(), b.extent, b.crs.as_deref(), b.rotation)).collect();
+    assert_eq!(
+        marks,
+        [
+            ("Zurich", [8.4, 47.3, 8.6, 47.45], Some("EPSG:4326"), 0.0),
+            ("Web", [900000.0, 5900000.0, 1000000.0, 6000000.0], None, 30.0),
+            ("Askew", [1.0, 2.0, 3.0, 4.0], None, 0.0),
+            ("Bookmark", [1.0, 2.0, 3.0, 4.0], None, 0.0)
+        ]
+    );
+    let rels: Vec<(&str, &str, &str, &str, &str)> = p
+        .relations
+        .iter()
+        .map(|r| {
+            (r.name.as_str(), r.referenced.as_str(), r.referenced_field.as_str(), r.referencing.as_str(), r.referencing_field.as_str())
+        })
+        .collect();
+    assert_eq!(
+        rels,
+        [
+            ("Owners of parcel", "parcels_1", "id", "owners_1", "pid"),
+            ("two keys", "parcels_1", "id", "owners_1", "pid"),
+            ("nameless", "parcels_1", "id", "owners_1", "pid"),
+            ("half pair", "parcels_1", "id", "owners_1", "pid")
+        ]
+    );
+    let time = |name: &str| p.layers.iter().find(|l| l.name == name).and_then(|l| l.style.time.as_deref());
+    for (name, field) in [
+        ("instant", Some("when")),
+        ("span", Some("t0")),
+        ("lasting", Some("t0")),
+        ("by_field", Some("t0")),
+        ("by_expr", None),
+        ("fixed", None),
+        ("redraw", None),
+        ("closed", Some("when")),
+        ("unnamed", None),
+        ("dem", None),
+    ] {
+        assert_eq!(time(name), field, "{name}");
+    }
+    let said =
+        |layer: &str, kind: NoteKind, part: &str| report.notes.iter().any(|n| n.layer == layer && n.kind == kind && n.text.contains(part));
+    use NoteKind::{Approximated as A, Skipped as S};
+    for (layer, kind, part) in [
+        ("", S, "the groups of its bookmarks (1: Swiss)"),
+        ("", S, "its bookmarks whose place doesn't read (3: Nowhere, Long, High)"),
+        ("", S, "its relation half pair's pairs of fields that don't name both (1)"),
+        ("", A, "its bookmarks with no name, named Bookmark (1)"),
+        ("", S, "its bookmarks whose coordinate system doesn't read (1: Blank)"),
+        ("", A, "its relations with no name, named by their id, else Relation (1: nameless)"),
+        ("", A, "its bookmarks whose rotation doesn't read, facing north (1: Askew)"),
+        ("lasting_events", A, "its features lasting 3 hours each: each shown at its date alone"),
+        ("", S, "its relation Owners of parcel's composition"),
+        ("", A, "its relation two keys on 2 pairs of fields: related by the first (pid = id) alone"),
+        ("", S, "its relations that name no layers or fields (1: none)"),
+        ("", S, "its polymorphic relations (1"),
+        ("", S, "its time span and steps (2020-01-01 to 2020-12-31, steps of 2 weeks, cumulative): the time slider is left off"),
+        ("instant", A, "its features accumulating over time"),
+        ("span", A, "its features' end dates (the field t1): each shown at its start date alone"),
+        ("lasting", A, "its features' durations (the field d)"),
+        ("by_field", A, "its features' end dates (`\"t1\"`)"),
+        ("by_expr", S, "its time, from the expression `\"t\" + make_interval(days:=1)`"),
+        ("fixed", S, "its fixed time range"),
+        ("redraw", S, "its redrawing as the map's time changes"),
+        ("closed", A, "a feature at the very end of a time step"),
+        ("unnamed", S, "its time settings, which name no field"),
+        ("dem", S, "its time settings"),
+    ] {
+        assert!(said(layer, kind, part), "{layer}: {part}: {:#?}", report.notes);
+    }
+    // Accumulating, an event has no duration of its own.
+    assert!(!said("piling", A, "lasting"), "{:#?}", report.notes);
+    assert!(!report.notes.iter().any(|n| n.text.contains("the map's rotation")), "{:#?}", report.notes);
+    // Each layer's time noted once.
+    assert_eq!(report.notes.iter().filter(|n| n.layer == "by_expr").count(), 1, "{:#?}", report.notes);
+}
+
+/// A project whose bookmarks, relation and time settings carry over whole gives no note on them:
+/// QGIS's default time settings (no span) included.
+#[test]
+fn bookmarks_relations_and_time_that_carry_over_whole_are_not_noted() {
+    let qgs = format!(
+        r#"<qgis version="4.2.3">
+      <projectlayers><maplayer type="vector" geometry="Point"><id>a</id><datasource>./a.gpkg</datasource><layername>a</layername><provider>ogr</provider>{}</maplayer></projectlayers>
+      <relations><relation id="r" name="r" referencedLayer="a" referencingLayer="b" strength="Association"><fieldRef referencedField="id" referencingField="aid"/></relation></relations>
+      <Bookmarks><Bookmark extent="Polygon ((1 2, 3 2, 3 4, 1 4, 1 2))" group="" id="b" name="Here" rotation="0"/></Bookmarks>
+      <ProjectTimeSettings cumulativeTemporalRange="0" frameRate="1" timeStep="1" timeStepUnit="h" totalMovieFrames="100"/>
+    </qgis>"#,
+        temporal("1", &[("startField", "day")])
+    );
+    let mut report = Report::default();
+    let p = read_project(&qgs, "/p", &mut report).unwrap();
+    assert_eq!((p.bookmarks.len(), p.relations.len(), p.rotation), (1, 1, 0.0));
+    assert_eq!(p.layers.first().and_then(|l| l.style.time.as_deref()), Some("day"));
+    assert!(report.notes.is_empty(), "{:#?}", report.notes);
+}
+
+/// The corpus's project structure, as QGIS wrote it: its bookmark, relation and a layer's time
+/// by a date field.
+#[test]
+fn the_corpus_bookmarks_relations_and_time_read_as_qgis_wrote_them() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qgs");
+    let text = std::fs::read_to_string(root.join("structure-groups-themes-bookmarks-variables-relations-joins-time.qgs")).unwrap();
+    let mut report = Report::default();
+    let p = read_project(&text, "/p/qgs", &mut report).unwrap();
+    let marks: Vec<(&str, [f64; 4], Option<&str>)> = p.bookmarks.iter().map(|b| (b.name.as_str(), b.extent, b.crs.as_deref())).collect();
+    assert_eq!(marks, [("Old town", [2696400.0, 1261250.0, 2698200.0, 1262350.0], Some("EPSG:2056"))]);
+    let rels: Vec<(&str, &str, &str)> =
+        p.relations.iter().map(|r| (r.name.as_str(), r.referenced_field.as_str(), r.referencing_field.as_str())).collect();
+    assert_eq!(rels, [("lines to points", "id", "id")]);
+    let points = p.layers.iter().find(|l| l.name == "points").unwrap();
+    assert_eq!(points.style.time.as_deref(), Some("day"));
+    let texts: Vec<&str> = report.notes.iter().map(|n| n.text.as_str()).collect();
+    assert!(!texts.iter().any(|t| t.contains("bookmark") || t.contains("relation") || t.contains("time settings")), "{texts:?}");
+}
+
+/// The corpus's bookmarks, relations and time settings as QGIS 4.2 wrote them: a bookmark turned
+/// and in a group, one in degrees; relations on one pair of fields, on two, a composition and a
+/// polymorphic one; a span of months, and each layer's time read or noted.
+#[test]
+fn the_corpus_bookmarks_relations_and_time_settings_read_as_qgis_wrote_them() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qgs");
+    let text = std::fs::read_to_string(root.join("bookmarks-relations-time.qgs")).unwrap();
+    let mut report = Report::default();
+    let p = read_project(&text, "/p/qgs", &mut report).unwrap();
+    let marks: Vec<(&str, Option<&str>, f64)> = p.bookmarks.iter().map(|b| (b.name.as_str(), b.crs.as_deref(), b.rotation)).collect();
+    assert_eq!(marks, [("Old town", Some("EPSG:2056"), 30.0), ("Region", Some("EPSG:4326"), 0.0)]);
+    assert_eq!(p.bookmarks[0].extent, [2696400.0, 1261250.0, 2698200.0, 1262350.0]);
+    let rels: Vec<&str> = p.relations.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(rels, ["lines to points", "lines to points by kind", "polygons of points"]);
+    let time = |name: &str| p.layers.iter().find(|l| l.name == name).and_then(|l| l.style.time.as_deref());
+    assert_eq!((time("points"), time("lines"), time("polygons")), (Some("day"), Some("day"), None));
+    let said = |layer: &str, part: &str| report.notes.iter().any(|n| n.layer == layer && n.text.contains(part));
+    for (layer, part) in [
+        ("", "the groups of its bookmarks (1: Places)"),
+        ("", "its relation lines to points by kind on 2 pairs of fields"),
+        ("", "its relation polygons of points's composition"),
+        ("", "its polymorphic relations (1"),
+        ("", "its time span and steps (2024-01-01 to 2024-12-31, steps of 1 month, cumulative)"),
+        ("points", "accumulating over time"),
+        ("lines", "its features' durations (the field value)"),
+        ("polygons", "its fixed time range"),
+    ] {
+        assert!(said(layer, part), "{layer}: {part}: {:#?}", report.notes);
+    }
+}
+
+/// Each provider's project in the corpus reads into the source RustGIS opens it from, as QGIS 4.2.3
+/// wrote it (the files needn't be there).
+#[test]
+fn the_corpus_sources_read_as_qgis_wrote_them() {
+    use rustgis_data::GeometryType;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qgs");
+    let read = |name: &str| {
+        let text = std::fs::read_to_string(root.join(format!("provider-{name}.qgs"))).unwrap();
+        let mut report = Report::default();
+        let p = read_project(&text, "/p/qgs", &mut report).unwrap();
+        (p.layers.into_iter().map(|l| (l.source, l.definition_query)).collect::<Vec<_>>(), report)
+    };
+    let one = |name: &str| read(name).0.into_iter().next().unwrap().0;
+    let file = |path: &str, layer: Option<&str>, subset: Option<&str>| Source::File {
+        path: path.into(),
+        layer: layer.map(Into::into),
+        subset: subset.map(Into::into),
+        ignored: Vec::new(),
+    };
+    assert_eq!(
+        one("vectortile"),
+        Source::Xyz {
+            url: "https://example.invalid/tiles/{z}/{x}/{y}.pbf".into(),
+            zmin: Some(0),
+            zmax: Some(14),
+            vector: true,
+            style: None
+        }
+    );
+    let Source::Xyz { style, .. } = one("vectortile-style") else { panic!() };
+    assert_eq!(style.as_deref(), Some("https://example.invalid/style.json"));
+    assert_eq!(
+        one("mbtilesvectortiles"),
+        Source::Archive { path: "/p/qgs/../data/tiles.mbtiles".into(), kind: "mbtiles", vector: true, zoom: (None, None) }
+    );
+    assert_eq!(
+        one("pmtiles"),
+        Source::Archive { path: "/p/qgs/../data/tiles.pmtiles".into(), kind: "pmtiles", vector: true, zoom: (None, None) }
+    );
+    assert_eq!(
+        one("mbtiles-raster"),
+        Source::Archive { path: "/p/qgs/../data/raster.mbtiles".into(), kind: "mbtiles", vector: false, zoom: (None, None) }
+    );
+    assert_eq!(one("gpx"), file("/p/qgs/../data/waypoints.gpx", Some("waypoints"), None));
+    assert_eq!(one("gpx-track"), file("/p/qgs/../data/waypoints.gpx", Some("tracks"), None));
+    let Source::Memory { geometry, fields, crs, .. } = one("memory") else { panic!() };
+    assert_eq!(crs.as_deref(), Some("EPSG:2056"));
+    assert_eq!((geometry, fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>()), (GeometryType::Point, vec!["name", "n"]));
+    let Source::SqlServer { table, connection, .. } = one("mssql") else { panic!() };
+    assert_eq!((table.as_str(), connection.as_str()), ("dbo.towns", "dbname=gis host=db.invalid user=me"));
+    // Virtual layers on one layer read as it with their filter; another is left for a note.
+    let gpkg = "/p/qgs/../data/sample.gpkg";
+    let (layers, _) = read("virtual");
+    let filtered = (file(gpkg, Some("points"), Some("value > 20")), Some(r#""value" > 20"#.to_string()));
+    assert_eq!(layers, std::slice::from_ref(&filtered));
+    let (layers, _) = read("virtual-ref");
+    let sources: Vec<_> = layers.iter().map(|(s, q)| (s.clone(), q.clone())).collect();
+    // (The virtual layer on top, as QGIS added it last.)
+    assert_eq!(sources, [filtered, (file(gpkg, Some("points"), None), None)]);
+    let Source::Virtual { query, from: None, filter: None } = one("virtual-grouped") else { panic!() };
+    assert_eq!(query, "SELECT kind, count(*) AS n FROM pts GROUP BY kind");
+    // Web services: each as the service and the layer RustGIS's service commands name (#882 10b).
+    let none = super::WebOptions::default();
+    let wfs = |layer: &str, ogc_api: bool, url: &str, filter: Option<Result<String, String>>| Source::Wfs {
+        url: url.into(),
+        layer: layer.into(),
+        ogc_api,
+        filter,
+        options: none.clone(),
+    };
+    assert_eq!(one("wfs"), wfs("ms:roads", false, "https://example.invalid/wfs", None));
+    assert_eq!(one("wfs-filtered"), wfs("ms:roads", false, "https://example.invalid/wfs", Some(Ok("kind = 'a'".into()))));
+    assert_eq!(one("oapif"), wfs("roads", true, "https://example.invalid/ogcapi", None));
+    let arcgis = |service: &str, layer: &str, features: bool| Source::ArcGis {
+        url: format!("https://example.invalid/arcgis/rest/services/{service}"),
+        layer: layer.into(),
+        features,
+        style: false,
+        options: none.clone(),
+    };
+    assert_eq!(one("arcgisfeatureserver"), arcgis("Roads/FeatureServer", "0", true));
+    assert_eq!(one("arcgismapserver"), arcgis("Topo/MapServer", "map:0", false));
+    assert_eq!(one("arcgisimageserver"), arcgis("Elev/ImageServer", "image", false));
+    assert_eq!(one("arcgisvectortileservice"), arcgis("Base/VectorTileServer", "style", false));
+    assert_eq!(one("wcs"), Source::Wcs { url: "https://example.invalid/wcs".into(), coverage: "dem".into(), options: none.clone() });
+    let Source::Wms { layer, wmts: true, .. } = one("wmts") else { panic!() };
+    assert_eq!(layer, "roads");
+    let Source::Wms { wmts: false, options, .. } = one("wms") else { panic!() };
+    assert_eq!(options, none);
+}
+
+/// A virtual layer on another layer of the project reads as that layer's file, with both
+/// filters; one on a layer that isn't there, or isn't a file, is left as it is.
+#[test]
+fn a_virtual_layer_on_another_layer_takes_its_filter_too() {
+    let layer = |id: &str, provider: &str, source: &str| {
+        format!(
+            r#"<maplayer type="vector"><id>{id}</id><datasource>{source}</datasource><layername>{id}</layername><provider>{provider}</provider></maplayer>"#
+        )
+    };
+    let qgs = format!(
+        "<qgis><projectlayers>{}{}{}{}</projectlayers></qgis>",
+        layer("v", "virtual", "?layer_ref=base:b&amp;query=SELECT%20*%20FROM%20b%20WHERE%20value%20%3E%202"),
+        layer("base", "ogr", "./a.gpkg|layername=a|subset=kind = 'x'"),
+        layer("lost", "virtual", "?layer_ref=nosuch:b&amp;query=SELECT%20*%20FROM%20b"),
+        layer("web", "virtual", "?layer_ref=tiles:t&amp;query=SELECT%20*%20FROM%20t"),
+    );
+    let mut report = Report::default();
+    let p = read_project(&qgs, "/d", &mut report).unwrap();
+    let v = p.layers.iter().find(|l| l.id == "v").unwrap();
+    assert_eq!(
+        v.source,
+        Source::File {
+            path: "/d/a.gpkg".into(),
+            layer: Some("a".into()),
+            subset: Some("(kind = 'x') AND (value > 2)".into()),
+            ignored: Vec::new()
+        }
+    );
+    assert_eq!(v.definition_query.as_deref(), Some(r#"( "kind" = 'x' ) AND ( "value" > 2 )"#));
+    // A virtual layer on a virtual layer further down is read too.
+    let qgs = format!(
+        "<qgis><projectlayers>{}{}{}</projectlayers></qgis>",
+        layer("top", "virtual", "?layer_ref=v:x&amp;query=SELECT%20*%20FROM%20x%20WHERE%20n%20%3C%209"),
+        layer("v", "virtual", "?layer_ref=base:b&amp;query=SELECT%20*%20FROM%20b%20WHERE%20value%20%3E%202"),
+        layer("base", "ogr", "./a.gpkg|layername=a"),
+    );
+    let mut report = Report::default();
+    let p2 = read_project(&qgs, "/d", &mut report).unwrap();
+    let Source::File { subset, .. } = &p2.layers.iter().find(|l| l.id == "top").unwrap().source else { panic!() };
+    assert_eq!(subset.as_deref(), Some("(value > 2) AND (n < 9)"));
+    // A filter past any RustGIS reads isn't kept, noted.
+    let long = format!("value > {}", "9".repeat(rustgis_data::query::MAX_LEN));
+    let qgs = format!(
+        "<qgis><projectlayers>{}{}</projectlayers></qgis>",
+        layer(
+            "v",
+            "virtual",
+            &format!("?layer_ref=base:b&amp;query=SELECT%20*%20FROM%20b%20WHERE%20{}", long.replace(' ', "%20").replace('>', "%3E"))
+        ),
+        layer("base", "ogr", "./a.gpkg|layername=a"),
+    );
+    let mut report = Report::default();
+    let p3 = read_project(&qgs, "/d", &mut report).unwrap();
+    let v3 = p3.layers.iter().find(|l| l.id == "v").unwrap();
+    assert!(matches!(&v3.source, Source::File { subset: None, .. }) && v3.definition_query.is_none(), "{:?}", v3.source);
+    assert!(report.notes.iter().any(|n| n.layer == "v" && n.text.contains("too long to read")), "{:?}", report.notes);
+    // A base layer's filter past any RustGIS reads is left behind, not copied: the virtual
+    // layer's own filter is kept, and each layer that selects from it says so.
+    let base_long = format!("./a.gpkg|layername=a|subset=value &gt; {}", "9".repeat(rustgis_data::query::MAX_LEN));
+    let qgs = format!(
+        "<qgis><projectlayers>{}{}{}</projectlayers></qgis>",
+        layer("v1", "virtual", "?layer_ref=base:b&amp;query=SELECT%20*%20FROM%20b%20WHERE%20value%20%3E%202"),
+        layer("v2", "virtual", "?layer_ref=base:b&amp;query=SELECT%20*%20FROM%20b%20WHERE%20value%20%3E%202"),
+        layer("base", "ogr", &base_long),
+    );
+    let mut report = Report::default();
+    let p4 = read_project(&qgs, "/d", &mut report).unwrap();
+    for id in ["v1", "v2"] {
+        let v = p4.layers.iter().find(|l| l.id == id).unwrap();
+        assert_eq!(v.definition_query.as_deref(), Some(r#""value" > 2"#), "{id}");
+        assert!(
+            report.notes.iter().any(|n| n.layer == id && n.text.contains("the filter of the layer its virtual layer selects from")),
+            "{id}"
+        );
+    }
+    for id in ["lost", "web"] {
+        let l = p.layers.iter().find(|l| l.id == id).unwrap();
+        assert!(matches!(l.source, Source::Virtual { .. }), "{id}: {:?}", l.source);
+    }
+}
+
+/// The map's rotation that doesn't read faces north, noted.
+#[test]
+fn a_map_rotation_that_does_not_read_is_noted() {
+    let qgs = r#"<qgis version="4.2.3"><mapcanvas name="theMapCanvas"><rotation>sideways</rotation></mapcanvas></qgis>"#;
+    let mut report = Report::default();
+    let p = read_project(qgs, "/p", &mut report).unwrap();
+    assert_eq!(p.rotation, 0.0);
+    assert!(
+        report.notes.iter().any(|n| n.text == "the map's rotation `sideways`, which doesn't read: facing north"),
+        "{:#?}",
+        report.notes
+    );
+}
+
+/// A project nested past the limit, or whose namespaces would take too long to resolve, is refused
+/// before it is parsed, never a crash or a hang.
+#[test]
+fn a_hostile_project_is_refused_before_parsing() {
+    let deep = format!("<!DOCTYPE qgis><qgis>{}{}</qgis>", "<a>".repeat(10_000), "</a>".repeat(10_000));
+    let refused = parse(&deep, "a QGIS project").unwrap_err();
+    assert!(refused.contains("deep"), "{refused}");
+    let declarations: String = (0..20_000).map(|k| format!(r#" xmlns:n{k}="urn:{k}""#)).collect();
+    let flood = format!("<qgis{declarations}/>");
+    let refused = parse(&flood, "a QGIS project").unwrap_err();
+    assert!(refused.contains("namespace declarations"), "{refused}");
+}
+
+fn letter_case_notes(report: &Report, layer: &str) -> usize {
+    report.notes.iter().filter(|n| n.layer == layer && n.kind == NoteKind::Approximated && n.text.contains("letter case")).count()
+}
+
+/// A filter that matches text ignoring case where QGIS (or the filter's own database) tells case
+/// apart is noted, once, under the rules of its dialect; one that doesn't differ is not.
+#[test]
+fn text_matched_ignoring_case_is_noted_where_qgis_tells_case_apart() {
+    for (file, subset, noted) in [
+        ("./a.gpkg", r#"&quot;kind&quot; = 'x'"#, true),
+        ("./a.gpkg", r#"&quot;kind&quot; IN ('a', 'B')"#, true),
+        ("./a.gpkg", r#"&quot;name&quot; &gt; 'M'"#, true),
+        ("./a.gpkg", r#"&quot;kind&quot; LIKE 'x%'"#, false),
+        ("./a.gpkg", r#"&quot;kind&quot; LIKE 'é%'"#, false),
+        ("./a.gpkg", r#"lower(&quot;kind&quot;) = 'x'"#, false),
+        ("./a.gpkg", r#"upper(&quot;kind&quot;) LIKE '%PARK%'"#, false),
+        ("./a.gpkg", r#"format_date(&quot;d&quot;, 'yyyy') IS NULL"#, false),
+        ("./a.shp", r#"&quot;kind&quot; = 'x'"#, false),
+        ("./a.shp", r#"&quot;kind&quot; LIKE 'x%'"#, true),
+        ("./a.shp", r#"&quot;kind&quot; ILIKE 'x%'"#, false),
+        ("./a.shp", r#"&quot;kind&quot; &gt; 'M'"#, false),
+        ("./a.shp", r#"&quot;kind&quot; &gt; 'É'"#, true),
+        ("./a.gpkg", r#"&quot;kind&quot; = '12' AND &quot;pop&quot; &gt; 5"#, false),
+        ("./a.gpkg", r#"&quot;kind&quot; = 'é'"#, false),
+    ] {
+        let project = format!(
+            r#"<qgis><projectlayers><maplayer type="vector"><id>a</id><datasource>{file}|layername=a|subset={subset}</datasource><layername>A</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#
+        );
+        let mut report = Report::default();
+        read_project(&project, "/maps", &mut report).unwrap();
+        assert_eq!(letter_case_notes(&report, "A"), usize::from(noted), "{file} {subset}: {:?}", report.notes);
+    }
+    for (file, subset, noted) in [
+        ("./a.gpkg", "&quot;pop&quot; NOT IN (1, NULL)", true),
+        ("./a.gpkg", "&quot;pop&quot; NOT IN (1, 2)", false),
+        ("./a.shp", "&quot;pop&quot; NOT IN (1, NULL)", true),
+    ] {
+        let project = format!(
+            r#"<qgis><projectlayers><maplayer type="vector"><id>a</id><datasource>{file}|layername=a|subset={subset}</datasource><layername>A</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#
+        );
+        let mut report = Report::default();
+        read_project(&project, "/maps", &mut report).unwrap();
+        let n = report.notes.iter().filter(|n| n.layer == "A" && n.text.contains("NOT IN list holds NULL")).count();
+        assert_eq!(n, usize::from(noted), "{subset}: {:?}", report.notes);
+    }
+}
+
+fn rules_layer(renderer_rules: &str, label_rules: &str) -> String {
+    format!(
+        r#"<qgis><projectlayers><maplayer type="vector"><id>a</id><datasource>./a.gpkg|layername=a</datasource><layername>A</layername><provider>ogr</provider>
+        <renderer-v2 type="RuleRenderer"><rules key="r">{renderer_rules}</rules>
+        <symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol><symbol type="marker" name="1"><layer class="SimpleMarker" enabled="1"/></symbol></symbols></renderer-v2>
+        <labeling type="rule-based"><rules key="l">{label_rules}</rules></labeling></maplayer></projectlayers></qgis>"#
+    )
+}
+
+#[test]
+fn rules_matching_text_ignoring_case_are_noted_and_unique_values_are_not() {
+    let label = r#"<rule key="1" filter="&quot;kind&quot; = 'x'"><settings><text-style fieldName="name"/></settings></rule>"#;
+    let mut report = Report::default();
+    let rules =
+        r#"<rule key="1" filter="&quot;kind&quot; LIKE 'x%'" symbol="0"/><rule key="2" filter="&quot;kind&quot; ILIKE 'y%'" symbol="1"/>"#;
+    read_project(&rules_layer(rules, label), "/m", &mut report).unwrap();
+    let said =
+        |part: &str| report.notes.iter().filter(|n| n.layer == "A" && n.text.contains(part) && n.text.contains("letter case")).count();
+    assert_eq!((said("its rules,"), said("its label rules,")), (1, 1), "{:?}", report.notes);
+    let mut report = Report::default();
+    let rules = r#"<rule key="1" filter="&quot;kind&quot; = 'x'" symbol="0"/><rule key="2" filter="&quot;kind&quot; = 'y'" symbol="1"/>"#;
+    read_project(&rules_layer(rules, ""), "/m", &mut report).unwrap();
+    assert!(!report.notes.iter().any(|n| n.text.contains("its rules,")), "{:?}", report.notes);
+    // Only rules the import keeps are noted: one whose symbol can't be read isn't kept.
+    let mut report = Report::default();
+    let rules = r#"<rule key="1" filter="&quot;value&quot; &gt; 1" symbol="0"/><rule key="2" filter="&quot;value&quot; &gt; 2" symbol="1"/><rule key="3" filter="&quot;kind&quot; LIKE 'x%'" symbol="9"/>"#;
+    read_project(&rules_layer(rules, ""), "/m", &mut report).unwrap();
+    assert_eq!(letter_case_notes(&report, "A"), 0, "{:?}", report.notes);
+    // But an else rule takes what its siblings don't draw, so their filters count with it.
+    let mut report = Report::default();
+    let rules = r#"<rule key="1" filter="&quot;value&quot; &gt; 1" symbol="0"/><rule key="3" filter="&quot;kind&quot; LIKE 'x%'" symbol="9"/><rule key="4" filter="ELSE" symbol="1" scalemaxdenom="50000"/>"#;
+    read_project(&rules_layer(rules, ""), "/m", &mut report).unwrap();
+    assert_eq!(letter_case_notes(&report, "A"), 1, "{:?}", report.notes);
+    // Label rules likewise: one without settings isn't imported.
+    let mut report = Report::default();
+    let bare = r#"<rule key="1" filter="&quot;kind&quot; = 'x'"/>"#;
+    read_project(&rules_layer("", bare), "/m", &mut report).unwrap();
+    assert_eq!(letter_case_notes(&report, "A"), 0, "{:?}", report.notes);
+    // Nor one past the 64 classes read.
+    let mut report = Report::default();
+    let many: String = (0..64)
+        .map(|k| format!(r#"<rule key="n{k}" filter="&quot;n&quot; = 1"><settings><text-style fieldName="name"/></settings></rule>"#))
+        .collect::<String>()
+        + label;
+    read_project(&rules_layer("", &many), "/m", &mut report).unwrap();
+    assert_eq!(letter_case_notes(&report, "A"), 0, "{:?}", report.notes);
+    // A label else rule takes what its sibling labels, and that sibling's filter counts with it
+    // even where the sibling makes no class (no text style).
+    let mut report = Report::default();
+    let siblings = r#"<rule key="1" filter="&quot;kind&quot; LIKE 'x%'"><settings/></rule><rule key="2" filter="ELSE"><settings><text-style fieldName="name"/></settings></rule>"#;
+    read_project(&rules_layer("", siblings), "/m", &mut report).unwrap();
+    assert_eq!(letter_case_notes(&report, "A"), 1, "{:?}", report.notes);
+}
+
+#[test]
+fn a_virtual_layer_filter_matching_text_ignoring_case_is_noted() {
+    let layer = |id: &str, provider: &str, source: &str| {
+        format!(
+            r#"<maplayer type="vector"><id>{id}</id><datasource>{source}</datasource><layername>{id}</layername><provider>{provider}</provider></maplayer>"#
+        )
+    };
+    for (base, query, noted) in [
+        ("./a.shp|layername=a", "SELECT%20*%20FROM%20b%20WHERE%20kind%20%3D%20'x'", true),
+        ("./a.shp|layername=a|subset=kind = 'x'", "SELECT%20*%20FROM%20b", false),
+    ] {
+        let qgs = format!(
+            "<qgis><projectlayers>{}{}</projectlayers></qgis>",
+            layer("v", "virtual", &format!("?layer_ref=base:b&amp;query={query}")),
+            layer("base", "ogr", base),
+        );
+        let mut report = Report::default();
+        read_project(&qgs, "/d", &mut report).unwrap();
+        assert_eq!(letter_case_notes(&report, "v"), usize::from(noted), "{base}: {:?}", report.notes);
+    }
+    // A virtual layer on a virtual layer reads the parts of the one below under their dialects.
+    for (base, v1, noted) in [
+        ("./a.shp|layername=a", "SELECT%20*%20FROM%20b%20WHERE%20kind%20%3D%20'x'", true),
+        ("./a.gpkg|layername=a|subset=kind LIKE 'x%'", "SELECT%20*%20FROM%20b", false),
+        ("./a.shp|layername=a|subset=kind = 'x'", "SELECT%20*%20FROM%20b", false),
+    ] {
+        let qgs = format!(
+            "<qgis><projectlayers>{}{}{}</projectlayers></qgis>",
+            layer("v2", "virtual", "?layer_ref=v1:b&amp;query=SELECT%20*%20FROM%20b"),
+            layer("v1", "virtual", &format!("?layer_ref=base:b&amp;query={v1}")),
+            layer("base", "ogr", base),
+        );
+        let mut report = Report::default();
+        read_project(&qgs, "/d", &mut report).unwrap();
+        assert_eq!(letter_case_notes(&report, "v2"), usize::from(noted), "{base}: {:?}", report.notes);
+    }
+}
+
+/// A virtual layer's filter dropped for being too long to read together with its base's isn't
+/// noted for.
+#[test]
+fn a_dropped_virtual_filter_is_not_noted_for_letter_case() {
+    let max = rustgis_data::query::MAX_LEN;
+    let base = format!("value &gt; {}", "9".repeat(max - 60));
+    let qgs = format!(
+        r#"<qgis><projectlayers><maplayer type="vector"><id>v</id><datasource>?layer_ref=base:b&amp;query=SELECT%20*%20FROM%20b%20WHERE%20kind%20%3D%20'{}x'</datasource><layername>v</layername><provider>virtual</provider></maplayer>
+        <maplayer type="vector"><id>base</id><datasource>./a.shp|subset={base}</datasource><layername>base</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#,
+        "y".repeat(100)
+    );
+    let mut report = Report::default();
+    read_project(&qgs, "/d", &mut report).unwrap();
+    assert!(report.notes.iter().any(|n| n.layer == "v" && n.text.contains("too long to read together")), "{:?}", report.notes);
+    assert_eq!(letter_case_notes(&report, "v"), 0, "{:?}", report.notes);
 }
