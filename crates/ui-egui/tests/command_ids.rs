@@ -39,6 +39,7 @@ const EXEMPT: &[(&str, &str)] = &[
     ("ui.stac.usgsLidar", "a Web Data preset: `ui.stac.*` is resolved by `stacui::Preset::from_id`"),
     ("ui.stac.vantor", "a Web Data preset: `ui.stac.*` is resolved by `stacui::Preset::from_id`"),
     ("data.cityofberkeley.info", "an open-data portal's host name; `info` is not in `NOT_IDS`, because `time.info` is a command"),
+    ("time.sim", "a SWAT+ project's simulation period file (TxtInOut), read by `swat.summary` (RustGIS-SwatPlus)"),
     ("stac.cut_note", "a key for a widget's remembered state in the STAC pane (stacui.rs), not a command"),
 ];
 

@@ -536,9 +536,11 @@ def test_a_layer_read_in_place_exports_its_whole_source(tmp_path):
 def test_geojson_export_reports_lost_heights_without_repeating_opening_notes(tmp_path):
     for stream in (False, True):
         session = rustgis.Session()
+        # A measure (the height null): RustGIS-SwatPlus keeps a GeoJSON file's heights read whole,
+        # but no measures, which are dropped and said.
         path = tmp_path / "heights.geojson"
         path.write_text(json.dumps({"type": "FeatureCollection", "features": [{
-            "type": "Feature", "geometry": {"type": "Point", "coordinates": [1, 2, 3]}, "properties": {}
+            "type": "Feature", "geometry": {"type": "Point", "coordinates": [1, 2, None, 4]}, "properties": {}
         }]}))
         layer = session.add_data(path, stream=stream)
         opening = [text for text, _ in session.notices()]
