@@ -1,16 +1,31 @@
 //! A SWAT+ run's output tables (A1.2 of the swatplus-rust roadmap): which tables a run wrote
 //! (`swat.output.list`), a table's statistics and rows picked by object and date
 //! (`swat.output.read`), the basin's water balance (`swat.balance`), and two runs side by side
-//! (`swat.compare`).
+//! (`swat.compare`); observed series loaded for the project (`swat.observed`) and how well a run
+//! fits them (`swat.metrics`: NSE, KGE, PBIAS, RSR, Spearman; stage through a rating curve).
 //!
 //! The tables are the engine's (text or Parquet, `rustgis_swat_run::output`) in a run's folder,
 //! or SWAT+'s own text tables in a TxtInOut folder. A table is gone through a row at a time; in
 //! the desktop app on a thread of its own (`reads::IN_BACKGROUND`), with its progress and Cancel.
 //! A confidential project's answers carry statistics only: no rows and no object names.
 
+use std::collections::BTreeMap;
+
 #[cfg(not(target_arch = "wasm32"))]
 use super::swat::MAX_LISTED;
+use super::swat::need_swat;
 use crate::CommandSpec as C;
+
+/// An observed series loaded for the project (`swat.observed`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Observed {
+    /// `flow` (m³/s) or `stage` (m).
+    pub kind: &'static str,
+    pub path: String,
+    pub column: String,
+    /// Daily values by (year, month, day): the mean of the day's readings.
+    pub series: BTreeMap<(i64, i64, i64), f64>,
+}
 
 const WHERE: &str = "Analyze › SWAT+";
 
@@ -33,11 +48,17 @@ pub fn commands() -> Vec<C> {
         C::new("swat.compare", "Compare SWAT+ Runs", WHERE, compare).roles(&[]).effects(files).view().params(
             r#"{"runs": [a, b] (each a run's number or a folder), "table": "e.g. channel_sd_day", "columns"?: ["column", …], "match"?: "object names, with * and ?", "unit"?: number | [number, …], "from"?: "yyyy[-mm[-dd]]", "to"?: "yyyy[-mm[-dd]]"} — each column's statistics in both runs and the change in its mean, overall and by object"#,
         ),
+        C::new("swat.observed", "Load SWAT+ Observations", WHERE, observed).roles(&[]).effects(files).view().when(need_swat).params(
+            r#"{"path"?: "a CSV of dates and values (none: list those loaded)", "name"?: text (default: the file's name), "column"?: "the values' column (default: the first after the date)", "kind"?: "flow" (m³/s, default) | "stage" (m), "dateColumn"?: "default: date, tanggal, time, waktu or the first column", "dayFirst"?: bool (dd/mm/yyyy, the default; false for mm/dd/yyyy), "missing"?: number (a value that means none, such as -9999)} — loads an observed series for swat.metrics; readings of one day are averaged"#,
+        ),
+        C::new("swat.metrics", "SWAT+ Fit Statistics", WHERE, metrics).roles(&[]).effects(files).view().when(need_swat).params(
+            r#"{"observed": "a name from swat.observed", "run"?: number | "folder" (as swat.output.list), "table"?: "a daily table (default channel_sd_day)", "column"?: "default flo_out", "match"?: "the object's name", "unit"?: number, "from"?: "yyyy[-mm[-dd]]", "to"?: "yyyy[-mm[-dd]]", "step"?: "day" (default) | "month", "rating"?: "fit" (stage's default) | {"a": number, "b": number, "h0": number}} — NSE, KGE (r, alpha, beta), PBIAS, RSR and Spearman of one object's simulated series against the observed, on the days both have; stage through a rating curve fitted to the run or given"#,
+        ),
     ]
 }
 
 #[cfg(target_arch = "wasm32")]
-use web::{balance, compare, list, read};
+use web::{balance, compare, list, metrics, observed, read};
 
 /// The browser has no run folders yet: the engine's WebAssembly module will give it tables.
 #[cfg(target_arch = "wasm32")]
@@ -62,12 +83,20 @@ mod web {
     pub(super) fn compare(_: &mut Session, _: &Value) -> CmdResult {
         Err(WHY.into())
     }
+
+    pub(super) fn observed(_: &mut Session, _: &Value) -> CmdResult {
+        Err(WHY.into())
+    }
+
+    pub(super) fn metrics(_: &mut Session, _: &Value) -> CmdResult {
+        Err(WHY.into())
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-use native::{balance, compare, list, read};
+use native::{balance, compare, list, metrics, observed, read};
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use native::{compare_ahead, read_ahead};
+pub(crate) use native::{compare_ahead, metrics_ahead, read_ahead};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
@@ -77,13 +106,15 @@ mod native {
     use rustgis_swat_run::output::{self, Cell, Scanned, TableFile, tidy};
     use serde_json::{Value, json};
 
+    use super::super::b;
     use super::super::swat::{glob, state};
     use super::super::{f, ps};
-    use super::{LISTED, MAX_LISTED};
+    use super::{LISTED, MAX_LISTED, Observed};
     use crate::{CmdResult, Session};
 
     const READ_KEY: &str = "swat.output.read";
     const COMPARE_KEY: &str = "swat.compare";
+    const METRICS_KEY: &str = "swat.metrics";
 
     /// The output folder `which` names, and how to say it: a run of `swat.runs` by its number;
     /// a run's folder (its `output`) or any folder of tables; by default the last run that
@@ -665,6 +696,395 @@ mod native {
     pub(super) fn date_for_tests(text: &str, end: bool) -> Option<(i64, i64, i64)> {
         date(text, end)
     }
+
+    // -----------------------------------------------------------------------------------------
+    // Observations and how well a run fits them
+
+    /// The largest observation file read (a century of hourly readings is far less).
+    const MAX_OBSERVED_BYTES: u64 = 256 << 20;
+
+    /// How a CSV of observations is read.
+    pub(super) struct ObsOptions {
+        pub(super) column: Option<String>,
+        pub(super) kind: &'static str,
+        pub(super) date_column: Option<String>,
+        pub(super) day_first: bool,
+        pub(super) missing: Option<f64>,
+    }
+
+    /// What a CSV of observations held besides its values.
+    #[derive(Debug, Default, PartialEq)]
+    pub(super) struct ObsReport {
+        pub(super) readings: u64,
+        pub(super) bad_dates: u64,
+        pub(super) bad_values: u64,
+        pub(super) missing: u64,
+        /// Days with several readings, averaged.
+        pub(super) several: u64,
+    }
+
+    fn days_in_month(y: i64, m: i64) -> i64 {
+        match m {
+            2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        }
+    }
+
+    /// A reading's day: `yyyy-mm-dd` or `yyyy/mm/dd`, else `dd/mm/yyyy` (or `mm/dd/yyyy` when not
+    /// `day_first`), with `-`, `/` or `.` between, and any time after a space or `T` left out.
+    pub(super) fn obs_date(text: &str, day_first: bool) -> Option<(i64, i64, i64)> {
+        let day = text.trim().trim_matches('"').split([' ', 'T']).next()?;
+        let parts: Vec<&str> = day.split(['-', '/', '.']).collect();
+        let [p0, p1, p2] = parts.as_slice() else { return None };
+        let n = |p: &str| p.trim().parse::<i64>().ok();
+        let (y, m, d) = if p0.trim().len() == 4 {
+            (n(p0)?, n(p1)?, n(p2)?)
+        } else if day_first {
+            (n(p2)?, n(p1)?, n(p0)?)
+        } else {
+            (n(p2)?, n(p0)?, n(p1)?)
+        };
+        ((1800..=2200).contains(&y) && (1..=12).contains(&m) && (1..=days_in_month(y, m)).contains(&d)).then_some((y, m, d))
+    }
+
+    /// Reads a CSV of dates and values: the delimiter the header uses most (`,`, `;` or a tab;
+    /// with `;` a decimal comma is read), the day of each reading, and the mean of a day's.
+    pub(super) fn read_observed(text: &str, o: &ObsOptions, path: &str) -> Result<(Observed, ObsReport), String> {
+        let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'));
+        let header = lines.next().ok_or("the file is empty")?;
+        let delim = [',', ';', '\t'].into_iter().max_by_key(|d| header.matches(*d).count()).filter(|d| header.contains(*d));
+        let split = |line: &str| -> Vec<String> {
+            match delim {
+                Some(d) => line.split(d).map(|f| f.trim().trim_matches('"').trim().to_string()).collect(),
+                None => line.split_whitespace().map(str::to_string).collect(),
+            }
+        };
+        let cols = split(header);
+        let find = |name: &str| cols.iter().position(|c| c.eq_ignore_ascii_case(name));
+        let date_at = match &o.date_column {
+            Some(c) => find(c).ok_or_else(|| format!("no column {c} (columns: {})", cols.join(", ")))?,
+            None => ["date", "tanggal", "time", "datetime", "waktu"].iter().find_map(|c| find(c)).unwrap_or(0),
+        };
+        let value_at = match &o.column {
+            Some(c) => find(c).ok_or_else(|| format!("no column {c} (columns: {})", cols.join(", ")))?,
+            None => (0..cols.len()).find(|&i| i != date_at).ok_or("the file has one column: give its dates and values")?,
+        };
+        let mut sums: BTreeMap<(i64, i64, i64), (f64, u32)> = BTreeMap::new();
+        let mut r = ObsReport::default();
+        for line in lines {
+            let fields = split(line);
+            let Some(day) = fields.get(date_at).and_then(|d| obs_date(d, o.day_first)) else {
+                r.bad_dates += 1;
+                continue;
+            };
+            let raw = fields.get(value_at).map(String::as_str).unwrap_or("");
+            if raw.is_empty() || ["na", "nan", "-", "null"].iter().any(|m| raw.eq_ignore_ascii_case(m)) {
+                r.missing += 1;
+                continue;
+            }
+            let parsed = if delim == Some(';') { raw.replace(',', ".").parse::<f64>() } else { raw.parse::<f64>() };
+            let Ok(x) = parsed else {
+                r.bad_values += 1;
+                continue;
+            };
+            if !x.is_finite() || o.missing.is_some_and(|m| x == m) {
+                r.missing += 1;
+                continue;
+            }
+            r.readings += 1;
+            let e = sums.entry(day).or_insert((0.0, 0));
+            e.0 += x;
+            e.1 += 1;
+        }
+        if sums.is_empty() {
+            return Err(format!("no readings with a date and a value in column {}", cols.get(value_at).cloned().unwrap_or_default()));
+        }
+        r.several = sums.values().filter(|(_, n)| *n > 1).count() as u64;
+        let series = sums.into_iter().map(|(d, (sum, n))| (d, sum / f64::from(n))).collect();
+        Ok((Observed { kind: o.kind, path: path.to_string(), column: cols.get(value_at).cloned().unwrap_or_default(), series }, r))
+    }
+
+    fn ymd((y, m, d): (i64, i64, i64)) -> String {
+        format!("{y:04}-{m:02}-{d:02}")
+    }
+
+    fn describe(name: &str, o: &Observed) -> Value {
+        let mut acc = Acc::default();
+        for v in o.series.values() {
+            acc.add(*v);
+        }
+        let first = o.series.keys().next().copied();
+        let last = o.series.keys().next_back().copied();
+        json!({
+            "name": name, "kind": o.kind, "column": o.column, "path": o.path,
+            "first": first.map(ymd), "last": last.map(ymd), "days": o.series.len(),
+            "values": acc.to_json(),
+        })
+    }
+
+    /// Reads a CSV of a few columns: its size is bounded, and it is done here.
+    pub(super) fn observed(s: &mut Session, p: &Value) -> CmdResult {
+        let Some(path) = ps(p, "path").map(str::trim).filter(|p| !p.is_empty()) else {
+            let st = state(s)?;
+            return Ok(json!({"observed": st.observed.iter().map(|(n, o)| describe(n, o)).collect::<Vec<_>>()}));
+        };
+        let kind = match ps(p, "kind") {
+            None | Some("flow") => "flow",
+            Some("stage") => "stage",
+            Some(k) => return Err(format!("kind is flow or stage, not {k}")),
+        };
+        let size = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?.len();
+        if size > MAX_OBSERVED_BYTES {
+            return Err(format!("{path}: {size} bytes is more than an observation file should be (256 MB)"));
+        }
+        let text = String::from_utf8_lossy(&std::fs::read(path).map_err(|e| format!("{path}: {e}"))?).into_owned();
+        let o = ObsOptions {
+            column: ps(p, "column").map(str::to_string),
+            kind,
+            date_column: ps(p, "dateColumn").map(str::to_string),
+            day_first: b(p, "dayFirst").unwrap_or(true),
+            missing: f(p, "missing"),
+        };
+        let (obs, report) = read_observed(&text, &o, path)?;
+        let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| {
+            std::path::Path::new(path).file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "observed".into())
+        });
+        // What wasn't read is said, one notice a kind, with its count.
+        for (n, what) in [
+            (report.bad_dates, "rows without a date it could read"),
+            (report.bad_values, "values it couldn't read as numbers"),
+            (report.missing, "readings marked missing"),
+        ] {
+            if n > 0 {
+                s.notify(format!("{name}: {n} {what} were left out"), false);
+            }
+        }
+        if report.several > 0 {
+            s.notify(format!("{name}: {} days had several readings; each day's mean is used", report.several), false);
+        }
+        let mut out = describe(&name, &obs);
+        out["readings"] = json!(report.readings);
+        out["left_out"] = json!({"dates": report.bad_dates, "values": report.bad_values, "missing": report.missing});
+        let st = super::super::swat::state_mut(s)?;
+        st.observed.insert(name, obs);
+        Ok(out)
+    }
+
+    /// A comparison of a run's daily series with an observed one, prepared on the window's thread.
+    pub(crate) struct MetricsJob {
+        name: String,
+        observed: Observed,
+        label: Value,
+        table: TableFile,
+        column: String,
+        query: Query,
+        monthly: bool,
+        rating: Option<rustgis_swat_run::metrics::Rating>,
+        confidential: bool,
+    }
+
+    fn prepare_metrics(s: &Session, p: &Value) -> Result<MetricsJob, String> {
+        let name = ps(p, "observed").map(str::trim).ok_or("give observed: a series loaded with swat.observed")?;
+        let st = state(s)?;
+        let observed = st.observed.get(name).cloned().ok_or_else(|| format!("no observed series {name} (swat.observed lists them)"))?;
+        let (dir, label) = source(s, p.get("run"))?;
+        let table = table_in(&dir, ps(p, "table").unwrap_or("channel_sd_day"))?;
+        if table.period != "day" {
+            return Err(format!("{} is a {} table: compare a daily one (step month gives monthly figures)", table.table, table.period));
+        }
+        let monthly = match ps(p, "step") {
+            None | Some("day") => false,
+            Some("month") => true,
+            Some(other) => return Err(format!("step is day or month, not {other}")),
+        };
+        let rating = match p.get("rating") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(f)) if f == "fit" => None,
+            Some(r @ Value::Object(_)) => {
+                let g =
+                    |k: &str| r.get(k).and_then(Value::as_f64).ok_or_else(|| format!("rating needs a, b and h0 as numbers (missing {k})"));
+                let (a, b, h0) = (g("a")?, g("b")?, g("h0")?);
+                if a <= 0.0 || b <= 0.0 {
+                    return Err("a rating curve's a and b are positive".into());
+                }
+                Some(rustgis_swat_run::metrics::Rating { a, b, h0 })
+            }
+            Some(other) => return Err(format!("rating is \"fit\" or {{a, b, h0}}, not {other}")),
+        };
+        if rating.is_some() && observed.kind != "stage" {
+            return Err(format!("{name} is a flow series: a rating curve is for stage"));
+        }
+        Ok(MetricsJob {
+            name: name.to_string(),
+            observed,
+            label,
+            table,
+            column: ps(p, "column").unwrap_or("flo_out").to_string(),
+            query: query(p)?,
+            monthly,
+            rating,
+            confidential: st.confidential,
+        })
+    }
+
+    impl MetricsJob {
+        fn go(self) -> Result<Value, String> {
+            use rustgis_swat_run::metrics as m;
+            let file = self.table.file().ok_or("the table has no file")?.to_path_buf();
+            let h = output::header(&file)?;
+            let at = |n: &str| h.columns.iter().position(|c| c == n);
+            let value = at(&self.column).ok_or_else(|| format!("{} has no column {}", self.table.table, self.column))?;
+            let (Some(yr), Some(mon), Some(day)) = (at("yr"), at("mon"), at("day")) else {
+                return Err(format!("{} has no yr, mon and day columns", self.table.table));
+            };
+            let (unit, objname) = (at("unit"), at("name"));
+            let watch = Watch::new();
+            let whole = |row: &[Cell], i: usize| row.get(i).and_then(Cell::whole);
+            let mut sim: BTreeMap<(i64, i64, i64), f64> = BTreeMap::new();
+            let mut objects: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut on_row = |row: &[Cell]| {
+                if watch.stop() {
+                    return false;
+                }
+                let object = objname.and_then(|i| row.get(i)).and_then(Cell::text);
+                if let Some(pat) = &self.query.matching
+                    && !object.is_some_and(|o| glob(pat, o))
+                {
+                    return true;
+                }
+                let u = unit.and_then(|i| whole(row, i));
+                if let Some(units) = &self.query.units
+                    && !u.is_some_and(|u| units.contains(&u))
+                {
+                    return true;
+                }
+                let (Some(y), Some(mo), Some(d)) = (whole(row, yr), whole(row, mon), whole(row, day)) else { return true };
+                let when = (y, mo, d);
+                if self.query.from.is_some_and(|f| when < f) || self.query.to.is_some_and(|t| when > t) {
+                    return true;
+                }
+                if objects.len() < 3 {
+                    objects.insert(object.map(str::to_string).or_else(|| u.map(|u| u.to_string())).unwrap_or_default());
+                }
+                if let Some(x) = row.get(value).and_then(Cell::number) {
+                    sim.insert(when, x);
+                }
+                true
+            };
+            let mut progress = |done: u64, total: u64| watch.progress(done, total);
+            let scanned = output::scan(&file, &mut on_row, &mut progress)?;
+            if scanned.stopped {
+                return Err("SWAT+ Fit Statistics was cancelled".into());
+            }
+            if objects.len() > 1 {
+                return Err(format!(
+                    "the rows picked are of several objects ({}…): give match or unit for one",
+                    if self.confidential {
+                        "names hidden".to_string()
+                    } else {
+                        objects.iter().take(2).cloned().collect::<Vec<_>>().join(", ")
+                    }
+                ));
+            }
+            // The days both have, in date order.
+            let paired: Vec<((i64, i64, i64), f64, f64)> =
+                sim.iter().filter_map(|(d, s)| self.observed.series.get(d).map(|o| (*d, *s, *o))).collect();
+            if paired.len() < 3 {
+                return Err(format!(
+                    "{} days with both a simulated and an observed value: too few (the observed series runs {} to {})",
+                    paired.len(),
+                    self.observed.series.keys().next().copied().map(ymd).unwrap_or_default(),
+                    self.observed.series.keys().next_back().copied().map(ymd).unwrap_or_default()
+                ));
+            }
+            let flows: Vec<f64> = paired.iter().map(|p| p.1).collect();
+            let obs: Vec<f64> = paired.iter().map(|p| p.2).collect();
+            let mut notes: Vec<String> = Vec::new();
+            let mut rating_json = Value::Null;
+            let mut flow_stage_spearman = Value::Null;
+            // Stage: the run's flows through a rating curve, given or fitted to this run.
+            let simulated: Vec<f64> = if self.observed.kind == "stage" {
+                let (rating, fitted) = match self.rating {
+                    Some(r) => (r, None),
+                    None => {
+                        let f = m::fit_rating(&flows, &obs, None)?;
+                        (f.rating, Some(f.rmse))
+                    }
+                };
+                rating_json = json!({"a": tidy(rating.a), "b": tidy(rating.b), "h0": tidy(rating.h0), "fitted": fitted.is_some(), "rmse_m": fitted.map(tidy)});
+                flow_stage_spearman = json!(tidy(m::spearman(&flows, &obs)?));
+                if fitted.is_some() {
+                    notes.push("stage through a rating curve fitted to this run: it judges the timing and shape of the flows, not their volume (a run losing water still fits, through a smaller a); measured discharges or the water balance see the volume".into());
+                }
+                flows.iter().map(|q| rating.stage(*q)).collect()
+            } else {
+                flows
+            };
+            // By month: the means of the days both have in each month.
+            let (s_series, o_series, months) = if self.monthly {
+                let mut by: BTreeMap<(i64, i64), (f64, f64, u32)> = BTreeMap::new();
+                for (p, s) in paired.iter().zip(&simulated) {
+                    let e = by.entry((p.0.0, p.0.1)).or_insert((0.0, 0.0, 0));
+                    e.0 += s;
+                    e.1 += p.2;
+                    e.2 += 1;
+                }
+                let n = by.len();
+                let (s, o): (Vec<f64>, Vec<f64>) = by.values().map(|(s, o, k)| (s / f64::from(*k), o / f64::from(*k))).unzip();
+                (s, o, Some(n))
+            } else {
+                (simulated, obs, None)
+            };
+            let k = m::kge(&s_series, &o_series)?;
+            let nse = m::nse(&s_series, &o_series)?;
+            let pbias = m::pbias(&s_series, &o_series)?;
+            let rsr = m::rsr(&s_series, &o_series)?;
+            let mut metrics = json!({
+                "nse": tidy(nse), "kge": tidy(k.kge), "r": tidy(k.r), "alpha": tidy(k.alpha), "beta": tidy(k.beta),
+                "pbias": tidy(pbias), "rsr": tidy(rsr), "spearman": tidy(m::spearman(&s_series, &o_series)?),
+            });
+            if !flow_stage_spearman.is_null() {
+                metrics["spearman_flow_stage"] = flow_stage_spearman;
+            }
+            if self.observed.kind == "flow" && self.monthly {
+                // Moriasi et al. (2007), for monthly streamflow.
+                let ok = nse > 0.5 && rsr <= 0.7 && pbias.abs() <= 25.0;
+                metrics["moriasi_monthly_satisfactory"] = json!(ok);
+            } else {
+                notes.push("Moriasi et al. (2007) judge monthly streamflow: satisfactory when NSE > 0.50, RSR ≤ 0.70 and |PBIAS| ≤ 25 %; on daily values or on stage the same numbers mean something else".into());
+            }
+            notes.push("PBIAS is positive when the simulation is too large".into());
+            let mut out = json!({
+                "observed": self.name, "kind": self.observed.kind, "source": self.label,
+                "table": self.table.table, "column": self.column,
+                "pairs": paired.len(), "months": months,
+                "first": paired.first().map(|p| ymd(p.0)), "last": paired.last().map(|p| ymd(p.0)),
+                "step": if self.monthly { "month" } else { "day" },
+                "metrics": metrics, "rating": rating_json, "notes": notes, "uneven": scanned.uneven,
+            });
+            if !self.confidential {
+                out["object"] = json!(objects.iter().next());
+            }
+            Ok(out)
+        }
+    }
+
+    /// `swat.metrics`' work, for the desktop app to do on a thread of its own.
+    pub(crate) fn metrics_ahead(s: &mut Session, p: &Value) -> Result<Option<super::super::reads::ReadWork>, String> {
+        let job = prepare_metrics(s, p)?;
+        Ok(Some(super::super::reads::ahead("SWAT+ Fit Statistics", METRICS_KEY.into(), move || job.go())))
+    }
+
+    pub(super) fn metrics(s: &mut Session, p: &Value) -> CmdResult {
+        let out = match super::super::reads::take::<Result<Value, String>>(s, METRICS_KEY) {
+            Some(made) => made?,
+            None => prepare_metrics(s, p)?.go()?,
+        };
+        say_uneven(s, out["table"].as_str().unwrap_or_default(), out["uneven"].as_u64().unwrap_or(0));
+        Ok(out)
+    }
 }
 
 // `cfg(test)` on its own, as clippy's allow-unwrap-in-tests looks for it.
@@ -818,5 +1238,168 @@ mod tests {
         let ahead = read_ahead(&mut s, "swat.output.read", &p).unwrap();
         let err = ahead.run(&rustgis_analysis::control::Control::cancelled_at_look(3)).err().unwrap();
         assert!(err.contains("cancelled"), "{err}");
+    }
+
+    /// A project, and a run's daily channel table of 60 days (2015-01-01 on) for cha01 and cha02,
+    /// cha01's flow `q(i) = 10 + 5 sin(i / 5)`.
+    fn flows() -> (tempfile::TempDir, tempfile::TempDir, Vec<f64>) {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("file.cio"), "file.cio: test\nsimulation        time.sim          null\n").unwrap();
+        std::fs::write(
+            project.path().join("time.sim"),
+            "time.sim: test\nday_start  yrc_start  day_end  yrc_end  step\n       0       2015        0     2015     0\n",
+        )
+        .unwrap();
+        let run = tempfile::tempdir().unwrap();
+        let mut t =
+            String::from(" file.cio                 swatplus-rust 1.2.0\n  jday   mon   day    yr    unit  gis_id  name    flo_out\n\n");
+        let mut q = Vec::new();
+        for i in 0..60 {
+            let (mon, day) = if i < 31 {
+                (1, i + 1)
+            } else if i < 59 {
+                (2, i - 30)
+            } else {
+                (3, 1)
+            };
+            let x = 10.0 + 5.0 * (f64::from(i) / 5.0).sin();
+            let x: f64 = format!("{x:.6}").parse().unwrap();
+            q.push(x);
+            for (u, name, v) in [(1, "cha01", x), (2, "cha02", 2.0 * x)] {
+                t.push_str(&format!("  {:4}  {mon:4}  {day:4}  2015  {u:6}  {u:6}  {name}  {v:.6}\n", i + 1));
+            }
+        }
+        std::fs::write(run.path().join("channel_sd_day.txt"), t).unwrap();
+        (project, run, q)
+    }
+
+    fn observations(dir: &std::path::Path, name: &str, values: &[f64]) -> String {
+        let mut csv = String::from("date,value\n");
+        for (i, v) in values.iter().enumerate() {
+            let d = i as i64;
+            let (m, day) = if d < 31 {
+                (1, d + 1)
+            } else if d < 59 {
+                (2, d - 30)
+            } else {
+                (3, 1)
+            };
+            csv.push_str(&format!("2015-{m:02}-{day:02},{v:.6}\n"));
+        }
+        let p = dir.join(name);
+        std::fs::write(&p, csv).unwrap();
+        p.display().to_string()
+    }
+
+    #[test]
+    fn observations_are_read_by_day_and_say_what_they_left_out() {
+        let text = "Tanggal;TMA (m)\n01/01/2015 07:00;1,5\n01/01/2015 17:00;2,5\nxx;3\n02/01/2015;-9999\n03/01/2015;abc\n04/01/2015;\n05/02/2015;3,25\n";
+        let o = native::ObsOptions { column: None, kind: "stage", date_column: None, day_first: true, missing: Some(-9999.0) };
+        let (obs, r) = native::read_observed(text, &o, "tma.csv").unwrap();
+        assert_eq!(r, native::ObsReport { readings: 3, bad_dates: 1, bad_values: 1, missing: 2, several: 1 });
+        assert_eq!(obs.series.get(&(2015, 1, 1)), Some(&2.0), "the day's mean");
+        assert_eq!(obs.series.get(&(2015, 2, 5)), Some(&3.25), "dd/mm/yyyy, decimal comma");
+        assert_eq!(obs.column, "TMA (m)");
+        assert_eq!(native::obs_date("2015-02-29", true), None);
+        assert_eq!(native::obs_date("02/05/2015", false), Some((2015, 2, 5)));
+        assert_eq!(native::obs_date("2016-02-29T10:00", true), Some((2016, 2, 29)));
+        assert!(native::read_observed("date,value\nx,1\n", &o, "x.csv").is_err());
+    }
+
+    #[test]
+    fn a_run_s_flow_is_judged_against_observed_flow() {
+        let (project, run, q) = flows();
+        let mut s = session();
+        s.run("swat.open", &json!({"path": project.path().display().to_string()})).unwrap();
+        let same = observations(project.path(), "same.csv", &q);
+        let more: Vec<f64> = q.iter().map(|x| 1.1 * x).collect();
+        let higher = observations(project.path(), "higher.csv", &more);
+        let r = s.run("swat.observed", &json!({"path": same})).unwrap();
+        assert_eq!((r["name"].clone(), r["days"].clone(), r["first"].clone()), (json!("same"), json!(60), json!("2015-01-01")));
+        s.run("swat.observed", &json!({"path": higher, "name": "gauge"})).unwrap();
+        assert_eq!(s.run("swat.observed", &json!({})).unwrap()["observed"].as_array().map(Vec::len), Some(2));
+        // A clean file says nothing; one with a row it can't read says so, with the count.
+        let said = |s: &Session| s.notices.iter().filter(|n| n.text.contains("were left out")).count();
+        assert_eq!(said(&s), 0);
+        let lossy = project.path().join("lossy.csv");
+        std::fs::write(
+            &lossy,
+            "date,value
+2015-01-01,1
+not a date,2
+2015-01-02,3
+",
+        )
+        .unwrap();
+        s.run("swat.observed", &json!({"path": lossy.display().to_string()})).unwrap();
+        assert_eq!(said(&s), 1);
+        assert!(s.notices.iter().any(|n| n.text == "lossy: 1 rows without a date it could read were left out"));
+        let folder = run.path().display().to_string();
+        let m = s.run("swat.metrics", &json!({"observed": "same", "run": folder, "match": "cha01"})).unwrap();
+        assert_eq!((m["pairs"].clone(), m["metrics"]["nse"].clone(), m["metrics"]["kge"].clone()), (json!(60), json!(1.0), json!(1.0)));
+        assert_eq!(m["object"], json!("cha01"));
+        // The observed is a tenth higher: the run is 9.09 % too low.
+        let m = s.run("swat.metrics", &json!({"observed": "gauge", "run": folder, "unit": 1})).unwrap();
+        let near = |v: &Value, x: f64| v.as_f64().is_some_and(|v| (v - x).abs() < 1e-4);
+        assert!(near(&m["metrics"]["pbias"], -9.090909) && near(&m["metrics"]["beta"], 0.9090909), "{m}");
+        // By month: three months, and Moriasi's verdict for monthly flow.
+        let m = s.run("swat.metrics", &json!({"observed": "same", "run": folder, "match": "cha01", "step": "month"})).unwrap();
+        assert_eq!((m["months"].clone(), m["metrics"]["moriasi_monthly_satisfactory"].clone()), (json!(3), json!(true)));
+        // Two channels picked, or none of the observed days: refused, saying why.
+        assert!(s.run("swat.metrics", &json!({"observed": "same", "run": folder})).unwrap_err().contains("several objects"));
+        assert!(
+            s.run("swat.metrics", &json!({"observed": "same", "run": folder, "match": "cha01", "from": 2016}))
+                .unwrap_err()
+                .contains("too few")
+        );
+        assert!(s.run("swat.metrics", &json!({"observed": "nope", "run": folder})).unwrap_err().contains("no observed series nope"));
+        assert!(
+            s.run("swat.metrics", &json!({"observed": "same", "run": folder, "match": "cha01", "rating": {"a": 1, "b": 2, "h0": 0}}))
+                .unwrap_err()
+                .contains("for stage")
+        );
+    }
+
+    #[test]
+    fn a_run_s_flow_is_judged_against_stage_through_a_rating_curve() {
+        let (project, run, q) = flows();
+        let mut s = session();
+        s.run("swat.open", &json!({"path": project.path().display().to_string()})).unwrap();
+        let curve = rustgis_swat_run::metrics::Rating { a: 12.0, b: 1.8, h0: 0.5 };
+        let stage: Vec<f64> = q.iter().map(|x| curve.stage(*x)).collect();
+        let tma = observations(project.path(), "tma.csv", &stage);
+        s.run("swat.observed", &json!({"path": tma, "kind": "stage"})).unwrap();
+        let folder = run.path().display().to_string();
+        let m = s.run("swat.metrics", &json!({"observed": "tma", "run": folder, "match": "cha01"})).unwrap();
+        assert_eq!(m["rating"]["fitted"], json!(true));
+        assert!(m["metrics"]["nse"].as_f64().unwrap() > 0.9999, "{m}");
+        assert!((m["rating"]["b"].as_f64().unwrap() - 1.8).abs() < 0.05, "{m}");
+        assert_eq!(m["metrics"]["spearman_flow_stage"], json!(1.0));
+        // Twice the flow (cha02) fits stage as well through its own curve: stage doesn't see volume.
+        let m2 = s.run("swat.metrics", &json!({"observed": "tma", "run": folder, "match": "cha02"})).unwrap();
+        assert!(m2["metrics"]["nse"].as_f64().unwrap() > 0.9999, "{m2}");
+        assert!(m["notes"].to_string().contains("not their volume"));
+        // A curve given is used as it is.
+        let given = s
+            .run("swat.metrics", &json!({"observed": "tma", "run": folder, "match": "cha01", "rating": {"a": 12, "b": 1.8, "h0": 0.5}}))
+            .unwrap();
+        assert_eq!(given["rating"]["fitted"], json!(false));
+        assert!(given["metrics"]["nse"].as_f64().unwrap() > 0.9999, "{given}");
+    }
+
+    #[test]
+    fn fit_statistics_made_ahead_land_and_stop_at_cancel() {
+        use crate::cmd::reads::{read_ahead, read_land};
+        let (project, run, q) = flows();
+        let mut s = session();
+        s.run("swat.open", &json!({"path": project.path().display().to_string()})).unwrap();
+        s.run("swat.observed", &json!({"path": observations(project.path(), "same.csv", &q)})).unwrap();
+        let p = json!({"observed": "same", "run": run.path().display().to_string(), "match": "cha01"});
+        let ahead = read_ahead(&mut s, "swat.metrics", &p).unwrap();
+        assert_eq!(ahead.name, "SWAT+ Fit Statistics");
+        let read = ahead.run(&rustgis_analysis::control::Control::stoppable()).unwrap();
+        assert_eq!(read_land(&mut s, read).unwrap()["pairs"], json!(60));
+        let ahead = read_ahead(&mut s, "swat.metrics", &p).unwrap();
+        assert!(ahead.run(&rustgis_analysis::control::Control::cancelled_at_look(5)).err().unwrap().contains("cancelled"));
     }
 }

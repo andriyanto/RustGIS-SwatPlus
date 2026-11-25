@@ -587,6 +587,8 @@ swat.engine
 swat.find query file?
 swat.get file column match? where?
 swat.installEngine
+swat.metrics observed run? table? column? match? unit? from? to? step? rating?
+swat.observed path? name? column? kind? dateColumn? dayFirst? missing?
 swat.open path confidential?
 swat.output.list run?
 swat.output.read run? table columns? match? unit? from? to? limit?
