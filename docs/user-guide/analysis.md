@@ -2423,8 +2423,12 @@ map project and isn't saved with it.
 | `swat.diff`, `swat.revert` | What changed since the project was opened; undoing all of it, a file's or a column's. |
 | `swat.save` | Writes the changed files over the folder it came from, or the whole project to another folder (`path`). Every other byte is as it was read. |
 
-| `swat.run` | Runs the project, as edited, with the [swatplus-rust](https://github.com/andriyanto/swatplus-rust) engine. Each run gets its own folder (`run-0001`, …) in RustGIS's data folder, or under `folder`: the edited files in `input` (an unchanged project is run from its own folder), the engine's tables in `output` (`format`: `parquet`, the default, `text` or `both`) and `run.json`, which records the project, the engine and its version, the mode, what was changed and a SHA-256 of the inputs. `fixSwat` corrects SWAT+'s known bugs (results then differ from SWAT+); `threads` sets the engine's threads. |
+| `swat.run` | Runs the project, as edited, with the [swatplus-rust](https://github.com/andriyanto/swatplus-rust) engine. Each run gets its own folder (`run-0001`, …) in RustGIS's data folder, or under `folder`: the project as edited in `input`, with every other file of its folder (SWAT+ opens some by names of its own, such as `puddle.ops`; an unchanged project is run from its own folder), the engine's tables in `output` (`format`: `parquet`, the default, `text` or `both`) and `run.json`, which records the project, the engine and its version, the mode, what was changed and a SHA-256 of the inputs. `fixSwat` corrects SWAT+'s known bugs (results then differ from SWAT+); `threads` sets the engine's threads. |
 | `swat.runs` | The runs made since the project was opened, as `run.json` records them. |
+| `swat.output.list` | A run's output tables: object, period (`day`, `mon`, `yr`, `aa`), formats and columns. `run` is a run's number in `swat.runs`, or a folder: a run's, or any folder of SWAT+ text tables (such as a TxtInOut folder SWAT+ ran in); by default the last run, else the project's folder. |
+| `swat.output.read` | A table's rows picked by object name (`match`, with `*` and `?`), `unit` and date (`from`, `to`: `yyyy`, `yyyy-mm` or `yyyy-mm-dd`): each column's count, mean, minimum, maximum and sum, and the first rows (`limit`, 50 by default). |
+| `swat.balance` | The basin's average annual water balance in mm (`basin_wb_aa`, and the aquifers' `basin_aqu_aa` when `print.prt` prints it), with evapotranspiration, water yield, surface runoff, percolation and deep seepage as fractions of precipitation, streamflow (water yield and the aquifers' return flow) as one, and the baseflow fraction. |
+| `swat.compare` | Two runs' table side by side (`runs`: `[a, b]`): each column's statistics in both and the change in its mean, overall and by object. |
 | `swat.engine`, `swat.setEngine`, `swat.installEngine` | Which engine program is used and its version; using another one (`path`, or none to look again); downloading the pinned release for this platform from GitHub, checked against its published SHA-256. |
 
 The engine is LGPL-2.1 (as SWAT+ is) and RustGIS Apache-2.0, so RustGIS doesn't link it: it runs
@@ -2437,7 +2441,12 @@ it with the days the engine has simulated and Cancel, which stops the engine. A 
 folder and its `run.json`, which says so (`stopped`), and isn't added to `swat.runs`; a failed one
 is, with the engine's `error`. The command line, scripts and the AI Assistant wait for the run; agents connected over
 MCP get its answer when it lands, with the app free meanwhile. The web app doesn't run models yet.
-Reading the output tables is next.
+
+The tables are read a row at a time, from the Parquet file when a run wrote one (its 32-bit values
+given to seven significant figures, as the text has them) and from the text otherwise, so a large
+basin's daily tables are never held whole. In the desktop app `swat.output.read` and `swat.compare`
+go on a thread of their own, with their progress and Cancel, as a run does. A confidential
+project's answers give statistics only: no rows, and no object names.
 
 ## Rain grids
 

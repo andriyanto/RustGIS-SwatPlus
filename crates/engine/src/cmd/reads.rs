@@ -3,7 +3,7 @@
 //! delimited text or spreadsheet read whole, a ZIP or CityJSON/CityGML model's layers, the opening
 //! of a large Shapefile or GeoJSON file read in place, #2446), Repair/Reload Data, Load All
 //! Features, Convert To Annotation's read of a layer read in place, native models or scripts, the
-//! Error Inspector's topology check (#1291), Source File State's hashing of a layer's file, Column Statistics' count of a column, Import QGIS Style's file and images, and a SWAT+ project's run (RustGIS-SwatPlus). [`read_ahead`]
+//! Error Inspector's topology check (#1291), Source File State's hashing of a layer's file, Column Statistics' count of a column, Import QGIS Style's file and images, and a SWAT+ project's run and the reads of its tables (RustGIS-SwatPlus). [`read_ahead`]
 //! takes what the read needs of the session, [`ReadAhead::run`] reads on the thread, and [`read_land`]
 //! runs the admitted command under its initiating owner: the command takes
 //! it instead of reading again, so what it adds, says, logs and puts in Undo is the same as when
@@ -238,6 +238,8 @@ pub(crate) const IN_BACKGROUND: &[(&str, &str)] = &[
     ("offline.keepRows", "Keep Field Package Rows"),
     ("style.importQgis", "Import QGIS Style"),
     ("swat.run", "Run SWAT+ Project"),
+    ("swat.output.read", "Read SWAT+ Output Table"),
+    ("swat.compare", "Compare SWAT+ Runs"),
 ];
 
 /// What `command`'s read is called, when it is one the app makes before the command lands
@@ -336,6 +338,18 @@ pub(crate) fn prepare(s: &mut Session, op: Authorized<CommandOp>, owner: Continu
             // The engine as a program of its own (RustGIS-SwatPlus): runs as long as the model.
             #[cfg(not(target_arch = "wasm32"))]
             let work = super::swat::run_ahead(s, params)?;
+            #[cfg(target_arch = "wasm32")]
+            let work = None;
+            (work, None)
+        }
+        // A run's table, gone through a row at a time (a large basin's daily tables are long).
+        "swat.output.read" | "swat.compare" => {
+            #[cfg(not(target_arch = "wasm32"))]
+            let work = if spec.id == "swat.compare" {
+                super::swat_output::compare_ahead(s, params)?
+            } else {
+                super::swat_output::read_ahead(s, params)?
+            };
             #[cfg(target_arch = "wasm32")]
             let work = None;
             (work, None)

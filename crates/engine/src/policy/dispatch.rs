@@ -123,7 +123,7 @@ impl Session {
         }
         let CallKind::Command { id, params } = &call.kind else {
             return Err(
-                "only standalone archive, column-statistics, similarity, topology, shape-conversion, image-grid, size-by-field or SWAT+ run commands can prepare a scoped read".into()
+                "only standalone archive, column-statistics, similarity, topology, shape-conversion, image-grid, size-by-field or SWAT+ run and output commands can prepare a scoped read".into()
             );
         };
         if !matches!(
@@ -137,9 +137,11 @@ impl Session {
                 | "raster.imageGrid"
                 | "layer.sizeBy"
                 | "swat.run"
+                | "swat.output.read"
+                | "swat.compare"
         ) {
             return Err(
-                "only standalone archive, column-statistics, similarity, topology, shape-conversion, image-grid, size-by-field or SWAT+ run commands can prepare a scoped read".into()
+                "only standalone archive, column-statistics, similarity, topology, shape-conversion, image-grid, size-by-field or SWAT+ run and output commands can prepare a scoped read".into()
             );
         }
         let capture = |s: &mut Session| s.capture_read(id, params);
