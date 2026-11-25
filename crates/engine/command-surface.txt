@@ -577,8 +577,10 @@ style.importQgis layer? path? text? data?
 style.new layer? name?
 style.remove name
 style.save path
+swat.balance run?
 swat.check
 swat.close
+swat.compare runs table columns? match? unit? from? to?
 swat.confidential on
 swat.diff file?
 swat.engine
@@ -586,6 +588,8 @@ swat.find query file?
 swat.get file column match? where?
 swat.installEngine
 swat.open path confidential?
+swat.output.list run?
+swat.output.read run? table columns? match? unit? from? to? limit?
 swat.revert file? column?
 swat.run fixSwat? threads? format? folder?
 swat.runs

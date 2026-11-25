@@ -3312,6 +3312,11 @@ impl RustGisApp {
                 let params = if params.is_null() { json!({}) } else { params };
                 return readjob::run(self, "swat.run", params);
             }
+            // A run's table is gone through a row at a time: a large basin's daily ones are long.
+            if let Some(command) = ["swat.output.read", "swat.compare"].into_iter().find(|c| *c == id) {
+                let params = if params.is_null() { json!({}) } else { params };
+                return readjob::run(self, command, params);
+            }
             // Publishing hashes, reads and writes the whole file: on a thread of its own, with
             // progress and Cancel, as an export is.
             if id == "source.publish" {

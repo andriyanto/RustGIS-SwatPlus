@@ -35,7 +35,7 @@ const MAX_FILES: usize = 20_000;
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_BYTES: u64 = 4 << 30;
 /// The most records a reply lists (the statistics cover them all).
-const MAX_LISTED: usize = 500;
+pub(super) const MAX_LISTED: usize = 500;
 
 /// The open SWAT+ project.
 #[derive(Clone, Debug)]
@@ -113,11 +113,11 @@ pub fn commands() -> Vec<C> {
     ]
 }
 
-fn need_swat(s: &Session) -> Option<&'static str> {
+pub(super) fn need_swat(s: &Session) -> Option<&'static str> {
     if s.swat.is_none() { Some("open a SWAT+ project first (swat.open)") } else { None }
 }
 
-fn state(s: &Session) -> Result<&SwatState, String> {
+pub(super) fn state(s: &Session) -> Result<&SwatState, String> {
     s.swat.as_deref().ok_or_else(|| "no SWAT+ project is open (swat.open)".to_string())
 }
 
@@ -228,7 +228,7 @@ impl Table<'_> {
 }
 
 /// `*` and `?` wildcards, without case.
-fn glob(pattern: &str, text: &str) -> bool {
+pub(super) fn glob(pattern: &str, text: &str) -> bool {
     fn go(p: &[char], t: &[char]) -> bool {
         match (p.first(), t.first()) {
             (None, None) => true,
@@ -787,12 +787,24 @@ impl Prepared {
         let (exe, version) = rustgis_swat_run::runner::find()
             .ok_or("swatplus-rust isn't found: install it (swat.installEngine), point to it (swat.setEngine), or put it on the PATH")?;
         let (n, folder) = next_run(&self.root)?;
+        // What the engine reads: the project's files and every other file of its folder, as
+        // SWAT+ opens some by names of its own (puddle.ops, transplant.plt, treatment.trt), but
+        // not tables an earlier run wrote there.
+        let mut names: BTreeSet<String> = self.names.iter().cloned().collect();
+        if let Some(d) = &self.dir {
+            for entry in std::fs::read_dir(d).map_err(|e| format!("{}: {e}", d.display()))?.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if entry.file_type().is_ok_and(|t| t.is_file()) && !written_by_a_run(&name) {
+                    names.insert(name);
+                }
+            }
+        }
         // The project's own folder when nothing changed (the engine only reads it); otherwise the
         // project as edited, written beside the run's tables. Both are fingerprinted as read.
         let mut fingerprint = rustgis_swat_run::run::Fingerprint::default();
         let input = match (&self.dir, self.changed.is_empty()) {
             (Some(d), true) => {
-                for name in &self.names {
+                for name in &names {
                     let path = d.join(name);
                     let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
                     fingerprint.add(name, &bytes);
@@ -804,7 +816,7 @@ impl Prepared {
             }
             _ => {
                 let input = folder.join("input");
-                for name in &self.names {
+                for name in &names {
                     // Names stay inside the folder, as they did when read.
                     if name.contains("..") || std::path::Path::new(name).is_absolute() {
                         continue;
@@ -885,6 +897,16 @@ impl Prepared {
             .map_err(|e| format!("{}: {e}", manifest.display()))?;
         Ok(record)
     }
+}
+
+/// Whether a file of a TxtInOut folder is one a run wrote there (an output table, a `.out` file,
+/// a table as CSV), not one it reads.
+#[cfg(not(target_arch = "wasm32"))]
+fn written_by_a_run(name: &str) -> bool {
+    use rustgis_swat_run::output::table_of;
+    table_of(name).is_some()
+        || name.ends_with(".out")
+        || name.strip_suffix(".csv").is_some_and(|stem| table_of(&format!("{stem}.txt")).is_some())
 }
 
 /// `swat.run`'s work, for the desktop app to do on a thread of its own before the command lands
@@ -1105,7 +1127,10 @@ echo '{"event":"done","days":731,"seconds":0.1}'
         let args = std::fs::read_to_string(runs_dir.path().join("run-0001/output/args.txt")).unwrap();
         assert!(args.trim().ends_with("--progress json --format parquet"), "{args}");
 
-        // Changed: the project as edited is written for the run, and only there.
+        // Changed: the project as edited is written for the run, and only there, with the files
+        // SWAT+ opens by names of its own; not an earlier run's tables.
+        std::fs::write(d.path().join("puddle.ops"), "puddle.ops: test\n").unwrap();
+        std::fs::write(d.path().join("channel_sd_day.txt"), "an earlier run's table\n").unwrap();
         let before = std::fs::read_to_string(d.path().join("hydrology.hyd")).unwrap();
         s.run("swat.set", &json!({"file": "hydrology.hyd", "column": "esco", "value": 0.5})).unwrap();
         let r2 = s.run("swat.run", &json!({"folder": folder, "fixSwat": true, "threads": 2})).unwrap();
@@ -1117,6 +1142,8 @@ echo '{"event":"done","days":731,"seconds":0.1}'
         assert_eq!(std::fs::read_to_string(d.path().join("hydrology.hyd")).unwrap(), before, "the project's file is untouched");
         let args = std::fs::read_to_string(runs_dir.path().join("run-0002/output/args.txt")).unwrap();
         assert!(args.trim().ends_with("--fix-swat --threads 2"), "{args}");
+        assert!(runs_dir.path().join("run-0002/input/puddle.ops").is_file(), "a file file.cio doesn't name is run too");
+        assert!(!runs_dir.path().join("run-0002/input/channel_sd_day.txt").exists(), "an earlier run's table isn't");
         let manifest: Value = serde_json::from_slice(&std::fs::read(runs_dir.path().join("run-0002/run.json")).unwrap()).unwrap();
         assert_eq!(manifest, r2);
 

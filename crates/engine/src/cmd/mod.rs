@@ -63,6 +63,7 @@ pub mod stac;
 pub mod stac_area;
 pub mod stac_bands;
 pub mod swat;
+pub mod swat_output;
 pub mod table_stats;
 pub(crate) mod terrain_blocks;
 pub mod tile_export;
@@ -143,6 +144,7 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(nldi::commands());
     v.extend(time::commands());
     v.extend(swat::commands());
+    v.extend(swat_output::commands());
     v.extend(rain::commands());
     v
 }

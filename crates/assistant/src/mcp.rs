@@ -171,6 +171,8 @@ impl ArchiveBatch {
                                 | "raster.imageGrid"
                                 | "layer.sizeBy"
                                 | "swat.run"
+                                | "swat.output.read"
+                                | "swat.compare"
                         )
                     )
                 {

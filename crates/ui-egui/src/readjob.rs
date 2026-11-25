@@ -422,6 +422,8 @@ fn called<'a>(command: &str, what: &'a str) -> &'a str {
         (true, "map.repairTiles") => tl_raw!("Repair Tile Archive"),
         (true, "offline.keepRows") => tl_raw!("Keep Field Package Rows"),
         (true, "swat.run") => tl_raw!("Run SWAT+ Project"),
+        (true, "swat.output.read") => tl_raw!("Read SWAT+ Output Table"),
+        (true, "swat.compare") => tl_raw!("Compare SWAT+ Runs"),
         (true, _) => tl_raw!("A background read"),
     }
 }
@@ -553,6 +555,8 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
                 | "topology.validate"
                 // A model run here would hold the window as long as the model runs.
                 | "swat.run"
+                | "swat.output.read"
+                | "swat.compare"
         ) || rustgis_engine::cmd::edit::table_edit_in_background(asked.command).is_some()
         {
             let why = crate::i18n::fmt("The background worker could not start ({error}). Retry the command.", &[("error", &e.to_string())]);
