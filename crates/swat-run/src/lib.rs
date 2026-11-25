@@ -10,6 +10,7 @@
 pub mod event;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod install;
+pub mod metrics;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod output;
 #[cfg(not(target_arch = "wasm32"))]

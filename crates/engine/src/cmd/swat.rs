@@ -49,6 +49,8 @@ pub struct SwatState {
     pub confidential: bool,
     /// The runs made since it was opened (`swat.runs`), each as `swat.run` answered.
     pub runs: Vec<Value>,
+    /// Observed series loaded for it (`swat.observed`), by name.
+    pub observed: BTreeMap<String, super::swat_output::Observed>,
 }
 
 pub fn commands() -> Vec<C> {
@@ -121,7 +123,7 @@ pub(super) fn state(s: &Session) -> Result<&SwatState, String> {
     s.swat.as_deref().ok_or_else(|| "no SWAT+ project is open (swat.open)".to_string())
 }
 
-fn state_mut(s: &mut Session) -> Result<&mut SwatState, String> {
+pub(super) fn state_mut(s: &mut Session) -> Result<&mut SwatState, String> {
     s.swat.as_deref_mut().ok_or_else(|| "no SWAT+ project is open (swat.open)".to_string())
 }
 
@@ -138,6 +140,7 @@ fn open(s: &mut Session, p: &Value) -> CmdResult {
         project,
         confidential: b(p, "confidential").unwrap_or(false),
         runs: Vec::new(),
+        observed: BTreeMap::new(),
     };
     s.swat = Some(Box::new(st));
     summary(s, &json!({}))

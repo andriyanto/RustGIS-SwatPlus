@@ -424,6 +424,7 @@ fn called<'a>(command: &str, what: &'a str) -> &'a str {
         (true, "swat.run") => tl_raw!("Run SWAT+ Project"),
         (true, "swat.output.read") => tl_raw!("Read SWAT+ Output Table"),
         (true, "swat.compare") => tl_raw!("Compare SWAT+ Runs"),
+        (true, "swat.metrics") => tl_raw!("SWAT+ Fit Statistics"),
         (true, _) => tl_raw!("A background read"),
     }
 }
@@ -557,6 +558,7 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
                 | "swat.run"
                 | "swat.output.read"
                 | "swat.compare"
+                | "swat.metrics"
         ) || rustgis_engine::cmd::edit::table_edit_in_background(asked.command).is_some()
         {
             let why = crate::i18n::fmt("The background worker could not start ({error}). Retry the command.", &[("error", &e.to_string())]);

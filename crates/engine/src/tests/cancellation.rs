@@ -399,7 +399,7 @@ pub(super) fn long_commands(boundaries: bool) {
     read(&s, "map.repairTiles", &json!({"index": 0, "path": out("moved.pmtiles")}));
 
     // Reads made ahead that aren't run here, and why.
-    let exempt: [(&str, &str); 3] = [
+    let exempt: [(&str, &str); 4] = [
         (
             "swat.run",
             "it runs the swatplus-rust program, which the fixtures don't have; cmd::swat's tests run it with a stand-in and cancel it while it runs",
@@ -409,6 +409,10 @@ pub(super) fn long_commands(boundaries: bool) {
             "it reads a SWAT+ run's tables, which the fixtures don't have; cmd::swat_output's tests cancel it while it reads",
         ),
         ("swat.compare", "it reads two SWAT+ runs' tables, which the fixtures don't have; it reads as swat.output.read does"),
+        (
+            "swat.metrics",
+            "it reads a SWAT+ run's daily table, which the fixtures don't have; cmd::swat_output's tests cancel it while it reads",
+        ),
     ];
     let covered = covered.into_inner();
     for (command, why) in exempt {

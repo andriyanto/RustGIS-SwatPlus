@@ -2429,6 +2429,8 @@ map project and isn't saved with it.
 | `swat.output.read` | A table's rows picked by object name (`match`, with `*` and `?`), `unit` and date (`from`, `to`: `yyyy`, `yyyy-mm` or `yyyy-mm-dd`): each column's count, mean, minimum, maximum and sum, and the first rows (`limit`, 50 by default). |
 | `swat.balance` | The basin's average annual water balance in mm (`basin_wb_aa`, and the aquifers' `basin_aqu_aa` when `print.prt` prints it), with evapotranspiration, water yield, surface runoff, percolation and deep seepage as fractions of precipitation, streamflow (water yield and the aquifers' return flow) as one, and the baseflow fraction. |
 | `swat.compare` | Two runs' table side by side (`runs`: `[a, b]`): each column's statistics in both and the change in its mean, overall and by object. |
+| `swat.observed` | Loads an observed series from a CSV of dates and values, for `swat.metrics`: flow (m³/s, the default) or stage (`"kind": "stage"`, m). The delimiter is the header's (`,`, `;` with a decimal comma, or a tab); dates are `yyyy-mm-dd` or `dd/mm/yyyy` (`"dayFirst": false` for `mm/dd/yyyy`), any time of day after them; the readings of one day are averaged. Rows without a date or a number, and readings marked missing (`missing`, such as -9999), are left out and said. With no `path` it lists the series loaded. |
+| `swat.metrics` | How well one object's daily series in a run (`table`, `channel_sd_day` by default; `column`, `flo_out`; the object by `match` or `unit`) fits an observed series, on the days both have (`step`: `day`, or `month` for monthly means): NSE, KGE with its r, alpha and beta, PBIAS (positive when the run is too large), RSR and Spearman's rank correlation; for monthly flow, whether Moriasi et al. (2007) call it satisfactory. Against stage, the run's flow goes through a rating curve `Q = a (H − h0)^b`, given (`rating`) or fitted to the run, and Spearman's correlation of flow with stage, which needs no curve, comes too. |
 | `swat.engine`, `swat.setEngine`, `swat.installEngine` | Which engine program is used and its version; using another one (`path`, or none to look again); downloading the pinned release for this platform from GitHub, checked against its published SHA-256. |
 
 The engine is LGPL-2.1 (as SWAT+ is) and RustGIS Apache-2.0, so RustGIS doesn't link it: it runs
@@ -2444,9 +2446,13 @@ MCP get its answer when it lands, with the app free meanwhile. The web app doesn
 
 The tables are read a row at a time, from the Parquet file when a run wrote one (its 32-bit values
 given to seven significant figures, as the text has them) and from the text otherwise, so a large
-basin's daily tables are never held whole. In the desktop app `swat.output.read` and `swat.compare`
-go on a thread of their own, with their progress and Cancel, as a run does. A confidential
+basin's daily tables are never held whole. In the desktop app `swat.output.read`, `swat.compare` and
+`swat.metrics` go on a thread of their own, with their progress and Cancel, as a run does. A confidential
 project's answers give statistics only: no rows, and no object names.
+
+A rating curve fitted to each run judges the timing and shape of its flows, not their volume: a run
+that loses water to the deep aquifer still fits a stage record, through a smaller `a`. Measured
+discharges, or the water balance (`swat.balance`), are what see the volume.
 
 ## Rain grids
 
