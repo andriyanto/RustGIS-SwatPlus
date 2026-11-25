@@ -8,6 +8,7 @@
 //! the desktop app on a thread of its own (`reads::IN_BACKGROUND`), with its progress and Cancel.
 //! A confidential project's answers carry statistics only: no rows and no object names.
 
+#[cfg(not(target_arch = "wasm32"))]
 use super::swat::MAX_LISTED;
 use crate::CommandSpec as C;
 
