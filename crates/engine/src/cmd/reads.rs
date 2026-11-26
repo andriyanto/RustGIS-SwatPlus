@@ -241,6 +241,8 @@ pub(crate) const IN_BACKGROUND: &[(&str, &str)] = &[
     ("swat.output.read", "Read SWAT+ Output Table"),
     ("swat.compare", "Compare SWAT+ Runs"),
     ("swat.metrics", "SWAT+ Fit Statistics"),
+    ("swat.chart", "SWAT+ Hydrograph"),
+    ("swat.map", "SWAT+ Map"),
 ];
 
 /// What `command`'s read is called, when it is one the app makes before the command lands
@@ -344,11 +346,13 @@ pub(crate) fn prepare(s: &mut Session, op: Authorized<CommandOp>, owner: Continu
             (work, None)
         }
         // A run's table, gone through a row at a time (a large basin's daily tables are long).
-        "swat.output.read" | "swat.compare" | "swat.metrics" => {
+        "swat.output.read" | "swat.compare" | "swat.metrics" | "swat.chart" | "swat.map" => {
             #[cfg(not(target_arch = "wasm32"))]
             let work = match spec.id {
                 "swat.compare" => super::swat_output::compare_ahead(s, params)?,
                 "swat.metrics" => super::swat_output::metrics_ahead(s, params)?,
+                "swat.chart" => super::swat_output::chart_ahead(s, params)?,
+                "swat.map" => super::swat_output::map_ahead(s, params)?,
                 _ => super::swat_output::read_ahead(s, params)?,
             };
             #[cfg(target_arch = "wasm32")]

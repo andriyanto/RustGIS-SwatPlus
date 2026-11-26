@@ -2,7 +2,9 @@
 //! (`swat.output.list`), a table's statistics and rows picked by object and date
 //! (`swat.output.read`), the basin's water balance (`swat.balance`), and two runs side by side
 //! (`swat.compare`); observed series loaded for the project (`swat.observed`) and how well a run
-//! fits them (`swat.metrics`: NSE, KGE, PBIAS, RSR, Spearman; stage through a rating curve).
+//! fits them (`swat.metrics`: NSE, KGE, PBIAS, RSR, Spearman; stage through a rating curve); a
+//! hydrograph of a run against them (`swat.chart`, SVG and CSV), and a run's figures joined to a
+//! map layer (`swat.map`).
 //!
 //! The tables are the engine's (text or Parquet, `rustgis_swat_run::output`) in a run's folder,
 //! or SWAT+'s own text tables in a TxtInOut folder. A table is gone through a row at a time; in
@@ -51,6 +53,12 @@ pub fn commands() -> Vec<C> {
         C::new("swat.observed", "Load SWAT+ Observations", WHERE, observed).roles(&[]).effects(files).view().when(need_swat).params(
             r#"{"path"?: "a CSV of dates and values (none: list those loaded)", "name"?: text (default: the file's name), "column"?: "the values' column (default: the first after the date)", "kind"?: "flow" (m³/s, default) | "stage" (m), "dateColumn"?: "default: date, tanggal, time, waktu or the first column", "dayFirst"?: bool (dd/mm/yyyy, the default; false for mm/dd/yyyy), "missing"?: number (a value that means none, such as -9999)} — loads an observed series for swat.metrics; readings of one day are averaged"#,
         ),
+        C::new("swat.map", "Map SWAT+ Results", WHERE, map).roles(&[]).effects(files).when(need_swat).params(
+            r#"{"layer"?: "the subbasins', landscape units' or channels' layer (default the active one)", "field": "its field that names the objects (e.g. Channel, Subbasin, LSUID)", "table": "e.g. channel_sd_aa or lsunit_wb_aa", "column": "e.g. flo_out", "key"?: "gis_id" (default) | "unit" | "name" (the table's column the field matches), "stat"?: "mean" (default) | "sum" | "min" | "max" (over the rows picked), "run"?: number | "folder" (as swat.output.list), "from"?: "yyyy[-mm[-dd]]", "to"?: "yyyy[-mm[-dd]]", "name"?: "the new layer's name", "classes"?: 1..12} — a copy of the layer with each feature's figure in a new field, in graduated colours"#,
+        ),
+        C::new("swat.chart", "SWAT+ Hydrograph", WHERE, chart).roles(&[]).effects(files).view().when(need_swat).params(
+            r#"{"run"?: number | "folder" (as swat.output.list), "table"?: "a daily table (default channel_sd_day)", "column"?: "default flo_out", "match"?: "the object's name", "unit"?: number, "from"?: "yyyy[-mm[-dd]]", "to"?: "yyyy[-mm[-dd]]", "observed"?: "a name from swat.observed", "step"?: "day" (default) | "month", "rating"?: "fit" | {"a", "b", "h0"} (stage), "path"?: "an .svg file (default: the run's charts folder)"} — a hydrograph of one object's series, with the observed and the fit statistics when given, as SVG, and its series as CSV beside it"#,
+        ),
         C::new("swat.metrics", "SWAT+ Fit Statistics", WHERE, metrics).roles(&[]).effects(files).view().when(need_swat).params(
             r#"{"observed": "a name from swat.observed", "run"?: number | "folder" (as swat.output.list), "table"?: "a daily table (default channel_sd_day)", "column"?: "default flo_out", "match"?: "the object's name", "unit"?: number, "from"?: "yyyy[-mm[-dd]]", "to"?: "yyyy[-mm[-dd]]", "step"?: "day" (default) | "month", "rating"?: "fit" (stage's default) | {"a": number, "b": number, "h0": number}} — NSE, KGE (r, alpha, beta), PBIAS, RSR and Spearman of one object's simulated series against the observed, on the days both have; stage through a rating curve fitted to the run or given"#,
         ),
@@ -58,7 +66,7 @@ pub fn commands() -> Vec<C> {
 }
 
 #[cfg(target_arch = "wasm32")]
-use web::{balance, compare, list, metrics, observed, read};
+use web::{balance, chart, compare, list, map, metrics, observed, read};
 
 /// The browser has no run folders yet: the engine's WebAssembly module will give it tables.
 #[cfg(target_arch = "wasm32")]
@@ -91,12 +99,20 @@ mod web {
     pub(super) fn metrics(_: &mut Session, _: &Value) -> CmdResult {
         Err(WHY.into())
     }
+
+    pub(super) fn chart(_: &mut Session, _: &Value) -> CmdResult {
+        Err(WHY.into())
+    }
+
+    pub(super) fn map(_: &mut Session, _: &Value) -> CmdResult {
+        Err(WHY.into())
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-use native::{balance, compare, list, metrics, observed, read};
+use native::{balance, chart, compare, list, map, metrics, observed, read};
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use native::{compare_ahead, metrics_ahead, read_ahead};
+pub(crate) use native::{chart_ahead, compare_ahead, map_ahead, metrics_ahead, read_ahead};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
@@ -338,11 +354,20 @@ mod native {
     }
 
     /// Goes through `file`'s rows and sums up those `q` picks; keeps the first `q.limit` rows
-    /// when `records`, and figures by object when `by_object`.
-    fn pick(file: &Path, q: &Query, records: bool, by_object: bool, watch: &Watch) -> Result<Picked, String> {
+    /// when `records`, and figures by object when `by` names the column objects are told by
+    /// (`name`, else the unit number when a table has no names; `gis_id`, `unit`), for at most
+    /// its count of objects.
+    fn pick(file: &Path, q: &Query, records: bool, by: Option<(&str, usize)>, watch: &Watch) -> Result<Picked, String> {
         let h = output::header(file)?;
         let at = |name: &str| h.columns.iter().position(|c| c == name);
         let (yr, mon, day, unit, name) = (at("yr"), at("mon"), at("day"), at("unit"), at("name"));
+        let by = match by {
+            Some((key, cap)) => {
+                let i = at(key).or(if key == "name" { unit } else { None });
+                Some((i.ok_or_else(|| format!("{} has no column {key} to tell its objects by", file.display()))?, cap))
+            }
+            None => None,
+        };
         let chosen: Vec<usize> = match &q.columns {
             Some(cols) => {
                 let unknown: Vec<&String> = cols.iter().filter(|c| at(c).is_none()).collect();
@@ -389,8 +414,12 @@ mod native {
                     acc.add(x);
                 }
             }
-            if by_object {
-                let key = object.map(str::to_string).or_else(|| whole(row, unit).map(|u| u.to_string())).unwrap_or_default();
+            if let Some((k, cap)) = by {
+                let key = match row.get(k) {
+                    Some(Cell::Text(t)) => t.clone(),
+                    Some(Cell::Int(i)) => i.to_string(),
+                    _ => String::new(),
+                };
                 let n = out.objects.len();
                 match out.objects.get_mut(&key) {
                     Some(accs) => {
@@ -400,7 +429,7 @@ mod native {
                             }
                         }
                     }
-                    None if n < MAX_LISTED => {
+                    None if n < cap => {
                         let mut accs = vec![Acc::default(); chosen.len()];
                         for (acc, &i) in accs.iter_mut().zip(&chosen) {
                             if let Some(x) = row.get(i).and_then(Cell::number) {
@@ -448,7 +477,7 @@ mod native {
         fn go(self) -> Result<Value, String> {
             let file = self.table.file().ok_or("the table has no file")?.to_path_buf();
             let watch = Watch::new();
-            let picked = pick(&file, &self.query, !self.confidential, false, &watch)?;
+            let picked = pick(&file, &self.query, !self.confidential, None, &watch)?;
             if picked.scanned.stopped {
                 return Err("Read SWAT+ Output Table was cancelled".into());
             }
@@ -620,7 +649,7 @@ mod native {
             let mut picked = Vec::new();
             for (_, t) in [&self.a, &self.b] {
                 let file = t.file().ok_or("the table has no file")?;
-                let pk = pick(file, &self.query, false, !self.confidential, &watch)?;
+                let pk = pick(file, &self.query, false, (!self.confidential).then_some(("name", MAX_LISTED)), &watch)?;
                 if pk.scanned.stopped {
                     return Err("Compare SWAT+ Runs was cancelled".into());
                 }
@@ -872,33 +901,108 @@ mod native {
         Ok(out)
     }
 
-    /// A comparison of a run's daily series with an observed one, prepared on the window's thread.
-    pub(crate) struct MetricsJob {
-        name: String,
-        observed: Observed,
+    /// One object's daily series of a run's table, as `swat.metrics` and `swat.chart` ask for it.
+    pub(crate) struct SeriesAsked {
         label: Value,
         table: TableFile,
         column: String,
         query: Query,
-        monthly: bool,
-        rating: Option<rustgis_swat_run::metrics::Rating>,
         confidential: bool,
     }
 
-    fn prepare_metrics(s: &Session, p: &Value) -> Result<MetricsJob, String> {
-        let name = ps(p, "observed").map(str::trim).ok_or("give observed: a series loaded with swat.observed")?;
-        let st = state(s)?;
-        let observed = st.observed.get(name).cloned().ok_or_else(|| format!("no observed series {name} (swat.observed lists them)"))?;
+    /// The series a [`SeriesAsked`] found: its values by day, and the object they are of.
+    struct Series {
+        values: BTreeMap<(i64, i64, i64), f64>,
+        object: Option<String>,
+        unit: Option<i64>,
+        uneven: u64,
+    }
+
+    fn series_asked(s: &Session, p: &Value) -> Result<SeriesAsked, String> {
         let (dir, label) = source(s, p.get("run"))?;
         let table = table_in(&dir, ps(p, "table").unwrap_or("channel_sd_day"))?;
         if table.period != "day" {
-            return Err(format!("{} is a {} table: compare a daily one (step month gives monthly figures)", table.table, table.period));
+            return Err(format!("{} is a {} table: give a daily one (step month gives monthly figures)", table.table, table.period));
         }
-        let monthly = match ps(p, "step") {
-            None | Some("day") => false,
-            Some("month") => true,
-            Some(other) => return Err(format!("step is day or month, not {other}")),
+        Ok(SeriesAsked {
+            label,
+            table,
+            column: ps(p, "column").unwrap_or("flo_out").to_string(),
+            query: query(p)?,
+            confidential: confidential(s),
+        })
+    }
+
+    /// Reads the asked object's daily values, a row at a time; refuses rows of several objects.
+    fn read_series(a: &SeriesAsked, what: &str) -> Result<Series, String> {
+        let file = a.table.file().ok_or("the table has no file")?.to_path_buf();
+        let h = output::header(&file)?;
+        let at = |n: &str| h.columns.iter().position(|c| c == n);
+        let value = at(&a.column).ok_or_else(|| format!("{} has no column {}", a.table.table, a.column))?;
+        let (Some(yr), Some(mon), Some(day)) = (at("yr"), at("mon"), at("day")) else {
+            return Err(format!("{} has no yr, mon and day columns", a.table.table));
         };
+        let (unit, objname) = (at("unit"), at("name"));
+        let watch = Watch::new();
+        let whole = |row: &[Cell], i: usize| row.get(i).and_then(Cell::whole);
+        let mut values: BTreeMap<(i64, i64, i64), f64> = BTreeMap::new();
+        let mut objects: std::collections::BTreeSet<(Option<String>, Option<i64>)> = std::collections::BTreeSet::new();
+        let mut on_row = |row: &[Cell]| {
+            if watch.stop() {
+                return false;
+            }
+            let object = objname.and_then(|i| row.get(i)).and_then(Cell::text);
+            if let Some(pat) = &a.query.matching
+                && !object.is_some_and(|o| glob(pat, o))
+            {
+                return true;
+            }
+            let u = unit.and_then(|i| whole(row, i));
+            if let Some(units) = &a.query.units
+                && !u.is_some_and(|u| units.contains(&u))
+            {
+                return true;
+            }
+            let (Some(y), Some(mo), Some(d)) = (whole(row, yr), whole(row, mon), whole(row, day)) else { return true };
+            let when = (y, mo, d);
+            if a.query.from.is_some_and(|f| when < f) || a.query.to.is_some_and(|t| when > t) {
+                return true;
+            }
+            if objects.len() < 3 {
+                objects.insert((object.map(str::to_string), u));
+            }
+            if let Some(x) = row.get(value).and_then(Cell::number) {
+                values.insert(when, x);
+            }
+            true
+        };
+        let mut progress = |done: u64, total: u64| watch.progress(done, total);
+        let scanned = output::scan(&file, &mut on_row, &mut progress)?;
+        if scanned.stopped {
+            return Err(format!("{what} was cancelled"));
+        }
+        if objects.len() > 1 {
+            let names: Vec<String> =
+                objects.iter().take(2).map(|(n, u)| n.clone().or_else(|| u.map(|u| u.to_string())).unwrap_or_default()).collect();
+            return Err(format!(
+                "the rows picked are of several objects ({}…): give match or unit for one",
+                if a.confidential { "names hidden".to_string() } else { names.join(", ") }
+            ));
+        }
+        let (object, unit) = objects.into_iter().next().unwrap_or_default();
+        Ok(Series { values, object, unit, uneven: scanned.uneven })
+    }
+
+    fn monthly_step(p: &Value) -> Result<bool, String> {
+        match ps(p, "step") {
+            None | Some("day") => Ok(false),
+            Some("month") => Ok(true),
+            Some(other) => Err(format!("step is day or month, not {other}")),
+        }
+    }
+
+    /// The rating curve given, `None` to fit one (or for a flow series).
+    fn rating_given(p: &Value, observed: Option<(&str, &Observed)>) -> Result<Option<rustgis_swat_run::metrics::Rating>, String> {
         let rating = match p.get("rating") {
             None | Some(Value::Null) => None,
             Some(Value::String(f)) if f == "fit" => None,
@@ -913,159 +1017,150 @@ mod native {
             }
             Some(other) => return Err(format!("rating is \"fit\" or {{a, b, h0}}, not {other}")),
         };
-        if rating.is_some() && observed.kind != "stage" {
+        if let (Some(_), Some((name, o))) = (rating, observed)
+            && o.kind != "stage"
+        {
             return Err(format!("{name} is a flow series: a rating curve is for stage"));
         }
-        Ok(MetricsJob {
-            name: name.to_string(),
-            observed,
-            label,
-            table,
-            column: ps(p, "column").unwrap_or("flo_out").to_string(),
-            query: query(p)?,
-            monthly,
-            rating,
-            confidential: st.confidential,
+        Ok(rating)
+    }
+
+    /// The figures of a run's series against an observed one.
+    struct Judged {
+        metrics: Value,
+        rating: Value,
+        /// The curve the run's flows go through to be stage, for stage.
+        curve: Option<rustgis_swat_run::metrics::Rating>,
+        notes: Vec<String>,
+        pairs: usize,
+        months: Option<usize>,
+        first: Option<(i64, i64, i64)>,
+        last: Option<(i64, i64, i64)>,
+    }
+
+    /// NSE, KGE, PBIAS, RSR and Spearman of `sim` against `observed` on the days both have (by
+    /// month, the means of those days in each month); stage through `rating`, or a curve fitted
+    /// to these flows.
+    fn judge(
+        sim: &BTreeMap<(i64, i64, i64), f64>,
+        observed: &Observed,
+        rating: Option<rustgis_swat_run::metrics::Rating>,
+        monthly: bool,
+    ) -> Result<Judged, String> {
+        use rustgis_swat_run::metrics as m;
+        let paired: Vec<((i64, i64, i64), f64, f64)> =
+            sim.iter().filter_map(|(d, s)| observed.series.get(d).map(|o| (*d, *s, *o))).collect();
+        if paired.len() < 3 {
+            return Err(format!(
+                "{} days with both a simulated and an observed value: too few (the observed series runs {} to {})",
+                paired.len(),
+                observed.series.keys().next().copied().map(ymd).unwrap_or_default(),
+                observed.series.keys().next_back().copied().map(ymd).unwrap_or_default()
+            ));
+        }
+        let flows: Vec<f64> = paired.iter().map(|p| p.1).collect();
+        let obs: Vec<f64> = paired.iter().map(|p| p.2).collect();
+        let mut notes: Vec<String> = Vec::new();
+        let mut rating_json = Value::Null;
+        let mut flow_stage_spearman = Value::Null;
+        let mut curve = None;
+        // Stage: the run's flows through a rating curve, given or fitted to this run.
+        let simulated: Vec<f64> = if observed.kind == "stage" {
+            let (r, fitted) = match rating {
+                Some(r) => (r, None),
+                None => {
+                    let f = m::fit_rating(&flows, &obs, None)?;
+                    (f.rating, Some(f.rmse))
+                }
+            };
+            rating_json = json!({"a": tidy(r.a), "b": tidy(r.b), "h0": tidy(r.h0), "fitted": fitted.is_some(), "rmse_m": fitted.map(tidy)});
+            flow_stage_spearman = json!(tidy(m::spearman(&flows, &obs)?));
+            if fitted.is_some() {
+                notes.push("stage through a rating curve fitted to this run: it judges the timing and shape of the flows, not their volume (a run losing water still fits, through a smaller a); measured discharges or the water balance see the volume".into());
+            }
+            curve = Some(r);
+            flows.iter().map(|q| r.stage(*q)).collect()
+        } else {
+            flows
+        };
+        let (s_series, o_series, months) = if monthly {
+            let mut by: BTreeMap<(i64, i64), (f64, f64, u32)> = BTreeMap::new();
+            for (p, s) in paired.iter().zip(&simulated) {
+                let e = by.entry((p.0.0, p.0.1)).or_insert((0.0, 0.0, 0));
+                e.0 += s;
+                e.1 += p.2;
+                e.2 += 1;
+            }
+            let n = by.len();
+            let (s, o): (Vec<f64>, Vec<f64>) = by.values().map(|(s, o, k)| (s / f64::from(*k), o / f64::from(*k))).unzip();
+            (s, o, Some(n))
+        } else {
+            (simulated, obs, None)
+        };
+        let k = m::kge(&s_series, &o_series)?;
+        let nse = m::nse(&s_series, &o_series)?;
+        let pbias = m::pbias(&s_series, &o_series)?;
+        let rsr = m::rsr(&s_series, &o_series)?;
+        let mut metrics = json!({
+            "nse": tidy(nse), "kge": tidy(k.kge), "r": tidy(k.r), "alpha": tidy(k.alpha), "beta": tidy(k.beta),
+            "pbias": tidy(pbias), "rsr": tidy(rsr), "spearman": tidy(m::spearman(&s_series, &o_series)?),
+        });
+        if !flow_stage_spearman.is_null() {
+            metrics["spearman_flow_stage"] = flow_stage_spearman;
+        }
+        if observed.kind == "flow" && monthly {
+            // Moriasi et al. (2007), for monthly streamflow.
+            metrics["moriasi_monthly_satisfactory"] = json!(nse > 0.5 && rsr <= 0.7 && pbias.abs() <= 25.0);
+        } else {
+            notes.push("Moriasi et al. (2007) judge monthly streamflow: satisfactory when NSE > 0.50, RSR ≤ 0.70 and |PBIAS| ≤ 25 %; on daily values or on stage the same numbers mean something else".into());
+        }
+        notes.push("PBIAS is positive when the simulation is too large".into());
+        Ok(Judged {
+            metrics,
+            rating: rating_json,
+            curve,
+            notes,
+            pairs: paired.len(),
+            months,
+            first: paired.first().map(|p| p.0),
+            last: paired.last().map(|p| p.0),
         })
+    }
+
+    fn observed_named(s: &Session, name: &str) -> Result<Observed, String> {
+        state(s)?.observed.get(name).cloned().ok_or_else(|| format!("no observed series {name} (swat.observed lists them)"))
+    }
+
+    /// A comparison of a run's daily series with an observed one, prepared on the window's thread.
+    pub(crate) struct MetricsJob {
+        name: String,
+        observed: Observed,
+        asked: SeriesAsked,
+        monthly: bool,
+        rating: Option<rustgis_swat_run::metrics::Rating>,
+    }
+
+    fn prepare_metrics(s: &Session, p: &Value) -> Result<MetricsJob, String> {
+        let name = ps(p, "observed").map(str::trim).ok_or("give observed: a series loaded with swat.observed")?;
+        let observed = observed_named(s, name)?;
+        let rating = rating_given(p, Some((name, &observed)))?;
+        Ok(MetricsJob { name: name.to_string(), asked: series_asked(s, p)?, monthly: monthly_step(p)?, rating, observed })
     }
 
     impl MetricsJob {
         fn go(self) -> Result<Value, String> {
-            use rustgis_swat_run::metrics as m;
-            let file = self.table.file().ok_or("the table has no file")?.to_path_buf();
-            let h = output::header(&file)?;
-            let at = |n: &str| h.columns.iter().position(|c| c == n);
-            let value = at(&self.column).ok_or_else(|| format!("{} has no column {}", self.table.table, self.column))?;
-            let (Some(yr), Some(mon), Some(day)) = (at("yr"), at("mon"), at("day")) else {
-                return Err(format!("{} has no yr, mon and day columns", self.table.table));
-            };
-            let (unit, objname) = (at("unit"), at("name"));
-            let watch = Watch::new();
-            let whole = |row: &[Cell], i: usize| row.get(i).and_then(Cell::whole);
-            let mut sim: BTreeMap<(i64, i64, i64), f64> = BTreeMap::new();
-            let mut objects: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-            let mut on_row = |row: &[Cell]| {
-                if watch.stop() {
-                    return false;
-                }
-                let object = objname.and_then(|i| row.get(i)).and_then(Cell::text);
-                if let Some(pat) = &self.query.matching
-                    && !object.is_some_and(|o| glob(pat, o))
-                {
-                    return true;
-                }
-                let u = unit.and_then(|i| whole(row, i));
-                if let Some(units) = &self.query.units
-                    && !u.is_some_and(|u| units.contains(&u))
-                {
-                    return true;
-                }
-                let (Some(y), Some(mo), Some(d)) = (whole(row, yr), whole(row, mon), whole(row, day)) else { return true };
-                let when = (y, mo, d);
-                if self.query.from.is_some_and(|f| when < f) || self.query.to.is_some_and(|t| when > t) {
-                    return true;
-                }
-                if objects.len() < 3 {
-                    objects.insert(object.map(str::to_string).or_else(|| u.map(|u| u.to_string())).unwrap_or_default());
-                }
-                if let Some(x) = row.get(value).and_then(Cell::number) {
-                    sim.insert(when, x);
-                }
-                true
-            };
-            let mut progress = |done: u64, total: u64| watch.progress(done, total);
-            let scanned = output::scan(&file, &mut on_row, &mut progress)?;
-            if scanned.stopped {
-                return Err("SWAT+ Fit Statistics was cancelled".into());
-            }
-            if objects.len() > 1 {
-                return Err(format!(
-                    "the rows picked are of several objects ({}…): give match or unit for one",
-                    if self.confidential {
-                        "names hidden".to_string()
-                    } else {
-                        objects.iter().take(2).cloned().collect::<Vec<_>>().join(", ")
-                    }
-                ));
-            }
-            // The days both have, in date order.
-            let paired: Vec<((i64, i64, i64), f64, f64)> =
-                sim.iter().filter_map(|(d, s)| self.observed.series.get(d).map(|o| (*d, *s, *o))).collect();
-            if paired.len() < 3 {
-                return Err(format!(
-                    "{} days with both a simulated and an observed value: too few (the observed series runs {} to {})",
-                    paired.len(),
-                    self.observed.series.keys().next().copied().map(ymd).unwrap_or_default(),
-                    self.observed.series.keys().next_back().copied().map(ymd).unwrap_or_default()
-                ));
-            }
-            let flows: Vec<f64> = paired.iter().map(|p| p.1).collect();
-            let obs: Vec<f64> = paired.iter().map(|p| p.2).collect();
-            let mut notes: Vec<String> = Vec::new();
-            let mut rating_json = Value::Null;
-            let mut flow_stage_spearman = Value::Null;
-            // Stage: the run's flows through a rating curve, given or fitted to this run.
-            let simulated: Vec<f64> = if self.observed.kind == "stage" {
-                let (rating, fitted) = match self.rating {
-                    Some(r) => (r, None),
-                    None => {
-                        let f = m::fit_rating(&flows, &obs, None)?;
-                        (f.rating, Some(f.rmse))
-                    }
-                };
-                rating_json = json!({"a": tidy(rating.a), "b": tidy(rating.b), "h0": tidy(rating.h0), "fitted": fitted.is_some(), "rmse_m": fitted.map(tidy)});
-                flow_stage_spearman = json!(tidy(m::spearman(&flows, &obs)?));
-                if fitted.is_some() {
-                    notes.push("stage through a rating curve fitted to this run: it judges the timing and shape of the flows, not their volume (a run losing water still fits, through a smaller a); measured discharges or the water balance see the volume".into());
-                }
-                flows.iter().map(|q| rating.stage(*q)).collect()
-            } else {
-                flows
-            };
-            // By month: the means of the days both have in each month.
-            let (s_series, o_series, months) = if self.monthly {
-                let mut by: BTreeMap<(i64, i64), (f64, f64, u32)> = BTreeMap::new();
-                for (p, s) in paired.iter().zip(&simulated) {
-                    let e = by.entry((p.0.0, p.0.1)).or_insert((0.0, 0.0, 0));
-                    e.0 += s;
-                    e.1 += p.2;
-                    e.2 += 1;
-                }
-                let n = by.len();
-                let (s, o): (Vec<f64>, Vec<f64>) = by.values().map(|(s, o, k)| (s / f64::from(*k), o / f64::from(*k))).unzip();
-                (s, o, Some(n))
-            } else {
-                (simulated, obs, None)
-            };
-            let k = m::kge(&s_series, &o_series)?;
-            let nse = m::nse(&s_series, &o_series)?;
-            let pbias = m::pbias(&s_series, &o_series)?;
-            let rsr = m::rsr(&s_series, &o_series)?;
-            let mut metrics = json!({
-                "nse": tidy(nse), "kge": tidy(k.kge), "r": tidy(k.r), "alpha": tidy(k.alpha), "beta": tidy(k.beta),
-                "pbias": tidy(pbias), "rsr": tidy(rsr), "spearman": tidy(m::spearman(&s_series, &o_series)?),
-            });
-            if !flow_stage_spearman.is_null() {
-                metrics["spearman_flow_stage"] = flow_stage_spearman;
-            }
-            if self.observed.kind == "flow" && self.monthly {
-                // Moriasi et al. (2007), for monthly streamflow.
-                let ok = nse > 0.5 && rsr <= 0.7 && pbias.abs() <= 25.0;
-                metrics["moriasi_monthly_satisfactory"] = json!(ok);
-            } else {
-                notes.push("Moriasi et al. (2007) judge monthly streamflow: satisfactory when NSE > 0.50, RSR ≤ 0.70 and |PBIAS| ≤ 25 %; on daily values or on stage the same numbers mean something else".into());
-            }
-            notes.push("PBIAS is positive when the simulation is too large".into());
+            let series = read_series(&self.asked, "SWAT+ Fit Statistics")?;
+            let j = judge(&series.values, &self.observed, self.rating, self.monthly)?;
+            let a = &self.asked;
             let mut out = json!({
-                "observed": self.name, "kind": self.observed.kind, "source": self.label,
-                "table": self.table.table, "column": self.column,
-                "pairs": paired.len(), "months": months,
-                "first": paired.first().map(|p| ymd(p.0)), "last": paired.last().map(|p| ymd(p.0)),
+                "observed": self.name, "kind": self.observed.kind, "source": a.label,
+                "table": a.table.table, "column": a.column,
+                "pairs": j.pairs, "months": j.months, "first": j.first.map(ymd), "last": j.last.map(ymd),
                 "step": if self.monthly { "month" } else { "day" },
-                "metrics": metrics, "rating": rating_json, "notes": notes, "uneven": scanned.uneven,
+                "metrics": j.metrics, "rating": j.rating, "notes": j.notes, "uneven": series.uneven,
             });
-            if !self.confidential {
-                out["object"] = json!(objects.iter().next());
+            if !a.confidential {
+                out["object"] = json!(series.object);
             }
             Ok(out)
         }
@@ -1084,6 +1179,548 @@ mod native {
         };
         say_uneven(s, out["table"].as_str().unwrap_or_default(), out["uneven"].as_u64().unwrap_or(0));
         Ok(out)
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Charts
+
+    const CHART_KEY: &str = "swat.chart";
+
+    /// A hydrograph asked for, prepared on the window's thread.
+    pub(crate) struct ChartJob {
+        asked: SeriesAsked,
+        observed: Option<(String, Observed)>,
+        monthly: bool,
+        rating: Option<rustgis_swat_run::metrics::Rating>,
+        path: Option<PathBuf>,
+        charts: PathBuf,
+    }
+
+    fn prepare_chart(s: &Session, p: &Value) -> Result<ChartJob, String> {
+        let observed = match ps(p, "observed").map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => Some((n.to_string(), observed_named(s, n)?)),
+            None => None,
+        };
+        let rating = rating_given(p, observed.as_ref().map(|(n, o)| (n.as_str(), o)))?;
+        let asked = series_asked(s, p)?;
+        // Beside the run, in its `charts` folder; for another folder, in the app's data folder.
+        let charts = match (asked.label.get("run"), asked.label["folder"].as_str()) {
+            (Some(_), Some(folder)) => PathBuf::from(folder).join("charts"),
+            _ => rustgis_data::dirs::app_data_dir().ok_or("can't find the app's data folder: give a path")?.join("swat-charts"),
+        };
+        let path = ps(p, "path").map(str::trim).filter(|p| !p.is_empty()).map(PathBuf::from);
+        if path.as_ref().is_some_and(|p| p.extension().is_none_or(|e| e != "svg")) {
+            return Err("path is an .svg file (its series go beside it, as .csv)".into());
+        }
+        Ok(ChartJob { asked, observed, monthly: monthly_step(p)?, rating, path, charts })
+    }
+
+    /// Days since 1970-01-01 of a civil date (Hinnant's algorithm).
+    fn day_number((y, m, d): (i64, i64, i64)) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let mp = (m + 9) % 12;
+        let doy = (153 * mp + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    /// Monthly means of a daily series, dated the 15th.
+    fn by_month(values: &BTreeMap<(i64, i64, i64), f64>) -> BTreeMap<(i64, i64, i64), f64> {
+        let mut by: BTreeMap<(i64, i64, i64), (f64, u32)> = BTreeMap::new();
+        for ((y, m, _), v) in values {
+            let e = by.entry((*y, *m, 15)).or_insert((0.0, 0));
+            e.0 += v;
+            e.1 += 1;
+        }
+        by.into_iter().map(|(k, (s, n))| (k, s / f64::from(n))).collect()
+    }
+
+    fn xml(text: &str) -> String {
+        text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    }
+
+    /// Round steps for an axis from `lo` to `hi`: about five, of 1, 2 or 5 times a power of ten.
+    fn ticks(lo: f64, hi: f64) -> Vec<f64> {
+        let span = (hi - lo).max(f64::EPSILON);
+        let raw = span / 5.0;
+        let p = 10f64.powf(raw.log10().floor());
+        let step = [1.0, 2.0, 5.0, 10.0].into_iter().map(|k| k * p).find(|s| *s >= raw).unwrap_or(10.0 * p);
+        let mut v = Vec::new();
+        let mut t = (lo / step).ceil() * step;
+        while t <= hi + step * 1e-9 && v.len() < 50 {
+            v.push(t);
+            t += step;
+        }
+        v
+    }
+
+    /// A hydrograph as SVG: the run's series as a line, the observed as dots (or a thin line when
+    /// there are many), date and value axes, a legend and the figures under the title.
+    fn hydrograph(
+        title: &str,
+        subtitle: &str,
+        unit: &str,
+        sim: &BTreeMap<(i64, i64, i64), f64>,
+        obs: Option<(&str, &BTreeMap<(i64, i64, i64), f64>)>,
+        monthly: bool,
+    ) -> String {
+        use std::fmt::Write;
+        let (w, h) = (1100.0, 440.0);
+        let (l, r, t, b) = (78.0, 24.0, 64.0, 48.0);
+        let all = sim.iter().chain(obs.iter().flat_map(|(_, o)| o.iter()));
+        let (mut d0, mut d1, mut v0, mut v1) = (i64::MAX, i64::MIN, f64::INFINITY, f64::NEG_INFINITY);
+        for (d, v) in all {
+            let n = day_number(*d);
+            (d0, d1) = (d0.min(n), d1.max(n));
+            (v0, v1) = (v0.min(*v), v1.max(*v));
+        }
+        if d0 > d1 {
+            (d0, d1, v0, v1) = (0, 1, 0.0, 1.0);
+        }
+        let v0 = v0.min(0.0);
+        let v1 = if v1 > v0 { v1 + (v1 - v0) * 0.05 } else { v0 + 1.0 };
+        let span = (d1 - d0).max(1) as f64;
+        let x = |d: (i64, i64, i64)| l + (day_number(d) - d0) as f64 / span * (w - l - r);
+        let y = |v: f64| h - b - (v - v0) / (v1 - v0) * (h - t - b);
+        let mut svg = String::new();
+        let _ = write!(
+            svg,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" font-family="sans-serif" font-size="12">
+<rect width="{w}" height="{h}" fill="#ffffff"/>
+<text x="{l}" y="24" font-size="16" font-weight="bold">{}</text>
+<text x="{l}" y="44" fill="#444444">{}</text>
+"##,
+            xml(title),
+            xml(subtitle)
+        );
+        // Value axis.
+        for v in ticks(v0, v1) {
+            let yy = y(v);
+            let _ = writeln!(
+                svg,
+                r##"<line x1="{l}" y1="{yy:.1}" x2="{:.1}" y2="{yy:.1}" stroke="#e5e5e5"/><text x="{:.1}" y="{:.1}" text-anchor="end" fill="#444444">{}</text>"##,
+                w - r,
+                l - 6.0,
+                yy + 4.0,
+                tidy(v)
+            );
+        }
+        let _ = writeln!(
+            svg,
+            r##"<text transform="translate(18,{:.1}) rotate(-90)" text-anchor="middle" fill="#444444">{}</text>"##,
+            (t + h - b) / 2.0,
+            xml(unit)
+        );
+        // Date axis: years, or months over a short span.
+        let (y0, y1) = ((1970 + d0 / 365 - 1).max(1800), 1970 + d1 / 365 + 1);
+        let years = (d1 - d0) as f64 / 365.25;
+        let every = if years <= 3.0 { 0 } else { ((years / 12.0).ceil() as i64).max(1) };
+        for yr in y0..=y1 {
+            let months: Vec<i64> = if every == 0 {
+                (1..=12).step_by(if years <= 1.0 { 1 } else { 3 }).collect()
+            } else if (yr - y0) % every == 0 {
+                vec![1]
+            } else {
+                vec![]
+            };
+            for m in months {
+                let n = day_number((yr, m, 1));
+                if n < d0 || n > d1 {
+                    continue;
+                }
+                let xx = x((yr, m, 1));
+                let label = if every == 0 { format!("{yr}-{m:02}") } else { yr.to_string() };
+                let _ = writeln!(
+                    svg,
+                    r##"<line x1="{xx:.1}" y1="{t}" x2="{xx:.1}" y2="{:.1}" stroke="#f0f0f0"/><text x="{xx:.1}" y="{:.1}" text-anchor="middle" fill="#444444">{label}</text>"##,
+                    h - b,
+                    h - b + 18.0
+                );
+            }
+        }
+        let _ = writeln!(
+            svg,
+            r##"<line x1="{l}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="#888888"/><line x1="{l}" y1="{t}" x2="{l}" y2="{:.1}" stroke="#888888"/>"##,
+            h - b,
+            w - r,
+            h - b,
+            h - b
+        );
+        // A line, broken where days (or months) are missing.
+        let line = |series: &BTreeMap<(i64, i64, i64), f64>| -> String {
+            let mut d = String::new();
+            let mut last: Option<i64> = None;
+            let gap = if monthly { 45 } else { 1 };
+            for (k, v) in series {
+                let n = day_number(*k);
+                let cmd = if last.is_some_and(|p| n - p <= gap) { 'L' } else { 'M' };
+                let _ = write!(d, "{cmd}{:.1},{:.1}", x(*k), y(*v));
+                last = Some(n);
+            }
+            d
+        };
+        if let Some((_, o)) = obs {
+            if o.len() > 1500 {
+                let _ = writeln!(svg, r##"<path d="{}" fill="none" stroke="#222222" stroke-width="0.8"/>"##, line(o));
+            } else {
+                for (k, v) in o {
+                    let _ = write!(svg, r##"<circle cx="{:.1}" cy="{:.1}" r="2" fill="#222222"/>"##, x(*k), y(*v));
+                }
+                svg.push('\n');
+            }
+        }
+        let _ = writeln!(svg, r##"<path d="{}" fill="none" stroke="#2b6cb0" stroke-width="1.2"/>"##, line(sim));
+        // The legend, in the plot's top right corner on a white box.
+        let (lx, ly) = (w - r - 176.0, t + 6.0);
+        let rows = if obs.is_some() { 2.0 } else { 1.0 };
+        let _ = writeln!(
+            svg,
+            r##"<rect x="{lx:.1}" y="{ly:.1}" width="170" height="{:.1}" fill="#ffffff" fill-opacity="0.9" stroke="#cccccc"/>"##,
+            8.0 + 18.0 * rows
+        );
+        let _ = writeln!(
+            svg,
+            r##"<line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="#2b6cb0" stroke-width="2"/><text x="{:.1}" y="{:.1}">simulated</text>"##,
+            lx + 8.0,
+            ly + 13.0,
+            lx + 24.0,
+            ly + 13.0,
+            lx + 30.0,
+            ly + 17.0
+        );
+        if let Some((name, _)) = obs {
+            let _ = writeln!(
+                svg,
+                r##"<circle cx="{:.1}" cy="{:.1}" r="3" fill="#222222"/><text x="{:.1}" y="{:.1}">{}</text>"##,
+                lx + 16.0,
+                ly + 31.0,
+                lx + 30.0,
+                ly + 35.0,
+                xml(name)
+            );
+        }
+        svg.push_str("</svg>\n");
+        svg
+    }
+
+    fn file_safe(text: &str) -> String {
+        text.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
+    }
+
+    impl ChartJob {
+        fn go(self) -> Result<Value, String> {
+            let series = read_series(&self.asked, "SWAT+ Hydrograph")?;
+            if series.values.is_empty() {
+                return Err("no simulated values on the days picked".into());
+            }
+            let a = &self.asked;
+            let judged = match &self.observed {
+                Some((_, o)) => Some(judge(&series.values, o, self.rating, self.monthly)?),
+                None => None,
+            };
+            // Stage: the run's every day through the curve, so the line covers the whole run.
+            let curve = judged.as_ref().and_then(|j| j.curve);
+            let sim_daily: BTreeMap<(i64, i64, i64), f64> = match curve {
+                Some(c) => series.values.iter().map(|(d, q)| (*d, c.stage(*q))).collect(),
+                None => series.values.clone(),
+            };
+            let sim = if self.monthly { by_month(&sim_daily) } else { sim_daily };
+            let obs = self.observed.as_ref().map(|(n, o)| (n.as_str(), if self.monthly { by_month(&o.series) } else { o.series.clone() }));
+            // Within the days the run has.
+            let (first, last) = (sim.keys().next().copied(), sim.keys().next_back().copied());
+            let obs = obs.map(|(n, o)| {
+                (
+                    n,
+                    o.into_iter()
+                        .filter(|(d, _)| first.is_some_and(|f| *d >= f) && last.is_some_and(|l| *d <= l))
+                        .collect::<BTreeMap<_, _>>(),
+                )
+            });
+            let who = if a.confidential {
+                series.unit.map(|u| format!("unit {u}"))
+            } else {
+                series.object.clone().or_else(|| series.unit.map(|u| format!("unit {u}")))
+            };
+            let who = who.unwrap_or_else(|| "object".into());
+            let stage = curve.is_some();
+            let quantity = if stage { format!("stage from {} (m)", a.column) } else { a.column.clone() };
+            let title = format!("{quantity}, {who}{}", if self.monthly { " (monthly means)" } else { "" });
+            let run = match (a.label.get("run"), a.label["folder"].as_str()) {
+                (Some(n), _) => format!("run {n}"),
+                (None, Some(f)) => Path::new(f).file_name().map_or_else(|| f.to_string(), |n| n.to_string_lossy().into_owned()),
+                _ => String::new(),
+            };
+            let subtitle = match &judged {
+                Some(j) => {
+                    let g = |k: &str| j.metrics[k].as_f64().map_or_else(|| "–".to_string(), |v| format!("{v:.2}"));
+                    format!(
+                        "{run} · {} · NSE {} · KGE {} · PBIAS {} % · {} days paired",
+                        a.table.table,
+                        g("nse"),
+                        g("kge"),
+                        g("pbias"),
+                        j.pairs
+                    )
+                }
+                None => format!("{run} · {}", a.table.table),
+            };
+            let unit = if stage {
+                "m".to_string()
+            } else if a.column.starts_with("flo") {
+                format!("{} (m³/s)", a.column)
+            } else {
+                a.column.clone()
+            };
+            let svg = hydrograph(&title, &subtitle, &unit, &sim, obs.as_ref().map(|(n, o)| (*n, o)), self.monthly);
+            let svg_path = match self.path {
+                Some(p) => p,
+                None => {
+                    let mut name = format!("{}-{}-{}", a.table.table, file_safe(&who), file_safe(&a.column));
+                    if let Some((n, _)) = &self.observed {
+                        name.push_str(&format!("-vs-{}", file_safe(n)));
+                    }
+                    if self.monthly {
+                        name.push_str("-monthly");
+                    }
+                    self.charts.join(format!("{name}.svg"))
+                }
+            };
+            if let Some(parent) = svg_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+            }
+            std::fs::write(&svg_path, svg).map_err(|e| format!("{}: {e}", svg_path.display()))?;
+            let mut csv = if obs.is_some() { String::from("date,simulated,observed\n") } else { String::from("date,simulated\n") };
+            let mut days: std::collections::BTreeSet<(i64, i64, i64)> = sim.keys().copied().collect();
+            if let Some((_, o)) = &obs {
+                days.extend(o.keys().copied());
+            }
+            for d in days {
+                let cell = |v: Option<&f64>| v.map(|v| tidy(*v).to_string()).unwrap_or_default();
+                match &obs {
+                    Some((_, o)) => csv.push_str(&format!("{},{},{}\n", ymd(d), cell(sim.get(&d)), cell(o.get(&d)))),
+                    None => csv.push_str(&format!("{},{}\n", ymd(d), cell(sim.get(&d)))),
+                }
+            }
+            let csv_path = svg_path.with_extension("csv");
+            std::fs::write(&csv_path, csv).map_err(|e| format!("{}: {e}", csv_path.display()))?;
+            let mut out = json!({
+                "svg": svg_path.display().to_string(), "csv": csv_path.display().to_string(),
+                "source": a.label, "table": a.table.table, "column": a.column,
+                "points": sim.len(), "first": first.map(ymd), "last": last.map(ymd),
+                "step": if self.monthly { "month" } else { "day" }, "uneven": series.uneven,
+            });
+            if let (Some(j), Some((n, o))) = (judged, &self.observed) {
+                out["observed"] = json!({"name": n, "kind": o.kind, "points": obs.as_ref().map_or(0, |(_, o)| o.len())});
+                out["metrics"] = j.metrics;
+                out["rating"] = j.rating;
+                out["notes"] = json!(j.notes);
+            }
+            Ok(out)
+        }
+    }
+
+    /// `swat.chart`'s work, for the desktop app to do on a thread of its own.
+    pub(crate) fn chart_ahead(s: &mut Session, p: &Value) -> Result<Option<super::super::reads::ReadWork>, String> {
+        let job = prepare_chart(s, p)?;
+        Ok(Some(super::super::reads::ahead("SWAT+ Hydrograph", CHART_KEY.into(), move || job.go())))
+    }
+
+    pub(super) fn chart(s: &mut Session, p: &Value) -> CmdResult {
+        let out = match super::super::reads::take::<Result<Value, String>>(s, CHART_KEY) {
+            Some(made) => made?,
+            None => prepare_chart(s, p)?.go()?,
+        };
+        say_uneven(s, out["table"].as_str().unwrap_or_default(), out["uneven"].as_u64().unwrap_or(0));
+        Ok(out)
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Maps
+
+    const MAP_KEY: &str = "swat.map";
+
+    /// A figure for each object of a run's table, to join to a map layer, prepared on the
+    /// window's thread.
+    pub(crate) struct MapJob {
+        label: Value,
+        table: TableFile,
+        column: String,
+        key: String,
+        stat: &'static str,
+        query: Query,
+        layer: u32,
+        field: String,
+        name: String,
+        classes: Option<u64>,
+    }
+
+    fn prepare_map(s: &Session, p: &Value) -> Result<MapJob, String> {
+        let layer = s.layer_id(p)?;
+        let l = s.map().layer(layer).ok_or("no such layer")?;
+        let field =
+            ps(p, "field").map(str::trim).ok_or("give field: the layer's field that names its objects (e.g. Channel, Subbasin, LSUID)")?;
+        if l.dataset.field_index(field).is_none() {
+            return Err(format!(
+                "{} has no field {field} (its fields: {})",
+                l.name,
+                l.dataset.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if l.dataset.windowed {
+            return Err(format!("{} is read in place, only in part: load all its features first (layer.loadAll)", l.name));
+        }
+        let stat = match ps(p, "stat") {
+            None | Some("mean") => "mean",
+            Some("sum") => "sum",
+            Some("min") => "min",
+            Some("max") => "max",
+            Some(other) => return Err(format!("stat is mean, sum, min or max, not {other}")),
+        };
+        let column = ps(p, "column").map(str::trim).ok_or("give column: the table's value to map (e.g. flo_out)")?.to_string();
+        let key = match ps(p, "key") {
+            None | Some("gis_id") => "gis_id",
+            Some("unit") => "unit",
+            Some("name") => "name",
+            Some(other) => return Err(format!("key is gis_id, unit or name, not {other}")),
+        };
+        let (dir, label) = source(s, p.get("run"))?;
+        let table = table_in(&dir, ps(p, "table").ok_or("give table: e.g. channel_sd_aa or lsunit_wb_aa")?)?;
+        let mut q = query(p)?;
+        q.columns = Some(vec![column.clone()]);
+        let classes = match f(p, "classes") {
+            None => None,
+            Some(c) if (1.0..=12.0).contains(&c) && c.fract() == 0.0 => Some(c as u64),
+            Some(c) => return Err(format!("classes is a whole number from 1 to 12, not {c}")),
+        };
+        let name = ps(p, "name")
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{} {column} {stat}", l.name));
+        Ok(MapJob { label, table, column, key: key.to_string(), stat, query: q, layer, field: field.to_string(), name, classes })
+    }
+
+    impl MapJob {
+        /// Each object's figure, as JSON for the landing to join.
+        fn go(self) -> Result<Value, String> {
+            let file = self.table.file().ok_or("the table has no file")?.to_path_buf();
+            let watch = Watch::new();
+            let picked = pick(&file, &self.query, false, Some((self.key.as_str(), usize::MAX)), &watch)?;
+            if picked.scanned.stopped {
+                return Err("SWAT+ Map was cancelled".into());
+            }
+            let mut values = serde_json::Map::new();
+            for (k, accs) in &picked.objects {
+                let Some(a) = accs.first().filter(|a| a.n > 0) else { continue };
+                let v = match self.stat {
+                    "sum" => a.sum,
+                    "min" => a.min,
+                    "max" => a.max,
+                    _ => a.sum / a.n as f64,
+                };
+                values.insert(k.clone(), json!(tidy(v)));
+            }
+            Ok(json!({
+                "source": self.label, "table": self.table.table, "column": self.column, "stat": self.stat,
+                "key": self.key, "layer": self.layer, "field": self.field, "name": self.name, "classes": self.classes,
+                "values": values, "rows": picked.matched, "uneven": picked.scanned.uneven,
+            }))
+        }
+    }
+
+    /// `swat.map`'s read, for the desktop app to do on a thread of its own; the layer is made as
+    /// it lands.
+    pub(crate) fn map_ahead(s: &mut Session, p: &Value) -> Result<Option<super::super::reads::ReadWork>, String> {
+        let job = prepare_map(s, p)?;
+        Ok(Some(super::super::reads::ahead("SWAT+ Map", MAP_KEY.into(), move || job.go())))
+    }
+
+    /// The text a key value of the layer is matched by: whole numbers without decimals.
+    fn key_text(v: &rustgis_data::Value) -> Option<String> {
+        match v {
+            rustgis_data::Value::Int(i) => Some(i.to_string()),
+            rustgis_data::Value::Float(x) if x.is_finite() && x.fract() == 0.0 => Some(format!("{}", *x as i64)),
+            rustgis_data::Value::Text(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
+            _ => None,
+        }
+    }
+
+    /// A copy of the layer with each feature's figure in a new field (as a tool's output is a
+    /// new layer), drawn in graduated colours by it.
+    pub(super) fn map(s: &mut Session, p: &Value) -> CmdResult {
+        let made = match super::super::reads::take::<Result<Value, String>>(s, MAP_KEY) {
+            Some(made) => made?,
+            None => prepare_map(s, p)?.go()?,
+        };
+        let values = made["values"].as_object().cloned().unwrap_or_default();
+        let layer = made["layer"].as_u64().and_then(|l| u32::try_from(l).ok()).ok_or("no layer")?;
+        let field = made["field"].as_str().unwrap_or_default().to_string();
+        let l = s.map().layer(layer).ok_or("the layer was removed while the table was read")?;
+        let mut ds = l.dataset.clone();
+        let at = ds.field_index(&field).ok_or_else(|| format!("{} no longer has the field {field}", l.name))?;
+        let base = format!("{}_{}", made["column"].as_str().unwrap_or("value"), made["stat"].as_str().unwrap_or("mean"));
+        let mut new = base.clone();
+        let mut i = 1;
+        while ds.field_index(&new).is_some() {
+            i += 1;
+            new = format!("{base}_{i}");
+        }
+        ds.fields.push(rustgis_data::Field::new(new.clone(), rustgis_data::FieldType::Double));
+        ds.features.add_column(rustgis_data::Value::Null);
+        let to = ds.fields.len() - 1;
+        let (mut matched, mut unmatched) = (0u64, 0u64);
+        let mut used = std::collections::BTreeSet::new();
+        for row in 0..ds.features.len() {
+            let figure = key_text(ds.features.value(row, at)).and_then(|k| values.get(&k).and_then(Value::as_f64).map(|v| (k, v)));
+            match figure {
+                Some((k, v)) => {
+                    ds.features.set_value(row, to, rustgis_data::Value::Float(v));
+                    used.insert(k);
+                    matched += 1;
+                }
+                None => unmatched += 1,
+            }
+        }
+        if matched == 0 {
+            return Err(format!(
+                "none of {}'s features matched an object of {} by {} = {}: check the field and key (gis_id, unit or name)",
+                l.name,
+                made["table"].as_str().unwrap_or_default(),
+                field,
+                made["key"].as_str().unwrap_or_default()
+            ));
+        }
+        let name = made["name"].as_str().unwrap_or("SWAT+ map").to_string();
+        // Its own layer, not the file the original was read from.
+        ds.name = name.clone();
+        ds.source = None;
+        let without = values.len() as u64 - used.len() as u64;
+        let id = super::super::layer::add_dataset(s, ds);
+        let mut sym = json!({"layer": id, "type": "graduated", "field": new});
+        if let Some(c) = made["classes"].as_u64() {
+            sym["classes"] = json!(c);
+        }
+        s.run("layer.symbology", &sym)?;
+        // Features with no figure, and objects with no feature, are said with their counts.
+        if unmatched > 0 {
+            s.notify(format!("{name}: {unmatched} features have no figure (no object of the table has their {field})"), false);
+        }
+        if without > 0 {
+            s.notify(format!("{name}: {without} objects of the table have no feature in the layer"), false);
+        }
+        say_uneven(s, made["table"].as_str().unwrap_or_default(), made["uneven"].as_u64().unwrap_or(0));
+        let mut acc = Acc::default();
+        for v in values.values().filter_map(Value::as_f64) {
+            acc.add(v);
+        }
+        Ok(json!({
+            "layer": s.map().layer(id).map(|l| l.name.clone()), "field": new, "source": made["source"],
+            "table": made["table"], "column": made["column"], "stat": made["stat"],
+            "features": matched + unmatched, "matched": matched, "unmatched": unmatched, "objects_without_feature": without,
+            "values": acc.to_json(),
+        }))
     }
 }
 
@@ -1400,6 +2037,111 @@ not a date,2
         let read = ahead.run(&rustgis_analysis::control::Control::stoppable()).unwrap();
         assert_eq!(read_land(&mut s, read).unwrap()["pairs"], json!(60));
         let ahead = read_ahead(&mut s, "swat.metrics", &p).unwrap();
+        assert!(ahead.run(&rustgis_analysis::control::Control::cancelled_at_look(5)).err().unwrap().contains("cancelled"));
+    }
+
+    /// A hydrograph of a run's series, with the observed and its figures, as SVG and CSV.
+    #[test]
+    fn a_hydrograph_is_written_as_svg_and_csv() {
+        let (project, run, q) = flows();
+        let out = tempfile::tempdir().unwrap();
+        let mut s = session();
+        s.run("swat.open", &json!({"path": project.path().display().to_string()})).unwrap();
+        s.run("swat.observed", &json!({"path": observations(project.path(), "same.csv", &q)})).unwrap();
+        let folder = run.path().display().to_string();
+        let svg = out.path().join("cha01.svg");
+        let r =
+            s.run("swat.chart", &json!({"run": folder, "match": "cha01", "observed": "same", "path": svg.display().to_string()})).unwrap();
+        assert_eq!((r["points"].clone(), r["metrics"]["nse"].clone()), (json!(60), json!(1.0)));
+        let text = std::fs::read_to_string(&svg).unwrap();
+        assert!(text.starts_with("<svg") && text.contains("NSE 1.00") && text.contains("simulated") && text.contains(">same<"), "{text}");
+        assert!(text.contains("flo_out (m³/s)") && text.contains("2015-02"), "a value axis and month ticks");
+        let csv = std::fs::read_to_string(out.path().join("cha01.csv")).unwrap();
+        assert_eq!(csv.lines().count(), 61);
+        assert!(csv.starts_with("date,simulated,observed\n2015-01-01,10,10\n"), "{csv}");
+        // By month, without observations: three months, two columns.
+        let m = out.path().join("monthly.svg");
+        let r = s.run("swat.chart", &json!({"run": folder, "unit": 2, "step": "month", "path": m.display().to_string()})).unwrap();
+        assert_eq!(r["points"], json!(3));
+        assert!(std::fs::read_to_string(out.path().join("monthly.csv")).unwrap().starts_with("date,simulated\n2015-01-15,"));
+        // Stage through a curve: the run's every day as stage.
+        let curve = rustgis_swat_run::metrics::Rating { a: 12.0, b: 1.8, h0: 0.5 };
+        let stage: Vec<f64> = q.iter().map(|x| curve.stage(*x)).collect();
+        s.run("swat.observed", &json!({"path": observations(project.path(), "tma.csv", &stage), "kind": "stage"})).unwrap();
+        let st = out.path().join("stage.svg");
+        let r =
+            s.run("swat.chart", &json!({"run": folder, "match": "cha01", "observed": "tma", "path": st.display().to_string()})).unwrap();
+        assert!(r["metrics"]["nse"].as_f64().unwrap() > 0.9999);
+        assert!(std::fs::read_to_string(&st).unwrap().contains("stage from flo_out (m)"));
+        assert!(
+            s.run("swat.chart", &json!({"run": folder, "match": "cha01", "path": out.path().join("x.png").display().to_string()}))
+                .unwrap_err()
+                .contains(".svg")
+        );
+    }
+
+    /// A layer of the channels with a field for their numbers, three features, one not in the run.
+    fn rivers(s: &mut Session) {
+        use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+        let mut ds = Dataset::new("rivers", GeometryType::Point, vec![Field::new("Channel", FieldType::Integer)]);
+        for i in 1..=3 {
+            ds.push(Some(Geometry::Point(Coord::new(100.0 + f64::from(i) * 0.01, -1.0))), vec![V::Int(i64::from(i))]);
+        }
+        crate::cmd::layer::add_dataset(s, ds);
+    }
+
+    /// A run's figures joined to a layer: a new layer, coloured by them, saying what had none.
+    #[test]
+    fn a_run_s_figures_are_mapped_onto_a_layer() {
+        let (project, run, q) = flows();
+        let mut s = session();
+        s.run("swat.open", &json!({"path": project.path().display().to_string()})).unwrap();
+        rivers(&mut s);
+        let layers = s.map().layers.len();
+        let folder = run.path().display().to_string();
+        let p = json!({"layer": "rivers", "field": "Channel", "table": "channel_sd_day", "column": "flo_out", "run": folder});
+        let r = s.run("swat.map", &p).unwrap();
+        assert_eq!((r["matched"].clone(), r["unmatched"].clone(), r["field"].clone()), (json!(2), json!(1), json!("flo_out_mean")));
+        assert_eq!(r["layer"], json!("rivers flo_out mean"));
+        assert_eq!(s.map().layers.len(), layers + 1);
+        let made = s.map().layer_by_name("rivers flo_out mean").unwrap();
+        let at = made.dataset.field_index("flo_out_mean").unwrap();
+        let mean = q.iter().sum::<f64>() / q.len() as f64;
+        let got = |row: usize| match made.dataset.features.value(row, at) {
+            rustgis_data::Value::Float(v) => Some(*v),
+            _ => None,
+        };
+        assert!((got(0).unwrap() - mean).abs() < 1e-4 && (got(1).unwrap() - 2.0 * mean).abs() < 1e-4 && got(2).is_none());
+        assert!(s.notices.iter().any(|n| n.text.contains("1 features have no figure")));
+        // The original is as it was, and Undo takes the new layer away.
+        assert_eq!(s.map().layer_by_name("rivers").unwrap().dataset.fields.len(), 1);
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.map().layers.len(), layers);
+        // The sum over the picked days, and a key that matches nothing.
+        let r = s.run("swat.map", &json!({"layer": "rivers", "field": "Channel", "table": "channel_sd_day", "column": "flo_out", "run": folder, "stat": "sum", "to": "2015-01-10"})).unwrap();
+        assert_eq!(r["stat"], json!("sum"));
+        let err = s.run("swat.map", &json!({"layer": "rivers", "field": "Channel", "table": "channel_sd_day", "column": "flo_out", "run": folder, "key": "name"})).unwrap_err();
+        assert!(err.contains("none of rivers's features matched"), "{err}");
+        assert!(
+            s.run("swat.map", &json!({"layer": "rivers", "field": "Nope", "table": "channel_sd_day", "column": "flo_out", "run": folder}))
+                .unwrap_err()
+                .contains("no field Nope")
+        );
+    }
+
+    #[test]
+    fn a_map_made_ahead_lands_and_stops_at_cancel() {
+        use crate::cmd::reads::{read_ahead, read_land};
+        let (project, run, _) = flows();
+        let mut s = session();
+        s.run("swat.open", &json!({"path": project.path().display().to_string()})).unwrap();
+        rivers(&mut s);
+        let p = json!({"layer": "rivers", "field": "Channel", "table": "channel_sd_day", "column": "flo_out", "run": run.path().display().to_string()});
+        let ahead = read_ahead(&mut s, "swat.map", &p).unwrap();
+        assert_eq!(ahead.name, "SWAT+ Map");
+        let read = ahead.run(&rustgis_analysis::control::Control::stoppable()).unwrap();
+        assert_eq!(read_land(&mut s, read).unwrap()["matched"], json!(2));
+        let ahead = read_ahead(&mut s, "swat.map", &p).unwrap();
         assert!(ahead.run(&rustgis_analysis::control::Control::cancelled_at_look(5)).err().unwrap().contains("cancelled"));
     }
 }

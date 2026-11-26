@@ -174,6 +174,8 @@ impl ArchiveBatch {
                                 | "swat.output.read"
                                 | "swat.compare"
                                 | "swat.metrics"
+                                | "swat.chart"
+                                | "swat.map"
                         )
                     )
                 {
