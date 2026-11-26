@@ -8313,6 +8313,8 @@ const DEFAULTS_TO_ACTIVE_LAYER: &[&str] = &[
     "zarr.reduce",
     "cube.trend",
     "cube.reduce",
+    // Enabled only with a SWAT+ project open, which the sample hasn't.
+    "swat.map",
 ];
 
 #[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
