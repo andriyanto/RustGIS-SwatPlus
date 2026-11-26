@@ -140,6 +140,8 @@ impl Session {
                 | "swat.output.read"
                 | "swat.compare"
                 | "swat.metrics"
+                | "swat.chart"
+                | "swat.map"
         ) {
             return Err(
                 "only standalone archive, column-statistics, similarity, topology, shape-conversion, image-grid, size-by-field or SWAT+ run and output commands can prepare a scoped read".into()

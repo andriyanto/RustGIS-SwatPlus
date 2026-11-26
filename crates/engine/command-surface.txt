@@ -578,6 +578,7 @@ style.new layer? name?
 style.remove name
 style.save path
 swat.balance run?
+swat.chart run? table? column? match? unit? from? to? observed? step? rating? path?
 swat.check
 swat.close
 swat.compare runs table columns? match? unit? from? to?
@@ -587,6 +588,7 @@ swat.engine
 swat.find query file?
 swat.get file column match? where?
 swat.installEngine
+swat.map layer? field table column key? stat? run? from? to? name? classes?
 swat.metrics observed run? table? column? match? unit? from? to? step? rating?
 swat.observed path? name? column? kind? dateColumn? dayFirst? missing?
 swat.open path confidential?

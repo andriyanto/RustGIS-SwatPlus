@@ -3313,7 +3313,9 @@ impl RustGisApp {
                 return readjob::run(self, "swat.run", params);
             }
             // A run's table is gone through a row at a time: a large basin's daily ones are long.
-            if let Some(command) = ["swat.output.read", "swat.compare", "swat.metrics"].into_iter().find(|c| *c == id) {
+            if let Some(command) =
+                ["swat.output.read", "swat.compare", "swat.metrics", "swat.chart", "swat.map"].into_iter().find(|c| *c == id)
+            {
                 let params = if params.is_null() { json!({}) } else { params };
                 return readjob::run(self, command, params);
             }
@@ -8311,6 +8313,8 @@ const DEFAULTS_TO_ACTIVE_LAYER: &[&str] = &[
     "zarr.reduce",
     "cube.trend",
     "cube.reduce",
+    // Enabled only with a SWAT+ project open, which the sample hasn't.
+    "swat.map",
 ];
 
 #[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
